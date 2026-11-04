@@ -60,8 +60,40 @@ const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
 const SVG_CONTENT_SECURITY_POLICY = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
 // Opaque origin blocks cookies, storage and API access while allowing scripts.
 // Agent HTML can open without a click, so disallow blocking modals.
-const HTML_CONTENT_SECURITY_POLICY =
-  "sandbox allow-scripts allow-forms allow-popups allow-downloads";
+/**
+ * Tailor fork: the served web app may connect only to its own origin, and loads images only
+ * from it, so rendered agent output cannot beacon data out through image URLs.
+ */
+export const TAILOR_WEB_APP_CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "script-src 'self'",
+  // The UI and its code highlighter set inline styles.
+  "style-src 'self' 'unsafe-inline'",
+  "font-src 'self' data:",
+  "media-src 'self' blob:",
+  "connect-src 'self'",
+  "img-src 'self' data: blob:",
+  "frame-src 'none'",
+  "worker-src 'self' blob:",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+].join("; ");
+
+/**
+ * Tailor fork: agent-written HTML is sandboxed with no network and no forms
+ * (upstream: "sandbox allow-scripts allow-forms allow-popups allow-downloads").
+ */
+export const HTML_CONTENT_SECURITY_POLICY = [
+  "default-src 'none'",
+  "script-src 'unsafe-inline'",
+  "style-src 'unsafe-inline'",
+  "img-src data: blob:",
+  "connect-src 'none'",
+  "form-action 'none'",
+  "sandbox allow-scripts",
+].join("; ");
 
 // Proxies may strip disposition; force document-capable downloads to octet-stream.
 const DOWNLOAD_MIME_TYPE_PATTERN = /^[\w!#$&^.+-]+\/[\w!#$&^.+-]+$/;
@@ -90,14 +122,46 @@ export function downloadContentDisposition(fileName?: string): string {
   }`;
 }
 
+/**
+ * Tailor fork: agent HTML is rendered only inside a frame (the browser says so with
+ * `Sec-Fetch-Dest: iframe`/`frame`). Any other request for it, a top-level navigation
+ * included, or one without the header, gets it as a download.
+ */
+export function isFramedRequest(fetchDest: string | undefined): boolean {
+  const value = fetchDest?.trim().toLowerCase();
+  return value === "iframe" || value === "frame";
+}
+
+function wouldServeInlineHtml(filePath: string, mimeType: string | undefined): boolean {
+  const lowerPath = filePath.toLowerCase();
+  const inline = mimeType?.split(";", 1)[0]?.trim();
+  if (inline !== undefined && isSafeInlineMediaMimeType(inline)) return false;
+  if (inline !== undefined && isSafeInlineDocumentMimeType(inline)) {
+    return inline.toLowerCase() === "text/html";
+  }
+  return lowerPath.endsWith(".html") || lowerPath.endsWith(".htm");
+}
+
 export function assetResponseHeaders(
   filePath: string,
   options?: {
     readonly download?: boolean;
     readonly fileName?: string;
     readonly mimeType?: string;
+    readonly fetchDest?: string;
   },
 ): Record<string, string> {
+  if (
+    !options?.download &&
+    wouldServeInlineHtml(filePath, options?.mimeType) &&
+    !isFramedRequest(options?.fetchDest)
+  ) {
+    return {
+      ...assetResponseHeaders(filePath, { ...options, download: true }),
+      "Cache-Control": "no-store",
+      Vary: "Sec-Fetch-Dest",
+    };
+  }
   const lowerPath = filePath.toLowerCase();
   const inlineMimeType = options?.mimeType?.split(";", 1)[0]?.trim();
   return {
@@ -121,13 +185,20 @@ export function assetResponseHeaders(
                   ? "text/html; charset=utf-8"
                   : "application/pdf",
               ...(inlineMimeType.toLowerCase() === "text/html"
-                ? { "Content-Security-Policy": HTML_CONTENT_SECURITY_POLICY }
+                ? {
+                    "Content-Security-Policy": HTML_CONTENT_SECURITY_POLICY,
+                    // Tailor fork: framed and top-level answers differ; never cache either.
+                    "Cache-Control": "no-store",
+                    Vary: "Sec-Fetch-Dest",
+                  }
                 : {}),
             }
           : lowerPath.endsWith(".html") || lowerPath.endsWith(".htm")
             ? {
                 "Content-Type": "text/html; charset=utf-8",
                 "Content-Security-Policy": HTML_CONTENT_SECURITY_POLICY,
+                "Cache-Control": "no-store",
+                Vary: "Sec-Fetch-Dest",
               }
             : {}),
     ...(!options?.download && lowerPath.endsWith(".svg")
@@ -166,6 +237,7 @@ export const assetFileResponse = Effect.fn("assetFileResponse")(function* (
     readonly mimeType?: string;
     readonly file?: OpenMediaFile;
     readonly renderIntent?: "mcp-app";
+    readonly fetchDest?: string;
   },
   rangeHeader?: string,
   ifRangeHeader?: string,
@@ -450,7 +522,9 @@ export const layerAssetRoute = HttpRouter.add(
       );
     }
     return yield* assetFileResponse(
-      asset,
+      request.headers["sec-fetch-dest"] === undefined
+        ? asset
+        : { ...asset, fetchDest: request.headers["sec-fetch-dest"] },
       request.method === "GET" ? request.headers.range : undefined,
       request.headers["if-range"],
       request.method === "HEAD" ? "HEAD" : "GET",
@@ -664,6 +738,8 @@ const handleStaticAndDevRequest = Effect.fn("handleStaticAndDevRequest")(
     const headers: Record<string, string> = {
       "Cache-Control": cacheControl,
       ...validators(fileInfo),
+      // Tailor fork: the web app talks only to this server (fetch, XHR, WebSocket).
+      ...(isHtml ? { "Content-Security-Policy": TAILOR_WEB_APP_CONTENT_SECURITY_POLICY } : {}),
     };
     const etag = headers.ETag;
     const lastModified = headers["Last-Modified"];

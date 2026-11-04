@@ -29,7 +29,12 @@ import { ORCHESTRATION_PROTOCOL_HEADER } from "@t3tools/contracts";
 
 import * as ServerConfig from "./config.ts";
 
-import { assetResponseHeaders, assetFileResponse, downloadContentDisposition } from "./http.ts";
+import {
+  HTML_CONTENT_SECURITY_POLICY,
+  assetResponseHeaders,
+  assetFileResponse,
+  downloadContentDisposition,
+} from "./http.ts";
 import * as ServerHttp from "./http.ts";
 
 describe("MCP app asset responses", () => {
@@ -49,7 +54,7 @@ describe("MCP app asset responses", () => {
         for (const method of ["GET", "HEAD"] as const) {
           const response = HttpServerResponse.toWeb(
             yield* assetFileResponse(
-              { path: file, mimeType: "text/html", renderIntent: "mcp-app" },
+              { path: file, mimeType: "text/html", renderIntent: "mcp-app", fetchDest: "iframe" },
               "bytes=0-1",
               undefined,
               method,
@@ -63,7 +68,7 @@ describe("MCP app asset responses", () => {
           expect(response.headers.get("etag")).toBeNull();
           expect(response.headers.get("last-modified")).toBeNull();
           expect(response.headers.get("content-security-policy")).toBe(
-            "sandbox allow-scripts allow-forms allow-popups allow-downloads",
+            HTML_CONTENT_SECURITY_POLICY,
           );
           expect(yield* Effect.promise(() => response.text())).toBe(
             method === "HEAD" ? "" : expected,
@@ -90,8 +95,39 @@ describe("MCP app asset responses", () => {
       const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-mcp-theme-size-" });
       const file = path.join(directory, "app.html");
       yield* fs.writeFileString(file, "x".repeat(MCP_APP_MAX_HTML_BYTES + 128 * 1024 + 1));
-      const response = yield* assetFileResponse({ path: file, renderIntent: "mcp-app" });
+      const response = yield* assetFileResponse({ path: file, renderIntent: "mcp-app", fetchDest: "iframe" });
       expect(response.status).toBe(413);
+    }).pipe(Effect.provide(layerFileResponse)),
+  );
+});
+
+// Tailor fork: agent HTML is a download unless the browser asks for it as a frame.
+describe("agent HTML responses", () => {
+  it.effect("answer a request without Sec-Fetch-Dest frame with an attachment", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-agent-html-" });
+      const file = path.join(directory, "page.html");
+      yield* fs.writeFileString(file, "<script>fetch('https://example.com')</script>");
+      for (const fetchDest of [undefined, "document", "empty"]) {
+        const response = HttpServerResponse.toWeb(
+          yield* assetFileResponse({
+            path: file,
+            mimeType: "text/html",
+            ...(fetchDest === undefined ? {} : { fetchDest }),
+          }),
+        );
+        expect(response.headers.get("content-disposition")).toMatch(/^attachment/);
+        expect(response.headers.get("content-type")).toBe("application/octet-stream");
+        expect(response.headers.get("cache-control")).toBe("no-store");
+        expect(response.headers.get("vary")).toBe("Sec-Fetch-Dest");
+      }
+      const framed = HttpServerResponse.toWeb(
+        yield* assetFileResponse({ path: file, mimeType: "text/html", fetchDest: "iframe" }),
+      );
+      expect(framed.headers.get("content-disposition")).toBeNull();
+      expect(framed.headers.get("content-security-policy")).toBe(HTML_CONTENT_SECURITY_POLICY);
     }).pipe(Effect.provide(layerFileResponse)),
   );
 });
@@ -784,11 +820,46 @@ describe("assetResponseHeaders", () => {
       "Content-Type": "application/pdf",
     });
     expect(
-      assetResponseHeaders("/attachments/upload.bin", { mimeType: "text/html" }),
+      assetResponseHeaders("/attachments/upload.bin", { mimeType: "text/html", fetchDest: "iframe" }),
     ).toMatchObject({
       "Content-Type": "text/html; charset=utf-8",
-      "Content-Security-Policy": "sandbox allow-scripts allow-forms allow-popups allow-downloads",
+      "Content-Security-Policy": HTML_CONTENT_SECURITY_POLICY,
     });
+  });
+
+  // Tailor fork: agent HTML is never a top-level page.
+  it("serves HTML inline only into a frame, and as a download otherwise", () => {
+    for (const fetchDest of [undefined, "document", "empty", "script", "IFRAMEX"]) {
+      for (const [path, mimeType] of [
+        ["/attachments/upload.bin", "text/html"],
+        ["/attachments/page.html", undefined],
+        ["/attachments/page.HTM", undefined],
+      ] as const) {
+        const headers = assetResponseHeaders(path, {
+          ...(mimeType === undefined ? {} : { mimeType }),
+          ...(fetchDest === undefined ? {} : { fetchDest }),
+        });
+        expect(headers["Content-Disposition"], `${path} ${fetchDest}`).toMatch(/^attachment/);
+        expect(headers["Content-Type"]).toBe("application/octet-stream");
+        expect(headers["Content-Security-Policy"]).toBe("default-src 'none'; sandbox");
+        expect(headers["Cache-Control"]).toBe("no-store");
+        expect(headers.Vary).toBe("Sec-Fetch-Dest");
+      }
+    }
+    for (const fetchDest of ["iframe", "frame", "IFrame"]) {
+      expect(assetResponseHeaders("/attachments/page.html", { fetchDest })).toMatchObject({
+        "Content-Type": "text/html; charset=utf-8",
+        "Content-Security-Policy": HTML_CONTENT_SECURITY_POLICY,
+        "Cache-Control": "no-store",
+        Vary: "Sec-Fetch-Dest",
+      });
+    }
+    expect(assetResponseHeaders("/attachments/a.png")["Content-Disposition"]).toBeUndefined();
+    expect(
+      assetResponseHeaders("/attachments/a.bin", { mimeType: "application/pdf" })[
+        "Content-Disposition"
+      ],
+    ).toBeUndefined();
   });
 
   it("downloads uploaded documents without executing their content", () => {

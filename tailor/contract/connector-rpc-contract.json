@@ -1,0 +1,162 @@
+{
+  "$comment": "Tailor connector contract, pinned at T3 Code v0.1.6. The exact WebSocket RPCs the Tailor connector calls, the fields it sends and the fields it reads. packages/contracts/src/tailorConnectorContract.test.ts and apps/server/src/tailor/connectorScopes.test.ts fail when an upstream bump changes any of it. Field names ending in '?' are optional. Update this file only in the reviewed bump PR, together with the connector adapter.",
+  "pinnedVersion": "0.1.6",
+  "rpcs": {
+    "orchestration.subscribeShell": {
+      "purpose": "Orchestration snapshot: every thread with its status and pending runtime request, then live updates.",
+      "schemaKey": "subscribeShell",
+      "stream": true,
+      "requiredScope": "orchestration:read",
+      "input": [
+        "afterSequence?",
+        "omitIdleSubagents?",
+        "omitOlderSettled?",
+        "requestCompletionMarker?"
+      ]
+    },
+    "orchestration.getThreadProjection": {
+      "purpose": "One thread's full projection (turns, runs, runtime requests).",
+      "schemaKey": "getThreadProjection",
+      "stream": false,
+      "requiredScope": "orchestration:read",
+      "input": ["threadId"]
+    },
+    "orchestration.subscribeThread": {
+      "purpose": "Live stream of one thread.",
+      "schemaKey": "subscribeThread",
+      "stream": true,
+      "requiredScope": "orchestration:read",
+      "input": [
+        "acceptBoundedSnapshot?",
+        "acceptCompactIds?",
+        "acceptCompactTurnItems?",
+        "acceptDedupedBodies?",
+        "acceptDeferredWork?",
+        "afterSequence?",
+        "requestCompletionMarker?",
+        "threadId"
+      ]
+    },
+    "orchestration.launchThread": {
+      "purpose": "Ensure/resume a thread: create it, or reuse it with reuseExistingThread, optionally with the first message.",
+      "schemaKey": "launchThread",
+      "stream": false,
+      "requiredScope": "orchestration:operate",
+      "input": [
+        "commandId",
+        "creationSource?",
+        "generateTitle?",
+        "initialMessage?",
+        "interactionMode",
+        "modelSelection",
+        "projectId",
+        "reuseExistingThread?",
+        "runtimeMode",
+        "threadId?",
+        "title",
+        "workspaceStrategy"
+      ],
+      "output": ["projection", "resumed", "sequence?", "threadId"]
+    },
+    "orchestration.dispatchCommand": {
+      "purpose": "Thread and turn commands. The connector sends only the command types listed here.",
+      "schemaKey": "dispatchCommand",
+      "stream": false,
+      "requiredScope": "orchestration:operate",
+      "output": ["sequence"],
+      "commands": {
+        "thread.create": [
+          "branch",
+          "commandId",
+          "createdBy",
+          "creationSource",
+          "delegatedFrom?",
+          "importedNativeThread?",
+          "interactionMode",
+          "linkOrigin?",
+          "modelSelection",
+          "projectId",
+          "runtimeMode",
+          "threadId",
+          "title",
+          "type",
+          "worktreePath"
+        ],
+        "message.dispatch": [
+          "attachments",
+          "commandId",
+          "context?",
+          "createdBy",
+          "creationSource",
+          "delegatedCompletion?",
+          "deliveryIntent?",
+          "dispatchMode",
+          "guestMessageId?",
+          "idleCompaction?",
+          "manualContinuationOfRunId?",
+          "messageId",
+          "modelSelection?",
+          "notification?",
+          "restartContinuationOfRunId?",
+          "scheduledTaskId?",
+          "senderThreadId?",
+          "sourcePlanRef?",
+          "text",
+          "threadId",
+          "titleSeed?",
+          "type",
+          "usageLimitContinuationOfRunId?",
+          "usageLimitRecoveryRequestId?"
+        ],
+        "run.interrupt": ["commandId", "holdQueue?", "reason?", "runId", "threadId", "type"],
+        "thread.stop": ["commandId", "reason?", "stopDelegatedTasks?", "threadId", "type"],
+        "runtime-request.respond": [
+          "answers?",
+          "attachmentsByQuestionId?",
+          "commandId",
+          "decision?",
+          "feedback?",
+          "requestId",
+          "threadId",
+          "type"
+        ]
+      }
+    }
+  },
+  "literals": {
+    "RuntimeMode": ["approval-required", "auto-accept-edits", "auto", "full-access"],
+    "ProviderApprovalDecision": ["accept", "acceptForSession", "acceptAlways", "decline", "cancel"],
+    "OrchestrationV2CreationSource": ["web", "mobile", "mcp", "provider", "server"],
+    "OrchestrationV2Actor": ["user", "agent", "system"],
+    "ShellStreamItemKinds": [
+      "synchronized",
+      "snapshot",
+      "project.updated",
+      "project.removed",
+      "thread.updated",
+      "thread.removed"
+    ]
+  },
+  "reads": {
+    "OrchestrationV2ShellSnapshot": [
+      "archivedThreads",
+      "projects",
+      "schemaVersion",
+      "snapshotSequence",
+      "threads"
+    ],
+    "OrchestrationV2ThreadShell": [
+      "activeRunId",
+      "id",
+      "interactionMode",
+      "latestRunId",
+      "pendingRuntimeRequest",
+      "projectId",
+      "runtimeMode",
+      "status",
+      "title",
+      "updatedAt"
+    ],
+    "OrchestrationV2PendingRuntimeRequestSummary": ["blocking?", "createdAt", "id", "kind"]
+  }
+}

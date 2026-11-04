@@ -106,6 +106,12 @@ export class ServerConfig extends Context.Service<
     readonly logWebSocketEvents: boolean;
     readonly tailscaleServeEnabled: boolean;
     readonly tailscaleServePort: number;
+    /**
+     * Tailor fork: set by the CLI config (every real `t3 serve`). On Windows a missing or
+     * unreadable machine policy then stops the Claude instance from running. Test configs
+     * leave it unset.
+     */
+    readonly tailorPolicyRequired?: boolean;
   }
 >()("t3/config/ServerConfig") {
   static readonly layerTest = (

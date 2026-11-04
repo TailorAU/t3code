@@ -1,4 +1,10 @@
 import * as DocumentText from "../../provider/DocumentText.ts";
+import * as TailorMachinePolicy from "../../tailor/machinePolicy.ts";
+import {
+  tailorClaudeManagedSettings,
+  type TailorProtectedPaths,
+} from "../../tailor/claudeDenyRules.ts";
+export { tailorClaudeManagedSettings, type TailorProtectedPaths };
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import { claudeTaskOutputRoot, tailClaudeTaskOutput } from "./ClaudeTaskOutputTail.ts";
 import {
@@ -154,6 +160,7 @@ import { spawnAndCollect } from "@t3tools/provider-core/server/snapshotProbe";
 import { signalProcessGroup } from "@t3tools/provider-core/server/processGroup";
 import {
   claudeSignedOutMessage,
+  hasClaudeManagedMcpConfig,
   makeClaudeEnvironment,
   resolveClaudeHomePath,
 } from "../../provider/Drivers/ClaudeHome.ts";
@@ -1483,6 +1490,8 @@ export function makeClaudeQueryOptions(input: {
   readonly appendSystemPromptFileText?: string;
   // Flag settings, because a user's settings.json env beats the process env in Claude Code.
   readonly toolSearchOverride?: "true";
+  /** Tailor fork: where the compiled deny rules point. */
+  readonly tailorProtectedPaths?: TailorProtectedPaths;
 }): ClaudeAgentSdkQueryOptions {
   const compiledSelection = compileClaudeModelSelection(input.modelSelection);
   const {
@@ -1495,12 +1504,16 @@ export function makeClaudeQueryOptions(input: {
     // The SDK replaces this flag with options.settings, so it arrives read as sdkSettings.
     settings: _launchArgSettings,
     ...extraArgs
-  } = input.settings === undefined ? {} : parseCliArgs(input.settings.launchArgs).flags;
+  } =
+    // Tailor fork: user launch arguments never reach Claude (TAILOR_IGNORE_LAUNCH_ARGS).
+    input.settings === undefined || TAILOR_IGNORE_LAUNCH_ARGS
+      ? {}
+      : parseCliArgs(input.settings.launchArgs).flags;
   // Claude Code overwrites its CLI append text with the SDK's initialize
   // appendSystemPrompt, so launch-argument text has to travel in that value.
   // The CLI puts file text before inline text and trims one trailing newline.
   const launchAppendSystemPrompt = [
-    input.appendSystemPromptFileText?.replace(/\r?\n$/, ""),
+    TAILOR_IGNORE_LAUNCH_ARGS ? undefined : input.appendSystemPromptFileText?.replace(/\r?\n$/, ""),
     launchArgAppendSystemPrompt,
   ].filter((text): text is string => typeof text === "string" && text.length > 0);
   const requestThinkingSummaries =
@@ -1517,11 +1530,13 @@ export function makeClaudeQueryOptions(input: {
     Object.keys(compiledSelection.settings).length === 0
       ? undefined
       : (compiledSelection.settings as ClaudeSdkSettings);
+  // Tailor fork: --settings from user launch arguments is ignored.
+  const sdkSettings = TAILOR_IGNORE_LAUNCH_ARGS ? undefined : input.sdkSettings;
   const querySettings =
     selectionSettings === undefined
-      ? input.sdkSettings
-      : typeof input.sdkSettings === "object" && input.sdkSettings !== null
-        ? ({ ...input.sdkSettings, ...selectionSettings } as ClaudeSdkSettings)
+      ? sdkSettings
+      : typeof sdkSettings === "object" && sdkSettings !== null
+        ? ({ ...sdkSettings, ...selectionSettings } as ClaudeSdkSettings)
         : selectionSettings;
   const compactQuerySettings =
     input.settings?.autoCompactWindow === undefined || input.settings.autoCompactWindow.length === 0
@@ -1608,11 +1623,96 @@ export function makeClaudeQueryOptions(input: {
   const additionalDirectories = [
     ...(input.cwd === null ? [] : [input.cwd]),
     ...(input.attachmentsDir === undefined ? [] : [input.attachmentsDir]),
-    ...claudeLaunchArgDirectories(input.settings?.launchArgs),
+    ...(TAILOR_IGNORE_LAUNCH_ARGS ? [] : claudeLaunchArgDirectories(input.settings?.launchArgs)),
   ];
   const withDirectories =
     additionalDirectories.length === 0 ? options : { ...options, additionalDirectories };
-  return input.cwd === null ? withDirectories : { ...withDirectories, cwd: input.cwd };
+  return tailorLockClaudeQueryOptions(
+    input.cwd === null ? withDirectories : { ...withDirectories, cwd: input.cwd },
+    input.permissionMode,
+    input.environment,
+    input.tailorProtectedPaths,
+  );
+}
+
+
+/** Tailor fork: Bypass and Auto become default; every other Claude mode is kept. */
+export function tailorCapPermissionMode(mode: PermissionMode): PermissionMode {
+  // Tailor fork: the build ceiling is Supervised, so acceptEdits is capped too.
+  return mode === "bypassPermissions" || mode === "auto" || mode === "acceptEdits" ? "default" : mode;
+}
+
+/** Tailor fork: user launch arguments and --settings are ignored everywhere in this build. */
+export const TAILOR_IGNORE_LAUNCH_ARGS = true as boolean;
+
+/** Tailor fork: the instance settings with every user launch argument removed. */
+export function tailorSanitizeClaudeSettings<S extends { readonly launchArgs: string }>(
+  settings: S,
+): S {
+  return !TAILOR_IGNORE_LAUNCH_ARGS || settings.launchArgs === ""
+    ? settings
+    : { ...settings, launchArgs: "" };
+}
+
+/** Tailor fork: Bypass and Auto never reach Claude (claudeRuntimeQueryPolicyForRuntimePolicy). */
+export const TAILOR_CLAUDE_MODE_CEILING = true as boolean;
+
+/** Tailor fork: settings files are never read for the agent's behaviour (see tailorLockClaudeQueryOptions). */
+export const TAILOR_IGNORE_SETTINGS_FILES = true as boolean;
+
+/** Tailor fork: tools the agent never gets, whatever the settings say. */
+export const TAILOR_CLAUDE_DISALLOWED_TOOLS: ReadonlyArray<string> = ["WebSearch", "WebFetch"];
+
+/**
+ * Tailor fork: the last word on every Claude query this server opens.
+ * - `settingSources: []`: no user, project or local settings file is loaded, so a
+ *   repository's `.claude/settings*.json` hooks, permissions and MCP approvals never apply.
+ * - `strictMcpConfig`: only the MCP servers T3 passes; a repository's `.mcp.json` is ignored.
+ *   (Omitted only next to an administrator's managed-mcp.json, which already excludes
+ *   other MCP config and makes Claude reject the flag.)
+ * - The permission mode is the runtime policy's, capped at acceptEdits; launch arguments
+ *   cannot raise it.
+ */
+export function tailorLockClaudeQueryOptions(
+  options: ClaudeAgentSdkQueryOptions,
+  requestedMode: PermissionMode | undefined,
+  environment?: NodeJS.ProcessEnv,
+  paths: TailorProtectedPaths = {},
+): ClaudeAgentSdkQueryOptions {
+  const {
+    allowDangerouslySkipPermissions: _skipPermissions,
+    strictMcpConfig: _strictMcpConfig,
+    ...rest
+  } = options;
+  const deny = tailorClaudeManagedSettings(environment, {
+    ...paths,
+    claudeHome: paths.claudeHome ?? environment?.CLAUDE_CONFIG_DIR,
+  });
+  // Also in the flag tier: SDK 0.3.276 drops `managedSettings` when a machine managed tier
+  // exists without parentSettingsBehavior "merge" (sdk.d.ts), so the denies must not rely on it.
+  const flagSettings = (typeof rest.settings === "object" && rest.settings !== null
+    ? rest.settings
+    : {}) as { permissions?: { deny?: ReadonlyArray<string> } } & Record<string, unknown>;
+  const settings = {
+    ...flagSettings,
+    permissions: {
+      ...flagSettings.permissions,
+      deny: Array.from(
+        new Set([...(flagSettings.permissions?.deny ?? []), ...deny.permissions.deny]),
+      ),
+    },
+  } as unknown as ClaudeSdkSettings;
+  return {
+    ...rest,
+    settings,
+    permissionMode: tailorCapPermissionMode(requestedMode ?? "default"),
+    settingSources: [],
+    ...(paths.managedMcpConfig === true ? {} : { strictMcpConfig: true }),
+    managedSettings: deny as unknown as ClaudeSdkSettings,
+    disallowedTools: Array.from(
+      new Set([...(rest.disallowedTools ?? []), ...TAILOR_CLAUDE_DISALLOWED_TOOLS]),
+    ),
+  };
 }
 
 /**
@@ -1726,9 +1826,10 @@ export function claudeMcpQueryOverrides(input: {
   if (session === undefined) {
     return input.allowedTools === undefined ? {} : { allowedTools: input.allowedTools };
   }
-  const mcpAllowedTools = input.readOnlySandbox
-    ? CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS
-    : [CLAUDE_T3_MCP_TOOL_WILDCARD];
+  // Tailor fork: only T3's read-only tools are pre-approved; every other T3 tool asks.
+  // Upstream pre-approves CLAUDE_T3_MCP_TOOL_WILDCARD outside read-only sandboxes.
+  void input.readOnlySandbox;
+  const mcpAllowedTools = CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS;
   return {
     allowedTools: Array.from(new Set([...(input.allowedTools ?? []), ...mcpAllowedTools])),
     mcpServers: {
@@ -2557,12 +2658,20 @@ export function claudeRuntimeQueryPolicyForRuntimePolicy(
   availability: ClaudeBypassAvailability = CLAUDE_BYPASS_FULLY_AVAILABLE,
 ): ClaudeRuntimeQueryPolicy {
   const requestedMode = permissionModeForClaudeRuntimePolicy(runtimePolicy);
-  const downgraded = requestedMode === "bypassPermissions" && availability.bypassDisabled;
-  const permissionMode = downgraded
+  // Tailor fork: a disabled Auto mode also caps a requested Auto, not only a Full access fallback.
+  const downgraded =
+    (requestedMode === "bypassPermissions" && availability.bypassDisabled) ||
+    (requestedMode === "auto" && availability.autoDisabled);
+  const uncappedMode = downgraded
     ? availability.autoDisabled
       ? "default"
       : "auto"
     : requestedMode;
+  // Tailor fork: Bypass, Auto and acceptEdits never reach Claude, at open or on a live mode
+  // change; the build's ceiling is Supervised (default with approvals).
+  const ceilinged =
+    uncappedMode === "bypassPermissions" || uncappedMode === "auto" || uncappedMode === "acceptEdits";
+  const permissionMode: PermissionMode = ceilinged ? "default" : uncappedMode;
   const readOnlyTools =
     sandboxPolicyKindForClaudeRuntimePolicy(runtimePolicy) === "readOnly"
       ? CLAUDE_READ_ONLY_ALLOWED_TOOLS
@@ -2574,6 +2683,7 @@ export function claudeRuntimeQueryPolicyForRuntimePolicy(
   // acceptEdits approves edits before the callback; the callback must ask for everything else.
   const installPermissionCallback =
     downgraded ||
+    ceilinged ||
     (runtimePolicy.approvalPolicy === undefined
       ? runtimePolicy.runtimeMode === "approval-required" ||
         runtimePolicy.runtimeMode === "auto-accept-edits"
@@ -2593,7 +2703,7 @@ export function claudeRuntimeQueryPolicyForRuntimePolicy(
     permissionMode,
     ...(readOnlyTools === undefined ? {} : { tools: readOnlyTools }),
     ...(allowedTools === undefined ? {} : { allowedTools }),
-    ...(permissionMode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
+    // Tailor fork: bypassPermissions never reaches here, so allowDangerouslySkipPermissions is never set.
     installPermissionCallback,
   };
 }
@@ -3422,18 +3532,15 @@ export function permissionResultFromDecision(input: {
   readonly suggestions?: Parameters<CanUseTool>[2]["suggestions"];
   readonly feedback?: string;
 }): PermissionResult {
+  // Tailor fork: no standing grants. "Accept for session" approves this one call only, so a
+  // single answer can never widen what later calls may do (upstream adds session rules,
+  // falling back to the whole tool name).
   if (input.decision === "accept" || input.decision === "acceptForSession") {
     return {
       behavior: "allow",
       updatedInput: input.toolInput,
       toolUseID: input.toolUseID,
-      decisionClassification:
-        input.decision === "acceptForSession" ? "user_permanent" : "user_temporary",
-      ...(input.decision === "acceptForSession"
-        ? {
-            updatedPermissions: toSessionPermissionUpdates(input.toolName, input.suggestions),
-          }
-        : {}),
+      decisionClassification: "user_temporary",
     };
   }
 
@@ -3450,7 +3557,8 @@ export function permissionResultFromDecision(input: {
   };
 }
 
-function toSessionPermissionUpdates(
+/** Upstream's session grant builder; unused while the Tailor fork allows no standing grants. */
+export function toSessionPermissionUpdates(
   toolName: string,
   suggestions: ReadonlyArray<PermissionUpdate> | undefined,
 ): Array<PermissionUpdate> {
@@ -4493,8 +4601,13 @@ export interface ClaudeAdapterV2Options {
 }
 
 export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
-  adapterOptions: ClaudeAdapterV2Options,
+  rawAdapterOptions: ClaudeAdapterV2Options,
 ) {
+  // Tailor fork: user launch arguments (including --settings) never apply in this build.
+  const adapterOptions: ClaudeAdapterV2Options = {
+    ...rawAdapterOptions,
+    settings: tailorSanitizeClaudeSettings(rawAdapterOptions.settings),
+  };
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const serverSettings = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
@@ -4516,6 +4629,58 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
     adapterOptions.settings.homePath.trim().length > 0 ||
     adapterOptions.environment.CLAUDE_CONFIG_DIR !== hostEnvironment.CLAUDE_CONFIG_DIR;
   const announcedBypassDowngrades = new Set<ThreadId>();
+  // Tailor fork: the machine policy always wins. With it installed, Claude runs only from the
+  // recorded Claude home and binary, and the binary must match the recorded SHA-256. On a real
+  // Windows server (the CLI config sets tailorPolicyRequired) a missing or unreadable policy
+  // refuses every query.
+  const tailorServerConfig = yield* Effect.serviceOption(ServerConfig.ServerConfig);
+  const tailorPolicyRequired =
+    hostPlatform === "win32" &&
+    Option.isSome(tailorServerConfig) &&
+    tailorServerConfig.value.tailorPolicyRequired === true;
+  const tailorManagedMcpConfig = yield* hasClaudeManagedMcpConfig().pipe(
+    Effect.provideService(FileSystem.FileSystem, fileSystem),
+  );
+  const tailorPolicyCheck = yield* Effect.cached(
+    Effect.gen(function* () {
+      const state = TailorMachinePolicy.readTailorPolicy(hostPlatform);
+      const refuse = (reason: string) =>
+        new ClaudeAgentSdkQueryRunnerError({
+          method: "tailorPolicy",
+          cause: `Claude is blocked by the machine policy: ${reason}`,
+        });
+      if (state._tag === "absent") {
+        if (tailorPolicyRequired) {
+          return yield* refuse("this server requires the machine policy, and it is not installed.");
+        }
+        return;
+      }
+      if (state._tag === "invalid") return yield* refuse(state.reason);
+      const installed = state.policy;
+      const binaryPath = adapterOptions.settings.binaryPath.trim();
+      if (!TailorMachinePolicy.samePath(hostPlatform, homePath, installed.claudeConfigDir)) {
+        return yield* refuse("the Claude instance must use the policy's Claude home.");
+      }
+      if (
+        binaryPath.length === 0 ||
+        !TailorMachinePolicy.samePath(hostPlatform, binaryPath, installed.claudeExe)
+      ) {
+        return yield* refuse("the Claude instance must use the policy's Claude binary.");
+      }
+      if (installed.claudeExeSha256 !== undefined) {
+        const actual = yield* Effect.tryPromise({
+          try: () => TailorMachinePolicy.sha256File(installed.claudeExe),
+          catch: () => refuse("the policy's Claude binary could not be read."),
+        });
+        if (actual !== installed.claudeExeSha256) {
+          return yield* refuse("the Claude binary does not match the policy's SHA-256.");
+        }
+      }
+    }),
+  );
+  const tailorPolicyGuard = tailorPolicyCheck.pipe(
+    Effect.mapError((cause) => queryRunnerError(cause, "tailorPolicy")),
+  );
   const readBypassSettings = (filePath: string) =>
     fileSystem.readFileString(filePath).pipe(
       Effect.flatMap(decodeClaudeBypassSettings),
@@ -4628,6 +4793,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
     function* (cwd: string | null, launchArgSettings: ClaudeSdkSettings | undefined) {
       const launchValue = launchArgSettings?.env?.ENABLE_TOOL_SEARCH;
       if (typeof launchValue === "string") return claudeToolSearchOverride(launchValue);
+      // Tailor fork: Claude loads no settings files (settingSources: []), so a repository or
+      // user settings file must not steer this either; only --settings and the process env do.
+      if (TAILOR_IGNORE_SETTINGS_FILES) {
+        return claudeToolSearchOverride(adapterOptions.environment.ENABLE_TOOL_SEARCH);
+      }
       const localDirectory = cwd === null ? null : yield* localSettingsDirectory(cwd);
       const settingsFiles = [
         ...(cwd === null || localDirectory === null
@@ -4739,9 +4909,21 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const queryPolicyForTurn = Effect.fnUntraced(function* (
           turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
         ) {
-          if (
-            permissionModeForClaudeRuntimePolicy(turnInput.runtimePolicy) !== "bypassPermissions"
-          ) {
+          const requestedMode = permissionModeForClaudeRuntimePolicy(turnInput.runtimePolicy);
+          if (requestedMode === "auto" && customHome) {
+            // Tailor fork: Claude skips a custom home's settings.json (settingSources leave out
+            // "user"), so its disableAutoMode would never apply. Enforce it here; an unreadable
+            // file fails closed to Supervised.
+            const home = yield* readBypassSettings(path.join(homePath, "settings.json")).pipe(
+              Effect.map(claudeBypassAvailability),
+              Effect.option,
+            );
+            return claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy, {
+              bypassDisabled: false,
+              autoDisabled: Option.isNone(home) || home.value.autoDisabled,
+            });
+          }
+          if (requestedMode !== "bypassPermissions") {
             return claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy);
           }
           const cwd = turnInput.runtimePolicy.cwd;
@@ -10087,6 +10269,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
           nativeThreadId: string,
         ) {
+          yield* tailorPolicyGuard;
           const queryPolicy = yield* queryPolicyForTurn(turnInput);
           const mcpSession = yield* mcpSessions.read(turnInput.threadId);
           const mcpOverrides = claudeMcpQueryOverrides({
@@ -10149,10 +10332,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             // A denied ExitPlanMode leaves Claude in plan mode. Restore only from plan:
             // Auto/default may reflect a policy restriction that forbids restoring bypass.
             if (existing.permissionMode === "plan" && existing.openedPermissionMode !== "plan") {
+              const restoreMode = tailorCapPermissionMode(existing.openedPermissionMode);
               existing.permissionMode = yield* existing.query
-                .setPermissionMode(existing.openedPermissionMode)
+                .setPermissionMode(restoreMode)
                 .pipe(
-                  Effect.as(existing.openedPermissionMode),
+                  Effect.as(restoreMode),
                   Effect.catchTags({
                     ClaudeAgentSdkQueryRunnerError: (error) =>
                       existing.openedPermissionMode === "bypassPermissions"
@@ -10249,6 +10433,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             supportedDialogKinds: ["resume_return"],
             ...(appendSystemPromptFileText === undefined ? {} : { appendSystemPromptFileText }),
             ...(toolSearchOverride === undefined ? {} : { toolSearchOverride }),
+            tailorProtectedPaths: {
+              t3BaseDir: Option.isSome(tailorServerConfig)
+                ? tailorServerConfig.value.baseDir
+                : undefined,
+              claudeHome: homePath,
+              managedMcpConfig: tailorManagedMcpConfig,
+            },
           });
           const resolvedTurnCwd = yield* fileSystem
             .realPath(turnInput.runtimePolicy.cwd ?? ".")
@@ -10319,8 +10510,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     message.subtype === "init" &&
                     !context.receivedInit
                   ) {
-                    context.openedPermissionMode =
-                      message.permissionMode ?? context.openedPermissionMode;
+                    // Tailor fork: a mode the CLI reports is capped before it can be restored.
+                    context.openedPermissionMode = tailorCapPermissionMode(
+                      message.permissionMode ?? context.openedPermissionMode,
+                    );
                     context.receivedInit = true;
                   }
                   if (
@@ -10488,6 +10681,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               querySession.lastTurn = context;
               yield* Ref.set(activeTurn, context);
               if (
+                // Tailor fork: Full access never runs in this build, so there is no downgrade to announce.
+                !TAILOR_CLAUDE_MODE_CEILING &&
                 !isClaudeProviderContinuationTurn(turnInput) &&
                 permissionModeForClaudeRuntimePolicy(turnInput.runtimePolicy) ===
                   "bypassPermissions" &&

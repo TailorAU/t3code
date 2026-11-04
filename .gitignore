@@ -12,6 +12,8 @@ packages/*/dist
 .env
 .env.local
 build/
+# Tailor fork: tailor/build holds source (the build guard), not output.
+!tailor/build/
 .logs/
 release/
 release-mock/

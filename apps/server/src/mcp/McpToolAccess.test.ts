@@ -304,16 +304,30 @@ it.effect.each([
   ["starts_threads", supervised, { runtimeMode: "full-access" }, "runtime_mode_escalation_denied"],
   ["starts_threads", plan, {}, "approval-required/plan"],
   ["starts_threads", plan, { interactionMode: "default" }, "interaction_mode_escalation_denied"],
-  ["starts_threads", fullAccess, { runtimeMode: "auto", interactionMode: "plan" }, "auto/plan"],
+  // Tailor fork: a stored full-access caller is clamped, so it cannot start Auto work.
+  [
+    "starts_threads",
+    fullAccess,
+    { runtimeMode: "auto", interactionMode: "plan" },
+    "runtime_mode_escalation_denied",
+  ],
   ["starts_threads", ended, {}, "parent_not_active"],
   ["starts_threads", supervisedClient, {}, "approval-required/default"],
   ["starts_threads", supervisedClient, { runtimeMode: "auto" }, "runtime_mode_escalation_denied"],
-  ["starts_threads", fullAccessClient, { runtimeMode: "full-access" }, "full-access/default"],
+  [
+    "starts_threads",
+    fullAccessClient,
+    { runtimeMode: "full-access" },
+    "runtime_mode_escalation_denied",
+  ],
 
-  ["writes_environment", fullAccess, {}, "ran"],
+  // Tailor fork: the build's runtime-mode ceiling (auto-accept-edits) means no caller is ever
+  // full-access, so environment writes (t3_project_update, t3_project_clone,
+  // t3_environment_preferences_update, ...) are refused even for a stored full-access thread.
+  ["writes_environment", fullAccess, {}, "capability_denied"],
   ["writes_environment", supervised, {}, "capability_denied"],
   ["writes_environment", plan, {}, "capability_denied"],
-  ["writes_environment", fullAccessClient, {}, "ran"],
+  ["writes_environment", fullAccessClient, {}, "capability_denied"],
   ["writes_environment", supervisedClient, {}, "capability_denied"],
 ] as const)("%s from %o with %o: %s", ([tool, scope, args, expected]) =>
   call(tool, scope, args).pipe(
@@ -425,13 +439,9 @@ it.effect.each([
   ],
   ["starts_threads", plan, { environmentId: box }, "starts_threads in environment-box"],
   ["writes_environment", supervised, { environmentId: box }, "capability_denied"],
-  [
-    "writes_environment",
-    fullAccess,
-    { environmentId: box },
-    "writes_environment in environment-box",
-  ],
-  ["writes_environment", fullAccess, { environmentId: here }, "here"],
+  // Tailor fork: refused at the runtime-mode ceiling, here and in a linked environment.
+  ["writes_environment", fullAccess, { environmentId: box }, "capability_denied"],
+  ["writes_environment", fullAccess, { environmentId: here }, "capability_denied"],
 
   // A thread id names a thread where the call runs, and is checked there.
   [

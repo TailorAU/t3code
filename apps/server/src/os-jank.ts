@@ -1,4 +1,5 @@
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as TailorMachinePolicy from "./tailor/machinePolicy.ts";
 import {
   listLoginShellCandidates,
   mergePathEntries,
@@ -68,6 +69,10 @@ export const fixPath = Effect.fn("fixPath")(function* (options?: {
   const env = yield* HostProcess.Environment;
 
   if (platform === "win32") {
+    // Tailor fork: with a machine policy present (installed or not readable), the launcher's
+    // admin-controlled PATH is final: never re-read PATH from the user environment or a
+    // PowerShell profile (t3agent's own dirs would come first).
+    if (TailorMachinePolicy.readTailorPolicy("win32")._tag !== "absent") return;
     // Desktop already populated the child env; repeating PowerShell probes costs seconds.
     if (options?.shellEnvironmentPrepared === true) return;
     const repairedEnvironment = yield* resolveWindowsEnvironment(env).pipe(

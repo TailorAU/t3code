@@ -1,9 +1,21 @@
 import type {
   GuestShareId,
+  ProjectId,
   OrchestrationV2SearchThreadInput,
   OrchestrationV2SearchThreadResult,
   OrchestrationV2ThreadHistoryPage,
 } from "@t3tools/contracts";
+import { clampRuntimeMode } from "@t3tools/contracts";
+import * as ServerConfigModule from "../config.ts";
+import * as TailorMachinePolicy from "../tailor/machinePolicy.ts";
+import * as TailorWorkspacePolicy from "../tailor/workspacePolicy.ts";
+
+/** Tailor fork: thread.create, thread.runtime-mode.set and delegated_task.request carry a mode. */
+function clampCommandRuntimeMode(command: OrchestrationV2ServerCommand): OrchestrationV2ServerCommand {
+  if (!("runtimeMode" in command)) return command;
+  const runtimeMode = clampRuntimeMode(command.runtimeMode);
+  return runtimeMode === command.runtimeMode ? command : { ...command, runtimeMode };
+}
 import {
   latestExecutedRun,
   latestRootProviderFailure,
@@ -979,6 +991,43 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const projects = yield* ProjectStore.ProjectStoreV2;
   const projectionStore = yield* ProjectionStoreV2;
+  // Tailor fork: with the machine policy installed, every command that sets a thread's
+  // worktree (from a client, MCP or the server itself) must name a path inside the project
+  // or T3's worktree folder (workspacePolicy.ts). ws.ts checks client commands as well.
+  const tailorServerConfig = yield* Effect.serviceOption(ServerConfigModule.ServerConfig);
+  const tailorWorktreeRejection = Effect.fn("orchestrationV2.tailorWorktreeRejection")(function* (
+    command: OrchestrationV2ServerCommand,
+  ) {
+    const worktreePath =
+      command.type === "thread.create"
+        ? command.worktreePath
+        : command.type === "thread.metadata.update"
+          ? (command.worktreePath ?? null)
+          : null;
+    if (worktreePath === null) return undefined;
+    // Without a ServerConfig (some test layers) the managed worktree root is unknown: only the
+    // project root is allowed then.
+    const rules = TailorMachinePolicy.tailorPathRulesIfInstalled(
+      process.platform,
+      Option.isSome(tailorServerConfig) ? tailorServerConfig.value.worktreesDir : "<no managed worktree root>",
+    );
+    if (rules === undefined) return undefined;
+    let projectId: ProjectId | undefined;
+    if (command.type === "thread.create") {
+      projectId = command.projectId;
+    } else if (command.type === "thread.metadata.update") {
+      const thread = yield* projectionStore
+        .getThread(command.threadId)
+        .pipe(Effect.orElseSucceed(() => undefined));
+      projectId = thread?.projectId;
+    }
+    const project =
+      projectId === undefined
+        ? Option.none()
+        : yield* projects.get(projectId).pipe(Effect.orElseSucceed(() => Option.none()));
+    if (Option.isNone(project)) return "The thread's project was not found.";
+    return TailorWorkspacePolicy.checkWorktreePath(worktreePath, project.value.workspaceRoot, rules);
+  });
   const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
   const nextTurnItemOrdinal = (
     projection: Pick<OrchestrationV2ThreadProjection, "thread"> &
@@ -13801,7 +13850,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     awaitRestartContinuation: Effect.fn("OrchestratorV2.awaitRestartContinuation")(function (run) {
       return effectOutbox.awaitSettled(`effect:restart-continuation:${run.id}`).pipe(Effect.ignore);
     }),
-    dispatch: dispatchWithReceipt,
+    // Tailor fork: every command, from a client or from the server itself, is clamped here.
+    dispatch: Effect.fn("orchestrationV2.dispatch.clamped")(function* (
+      command: OrchestrationV2ServerCommand,
+    ) {
+      const refusal = yield* tailorWorktreeRejection(command);
+      if (refusal !== undefined) {
+        return yield* new OrchestratorCommandRejectedError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: new Error(refusal),
+        });
+      }
+      return yield* dispatchWithReceipt(clampCommandRuntimeMode(command));
+    }),
     autoArmLimitRecovery: Effect.fn("OrchestratorV2.autoArmLimitRecovery")(function (input) {
       return threadDispatch.withLock(
         input.threadId,

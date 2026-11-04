@@ -28,18 +28,40 @@ export type BuiltInDriversEnv =
   | PiDriverEnv
   | MuseDriverEnv;
 
-export const BUILT_IN_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv>> = [
-  CodexDriver,
-  ClaudeDriver,
-  CursorDriver,
-  GrokDriver,
-  FxDriver,
-  OpenCodeDriver,
-  AntigravityDriver,
-  PiDriver,
-  MuseDriver,
-  AcpRegistryDriver,
-];
+/**
+ * Tailor fork (TailorAU/t3code): the Cursor driver is off at compile time. `@cursor/sdk`
+ * bundles its own copy of the MCP SDK inside its Webpack chunks, which the workspace
+ * `@modelcontextprotocol/sdk` override cannot patch. Flip this only in a reviewed PR that
+ * re-checks the bundled copy (tailor/SECURITY-REVIEW.md, finding T3-04).
+ */
+export const TAILOR_CURSOR_DRIVER_ENABLED = false as boolean;
+
+/**
+ * Tailor fork: the build runs Claude only. Every other driver is left out at compile time, so
+ * no user setting can enable it. Flip only in a reviewed PR that extends the policy and egress.
+ */
+export const TAILOR_CLAUDE_ONLY = true as boolean;
+
+const withoutDisabledDrivers = <D>(drivers: ReadonlyArray<D>): ReadonlyArray<D> =>
+  TAILOR_CLAUDE_ONLY
+    ? drivers.filter((driver) => (driver as unknown) === ClaudeDriver)
+    : TAILOR_CURSOR_DRIVER_ENABLED
+      ? drivers
+      : drivers.filter((driver) => (driver as unknown) !== CursorDriver);
+
+export const BUILT_IN_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv>> =
+  withoutDisabledDrivers<AnyProviderDriver<BuiltInDriversEnv>>([
+    CodexDriver,
+    ClaudeDriver,
+    CursorDriver,
+    GrokDriver,
+    FxDriver,
+    OpenCodeDriver,
+    AntigravityDriver,
+    PiDriver,
+    MuseDriver,
+    AcpRegistryDriver,
+  ]);
 
 export type BuiltInUsageReadersEnv =
   | ProviderUsageReaderEnv<typeof ClaudeDriver>
@@ -54,7 +76,7 @@ export type BuiltInUsageReadersEnv =
 /** Order matters: aggregation keeps the first duplicate record. */
 export const BUILT_IN_USAGE_DRIVERS: ReadonlyArray<
   AnyProviderDriver<BuiltInDriversEnv, BuiltInUsageReadersEnv>
-> = [
+> = withoutDisabledDrivers<AnyProviderDriver<BuiltInDriversEnv, BuiltInUsageReadersEnv>>([
   ClaudeDriver,
   CodexDriver,
   GrokDriver,
@@ -63,4 +85,4 @@ export const BUILT_IN_USAGE_DRIVERS: ReadonlyArray<
   MuseDriver,
   AntigravityDriver,
   CursorDriver,
-];
+]);

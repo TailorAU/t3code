@@ -15,6 +15,7 @@ import { makeClaudeTextGeneration } from "../../textGeneration/ClaudeTextGenerat
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as ServerConfig from "../../config.ts";
+import * as TailorMachinePolicy from "../../tailor/machinePolicy.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import {
@@ -104,6 +105,10 @@ export type ClaudeDriverEnv =
   | ProviderEventLoggers.ProviderEventLoggers
   | ServerConfig.ServerConfig;
 
+/** Tailor fork: a binary path that never exists, used when the machine policy is missing. */
+export const TAILOR_POLICY_BLOCKED_BINARY =
+  "T3CodePolicy-required-install-the-machine-policy-before-running-Claude.exe";
+
 export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.Path> = {
   driverKind: DRIVER_KIND,
   metadata: {
@@ -117,10 +122,48 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
     instanceId,
     displayName,
     accentColor,
-    environment,
+    environment: userEnvironment,
     enabled,
-    config,
+    config: userConfig,
   }) {
+    // Tailor fork: the machine policy wins over the user-writable instance settings. It sets
+    // the Claude binary and home, drops launch arguments, and allowlists the environment;
+    // on Windows without a readable policy the binary is replaced by a path that cannot run.
+    const tailorConfig = yield* ServerConfig.ServerConfig;
+    const tailorPolicy = TailorMachinePolicy.readTailorPolicy(yield* HostProcess.Platform);
+    const tailorPolicyRequired =
+      (yield* HostProcess.Platform) === "win32" && tailorConfig.tailorPolicyRequired === true;
+    // The probe and `claude -p` use this binary too, so check its hash here as well.
+    const tailorBinaryOk =
+      tailorPolicy._tag !== "installed" || tailorPolicy.policy.claudeExeSha256 === undefined
+        ? true
+        : yield* Effect.tryPromise(() =>
+            TailorMachinePolicy.sha256File(tailorPolicy.policy.claudeExe),
+          ).pipe(
+            Effect.map((hash) => hash === tailorPolicy.policy.claudeExeSha256),
+            Effect.orElseSucceed(() => false),
+          );
+    const config: ClaudeSettings =
+      tailorPolicy._tag === "installed" && !tailorBinaryOk
+        ? { ...userConfig, launchArgs: "", binaryPath: TAILOR_POLICY_BLOCKED_BINARY }
+        : tailorPolicy._tag === "installed"
+        ? {
+            ...userConfig,
+            launchArgs: "",
+            binaryPath: tailorPolicy.policy.claudeExe,
+            homePath: tailorPolicy.policy.claudeConfigDir,
+          }
+        : tailorPolicyRequired || tailorPolicy._tag === "invalid"
+          ? { ...userConfig, launchArgs: "", binaryPath: TAILOR_POLICY_BLOCKED_BINARY }
+          : { ...userConfig, launchArgs: "" };
+    const environment = TailorMachinePolicy.filterInstanceEnvironment<
+      (typeof userEnvironment)[number]
+    >(
+      userEnvironment,
+      tailorPolicy._tag === "installed"
+        ? tailorPolicy.policy.instanceEnvironmentAllowlist
+        : TailorMachinePolicy.TAILOR_INSTANCE_ENVIRONMENT_ALLOWLIST,
+    );
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;

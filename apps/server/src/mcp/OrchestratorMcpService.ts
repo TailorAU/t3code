@@ -63,6 +63,7 @@ import {
   ThreadId,
   isOrchestrationV2WorkActive,
 } from "@t3tools/contracts";
+import { clampRuntimeMode } from "@t3tools/contracts";
 import { getProviderOptionCurrentValue } from "@t3tools/shared/model";
 import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
@@ -1119,7 +1120,8 @@ const make = Effect.gen(function* () {
     return {
       parent,
       limits: {
-        runtimeMode: parent.thread.runtimeMode,
+        // Tailor fork: clamp a stored parent mode to the build's ceiling.
+        runtimeMode: clampRuntimeMode(parent.thread.runtimeMode),
         interactionMode: parent.thread.interactionMode,
       },
     } as const;

@@ -483,7 +483,7 @@ const clientScope = (
   capabilities: new Set(["orchestration", "worktree", "pull-requests"]),
 });
 
-it.effect("a client caller targets any thread within its ceiling and cannot act as a thread", () =>
+it.effect("a client caller targets only threads within its (Supervised-capped) ceiling and cannot act as a thread", () =>
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
     const call = (
@@ -501,13 +501,14 @@ it.effect("a client caller targets any thread within its ceiling and cannot act 
     const untargeted = yield* call("t3_thread_organize", { action: "pin" }, clientScope("auto"));
     expect(declaredFailure(untargeted)).toMatchObject({ code: "target_required" });
 
+    // Tailor fork: the build ceiling caps every client at Supervised, so even a client approved
+    // for auto cannot target the (pre-existing) auto thread.
     const pinned = yield* call(
       "t3_thread_organize",
       { action: "pin", threadId: "other-project-thread" },
       clientScope("auto"),
     );
-    expect(pinned.isError).toBe(false);
-    expect(pinned.structuredContent).toMatchObject({ sequence: 7 });
+    expect(declaredFailure(pinned)).toMatchObject({ code: "runtime_mode_escalation_denied" });
 
     const aboveCeiling = yield* call(
       "t3_thread_organize",
@@ -675,8 +676,12 @@ it.effect("a caller cannot rewrite a scheduled task that runs above its own mode
     expect(declaredFailure(update)).toMatchObject({ code: "runtime_mode_escalation_denied" });
     const remove = yield* call("delete_scheduled_task", { scheduledTaskId: "task-full-access" });
     expect(declaredFailure(remove)).toMatchObject({ code: "runtime_mode_escalation_denied" });
+    // Tailor fork: the caller approved for auto is capped at Supervised, so an auto task is
+    // above it too; a Supervised task is within it.
+    const autoTask = yield* call("schedule_task", { scheduledTaskId: "task-auto", enabled: false });
+    expect(declaredFailure(autoTask)).toMatchObject({ code: "runtime_mode_escalation_denied" });
     const allowed = yield* call("schedule_task", {
-      scheduledTaskId: "task-auto",
+      scheduledTaskId: "task-supervised",
       enabled: false,
     });
     expect(allowed.isError).toBe(false);
@@ -698,11 +703,15 @@ it.effect("a caller cannot rewrite a scheduled task that runs above its own mode
                 tasks: [
                   scheduledTask("task-full-access", "full-access"),
                   scheduledTask("task-auto", "auto"),
+                  scheduledTask("task-supervised", "approval-required"),
                 ],
               }),
             upsert: (input) =>
               Effect.succeed({
-                task: { ...(scheduledTask(input.id ?? "task-auto", "auto") as object), ...input },
+                task: {
+                  ...(scheduledTask(input.id ?? "task-supervised", "approval-required") as object),
+                  ...input,
+                },
               } as never),
           }),
         ),
@@ -717,7 +726,10 @@ it.effect("a caller cannot rewrite a scheduled task that runs above its own mode
   ),
 );
 
-function scheduledTask(id: string, runtimeMode: "auto" | "full-access"): never {
+function scheduledTask(
+  id: string,
+  runtimeMode: "approval-required" | "auto" | "full-access",
+): never {
   return {
     id,
     title: id,
@@ -807,7 +819,8 @@ it.effect.each(["t3_thread_interrupt", "t3_workflow_stop"])(
 
 it.effect("discovers workflow stop targets and requires orchestration capability", () => {
   const threadId = ThreadId.make("workflow-parent");
-  const shell = McpToolAccessTestkit.liveThreadShell(threadId);
+  // Tailor fork: under the Supervised build ceiling the thread runs approval-required.
+  const shell = McpToolAccessTestkit.liveThreadShell(threadId, { runtimeMode: "approval-required" });
   const subagentId = NodeId.make("workflow-coordinator");
   const itemId = TurnItemId.make("workflow-coordinator-activity");
   const row: OrchestrationV2ProjectedTurnItem = {
@@ -876,7 +889,10 @@ it.effect("discovers workflow stop targets and requires orchestration capability
         Layer.provide(NodeCrypto.layer),
         Layer.provide(
           Layer.mock(ThreadManagement.ThreadManagementService)({
-            getThreadShell: (id) => Effect.succeed(McpToolAccessTestkit.liveThreadShell(id)),
+            getThreadShell: (id) =>
+              Effect.succeed(
+                McpToolAccessTestkit.liveThreadShell(id, { runtimeMode: "approval-required" }),
+              ),
             getProjectThreadRecords: () =>
               Effect.succeed(McpToolAccessTestkit.idleThreadProjection(shell)),
             getTimelinePage: () => Effect.succeed({ items: [row], totalItems: 1, hasMore: false }),

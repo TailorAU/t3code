@@ -9,6 +9,7 @@ import {
   type RuntimeMode,
   type ThreadId,
 } from "@t3tools/contracts";
+import { clampRuntimeMode } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -78,8 +79,10 @@ const interactionModeRank: Record<ProviderInteractionMode, number> = { plan: 0, 
  */
 export const clientModeCeiling = (client: McpClientCaller | undefined): ClientModes => {
   const approved: ClientModes = {
-    runtimeMode:
+    // Tailor fork: a client is never approved above the build's ceiling.
+    runtimeMode: clampRuntimeMode(
       client === undefined || client.access === "read-only" ? "approval-required" : client.access,
+    ),
     interactionMode: "default",
   };
   const asked = client?.narrowedTo;

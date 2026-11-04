@@ -45,6 +45,25 @@ export const AuthAccessReadScope = "access:read" as const;
 export const AuthAccessWriteScope = "access:write" as const;
 export const AuthRelayReadScope = "relay:read" as const;
 export const AuthRelayWriteScope = "relay:write" as const;
+/**
+ * Tailor fork: the connector's only scope. It reaches exactly the RPCs and dispatch commands
+ * in TAILOR_CONNECTOR_RPCS / TAILOR_CONNECTOR_COMMANDS (tailor/contract), nothing else.
+ */
+export const AuthTailorConnectorScope = "tailor:connector" as const;
+export const TAILOR_CONNECTOR_RPCS = [
+  "orchestration.subscribeShell",
+  "orchestration.getThreadProjection",
+  "orchestration.subscribeThread",
+  "orchestration.launchThread",
+  "orchestration.dispatchCommand",
+] as const;
+export const TAILOR_CONNECTOR_COMMANDS = [
+  "thread.create",
+  "message.dispatch",
+  "run.interrupt",
+  "thread.stop",
+  "runtime-request.respond",
+] as const;
 export const AuthEnvironmentScope = Schema.Literals([
   AuthOrchestrationReadScope,
   AuthOrchestrationOperateScope,
@@ -63,6 +82,7 @@ export const AuthEnvironmentScope = Schema.Literals([
   AuthAccessWriteScope,
   AuthRelayReadScope,
   AuthRelayWriteScope,
+  AuthTailorConnectorScope,
 ]);
 export type AuthEnvironmentScope = typeof AuthEnvironmentScope.Type;
 export const AuthEnvironmentScopes = Schema.Array(AuthEnvironmentScope);
@@ -97,6 +117,7 @@ const authScopeResponseFields = {
 
 // Client-only fallback for old servers. Servers never expand grants; empty permissions grant nothing.
 const legacyParents: Partial<Record<AuthEnvironmentScope, AuthEnvironmentScope>> = {
+  [AuthTailorConnectorScope]: AuthOrchestrationReadScope,
   [AuthFilesystemReadScope]: AuthOrchestrationReadScope,
   [AuthDiagnosticsReadScope]: AuthOrchestrationReadScope,
   [AuthSettingsWriteScope]: AuthOrchestrationOperateScope,

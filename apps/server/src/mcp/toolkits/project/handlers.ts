@@ -19,6 +19,9 @@ import { mutateProjectWithClone } from "../../../project/ProjectMutation.ts";
 import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
 import * as Repositories from "../../../sourceControl/SourceControlRepositoryService.ts";
 import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
+import * as ServerConfigModule from "../../../config.ts";
+import * as TailorMachinePolicy from "../../../tailor/machinePolicy.ts";
+import * as TailorWorkspacePolicy from "../../../tailor/workspacePolicy.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
 import * as DateTime from "effect/DateTime";
@@ -59,6 +62,20 @@ const assertProjectWorktree = Effect.fn("mcp.assertProjectWorktree")(function* (
       message:
         "worktreePath must be one of the project's git worktrees. t3_worktree_list shows them.",
     });
+  // Tailor fork: with the machine policy installed, a git worktree (which can live anywhere)
+  // must also be inside the project or T3's worktree folder, and outside the policy folder
+  // (workspacePolicy.ts). Orchestrator.dispatch applies the same rule to the launch itself.
+  const config = yield* Effect.serviceOption(ServerConfigModule.ServerConfig);
+  const rules = TailorMachinePolicy.tailorPathRulesIfInstalled(
+    process.platform,
+    Option.isSome(config) ? config.value.worktreesDir : workspaceRoot,
+  );
+  const refusal =
+    rules === undefined
+      ? undefined
+      : TailorWorkspacePolicy.checkWorktreePath(worktreePath, workspaceRoot, rules);
+  if (refusal !== undefined)
+    return yield* new OrchestratorMcpFailure({ code: "invalid_request", message: refusal });
 });
 
 /** A fixed-length id, so a long key fits in the scratch folder name derived from it. */

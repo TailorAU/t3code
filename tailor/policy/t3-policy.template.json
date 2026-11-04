@@ -1,0 +1,148 @@
+{
+  "$comment": "Generic lock-down policy template for a T3 Code v0.1.6 server run by a supervising connector. T3 Code has no managed-policy file of its own (see tailor/policy/README.md); install-policy.ps1 turns this template into machine environment variables, a read-only Claude settings file and an optional settings seed, and the connector launches 't3 serve' only with the 'serverEnvironment' below. No hostnames, paths, accounts or credentials belong in this file; machine-specific values are installer parameters. The build runs Claude only (TAILOR_CLAUDE_ONLY); disabledDrivers is no longer needed.",
+  "policyVersion": 1,
+  "t3Version": "0.1.6",
+  "clients": {
+    "allowed": [
+      "local-browser"
+    ],
+    "connect": false,
+    "remotePairing": false,
+    "tailscaleServe": false,
+    "ssh": false,
+    "lan": false
+  },
+  "telemetry": false,
+  "updates": "off",
+  "runtimeMode": {
+    "default": "approval-required",
+    "lockDefault": true,
+    "max": "approval-required",
+    "$comment": "Compiled into the server (TAILOR_MAX_RUNTIME_MODE, DEFAULT_RUNTIME_MODE): Supervised on every path. These values document it and cannot raise it; raising it needs the t3server/t3agent split (SECURITY-REVIEW.md, T3-42)."
+  },
+  "serverEnvironment": {
+    "T3CODE_HOST": "127.0.0.1",
+    "T3CODE_LAN": "false",
+    "T3CODE_TAILSCALE_SERVE": "false",
+    "T3CODE_TELEMETRY_ENABLED": "false",
+    "T3CODE_OTEL_SDK_DISABLED": "true",
+    "T3CODE_DISABLE_AUTO_UPDATE": "1",
+    "T3CODE_NO_BROWSER": "true",
+    "T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD": "false"
+  },
+  "serverEnvironmentMustBeUnset": [
+    "T3CODE_RELAY_URL",
+    "T3CODE_POSTHOG_KEY",
+    "T3CODE_POSTHOG_HOST",
+    "T3CODE_OTLP_TRACES_URL",
+    "T3CODE_OTLP_METRICS_URL",
+    "T3CODE_OTLP_LOGS_URL",
+    "T3CODE_OTLP_HEADERS",
+    "T3CODE_DEV_AUTH_TOKEN",
+    "VITE_DEV_SERVER_URL",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "all_proxy",
+    "NODE_OPTIONS"
+  ],
+  "t3SettingsSeed": {
+    "defaultRuntimeMode": "approval-required",
+    "enableProviderUpdateChecks": false,
+    "continueThreadsAfterServerUpdate": false,
+    "enableAgentBrowserAccess": false,
+    "enableAgentDeviceAccess": false,
+    "enableDeviceSupport": false
+  },
+  "claudeInstance": {
+    "instanceId": "claudeAgent",
+    "driver": "claudeAgent",
+    "$comment": "The installer writes 'settings' to <Claude home>\\settings.json, read-only to non-admins. The server reads it to cap the mode. The Claude binary loads no settings file at all (settingSources: []); its deny rules come from the policy tier compiled into the server (tailorClaudeManagedSettings), and are repeated here for reference.",
+    "settings": {
+      "permissions": {
+        "defaultMode": "default",
+        "disableBypassPermissionsMode": "disable",
+        "disableAutoMode": "disable",
+        "deny": [
+          "Edit(**/.claude/**)",
+          "Write(**/.claude/**)",
+          "Edit(**/.mcp.json)",
+          "Write(**/.mcp.json)",
+          "Edit(~/.claude.json)",
+          "Write(~/.claude.json)",
+          "Read(~/.t3/**)",
+          "Edit(~/.t3/**)",
+          "Write(~/.t3/**)",
+          "Edit(**/.githooks/**)",
+          "Write(**/.githooks/**)",
+          "Edit(**/.husky/**)",
+          "Write(**/.husky/**)",
+          "Edit(**/.git/**)",
+          "Write(**/.git/**)",
+          "Edit(~/.gitconfig)",
+          "Write(~/.gitconfig)",
+          "Edit(~/.config/git/**)",
+          "Write(~/.config/git/**)",
+          "Edit(**/.gitattributes)",
+          "Write(**/.gitattributes)",
+          "Edit(**/.gitmodules)",
+          "Write(**/.gitmodules)",
+          "WebSearch",
+          "WebFetch"
+        ]
+      },
+      "disableAutoMode": "disable"
+    },
+    "environment": {
+      "$comment": "Set on the T3 provider instance (Settings > Providers > Claude > Environment), never machine-wide. Credential variables are entered there as sensitive values; see provider-config.md.",
+      "DISABLE_AUTOUPDATER": "1",
+      "DISABLE_TELEMETRY": "1",
+      "DISABLE_ERROR_REPORTING": "1",
+      "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+    },
+    "environmentAllowlist": [
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_BASE_URL",
+      "ANTHROPIC_MODEL",
+      "ANTHROPIC_DEFAULT_OPUS_MODEL",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL",
+      "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+      "ANTHROPIC_SMALL_FAST_MODEL",
+      "CLAUDE_CODE_USE_BEDROCK",
+      "AWS_REGION",
+      "AWS_PROFILE",
+      "DISABLE_AUTOUPDATER",
+      "DISABLE_TELEMETRY",
+      "DISABLE_ERROR_REPORTING",
+      "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+    ]
+  },
+  "disabledDrivers": [],
+  "connectorToken": {
+    "$comment": "Issued by the 'T3 token issuer' task, which runs as t3agent with T3's own CLI against the T3 home every day, into %ProgramData%\\T3CodePolicy\\connector-drop (t3agent may create the file but not read, list or delete it). The 'T3 token mover' task (SYSTEM, fixed code) moves it into connector\\token with a t3bridge-only ACL set at creation. The daily issuer keeps the new and the previous connector session and revokes the rest; -RotateConnectorToken revokes every previous one first. tailor:connector reaches only the five contract RPCs and five dispatch commands (RpcAuthorization.tailorConnectorAllows). install-policy.ps1 -ConnectorTokenDays sets the lifetime.",
+    "scopes": [
+      "tailor:connector"
+    ],
+    "ttl": "7d",
+    "rpcAllowlist": "tailor/contract/connector-rpc-contract.json"
+  },
+  "egress": {
+    "$comment": "Defaults for install-policy.ps1 -AllowedHosts. Override per machine.",
+    "allowedHosts": [
+      "api.anthropic.com",
+      "bedrock-runtime.ap-southeast-2.amazonaws.com",
+      "bedrock-runtime.ap-southeast-4.amazonaws.com"
+    ]
+  },
+  "bridge": {
+    "$comment": "The T3 bridge runs as t3bridge, opens no listener, reaches T3 only through the named pipe \\\\.\\pipe\\t3code-bridge (owner t3agent, t3bridge read/write; it checks the owner and session before sending anything) and dials out only to the tailor.au API hosts given to install-policy.ps1 -TailorApiHosts (for example api.example.com). Its tailor.au key lives in %ProgramData%\\T3CodePolicy\\bridge, readable by t3bridge only."
+  },
+  "workspaces": {
+    "$comment": "Projects must be inside a workspace root while the policy is installed (workspacePolicy.ts). The installer creates %ProgramData%\\T3CodePolicy\\workspaces for Administrators, SYSTEM and t3agent only; -WorkspaceRoots adds more. See README.md, 'Getting code in and out'."
+  },
+  "gitHardening": {
+    "$comment": "Every git command T3 runs is the policy's absolute gitExe and gets GIT_CONFIG_GLOBAL = an empty admin-owned file (%ProgramData%\\T3CodePolicy\\git-config\\gitconfig), GIT_CONFIG_NOSYSTEM=1, core.hooksPath = the empty admin-owned git-hooks folder, safe.bareRepository=explicit, core.fsmonitor=false, protocol.ext.allow=never, protocol.file.allow=user, credential.helper= (cleared), core.askPass= and core.gitProxy=none, core.sshCommand=ssh, commit.gpgSign=false and tag.gpgSign=false; diff, log, show, blame, diff-tree and stash show get --no-ext-diff --no-textconv (gitHardening.ts)."
+  }
+}

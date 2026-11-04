@@ -432,6 +432,14 @@ async function waitForReplayDelay(afterMs: number, signal: AbortSignal): Promise
   }
 }
 
+function withoutTailorDenies(
+  settings: NonNullable<ClaudeAdapterV2.ClaudeAgentSdkQueryOptions["settings"]>,
+): NonNullable<ClaudeAdapterV2.ClaudeAgentSdkQueryOptions["settings"]> {
+  if (typeof settings !== "object" || settings === null) return settings;
+  const { permissions: _permissions, ...rest } = settings as Record<string, unknown>;
+  return rest as NonNullable<ClaudeAdapterV2.ClaudeAgentSdkQueryOptions["settings"]>;
+}
+
 function stableClaudeQueryOptions(
   options: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions,
 ): ClaudeAdapterV2.ClaudeAgentSdkQueryOptions {
@@ -441,7 +449,9 @@ function stableClaudeQueryOptions(
     permissionMode: options.permissionMode,
     ...(options.allowedTools === undefined ? {} : { allowedTools: options.allowedTools }),
     ...(options.disallowedTools === undefined ? {} : { disallowedTools: options.disallowedTools }),
-    ...(options.settings === undefined ? {} : { settings: options.settings }),
+    // Tailor fork: the lock's deny rules (settings.permissions) depend on machine paths and
+    // are tested in tailor/claudeLock.test.ts; replay fixtures compare everything else.
+    ...(options.settings === undefined ? {} : { settings: withoutTailorDenies(options.settings) }),
     ...(options.allowDangerouslySkipPermissions === true
       ? { allowDangerouslySkipPermissions: true }
       : {}),

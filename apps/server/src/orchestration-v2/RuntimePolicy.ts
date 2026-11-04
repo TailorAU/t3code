@@ -5,6 +5,7 @@ import {
   ProviderInstanceId,
   type RuntimeMode,
 } from "@t3tools/contracts";
+import { clampRuntimeMode } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -64,10 +65,12 @@ function providerRuntimeMode(
   runtimeMode: RuntimeMode,
   supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined,
 ): RuntimeMode {
+  // Tailor fork: a stored mode above the build's ceiling never reaches a provider.
+  const capped = clampRuntimeMode(runtimeMode);
   return supportedRuntimeModes === undefined ||
     supportedRuntimeModes.length === 0 ||
-    supportedRuntimeModes.includes(runtimeMode)
-    ? runtimeMode
+    supportedRuntimeModes.includes(capped)
+    ? capped
     : "approval-required";
 }
 

@@ -91,7 +91,12 @@ const decodeOutcome = Schema.decodeUnknownEffect(
   ),
 );
 
-const renameRacingTheUser = (threadId: ThreadId, userRaises: boolean) =>
+const renameRacingTheUser = (
+  threadId: ThreadId,
+  userRaises: boolean,
+  raise: "runtime" | "interaction" = "runtime",
+  caller: McpInvocationContext.McpInvocationScope = supervisedClient,
+) =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
     const threads = yield* ThreadManagement.ThreadManagementService;
@@ -103,12 +108,21 @@ const renameRacingTheUser = (threadId: ThreadId, userRaises: boolean) =>
           Effect.gen(function* () {
             if (userRaises) {
               yield* orchestrator
-                .dispatch({
-                  type: "thread.runtime-mode.set",
-                  commandId: CommandId.make("user-raise"),
-                  threadId: input.threadId,
-                  runtimeMode: "full-access",
-                })
+                .dispatch(
+                  raise === "runtime"
+                    ? {
+                        type: "thread.runtime-mode.set",
+                        commandId: CommandId.make("user-raise"),
+                        threadId: input.threadId,
+                        runtimeMode: "full-access",
+                      }
+                    : {
+                        type: "thread.interaction-mode.set",
+                        commandId: CommandId.make("user-raise-interaction"),
+                        threadId: input.threadId,
+                        interactionMode: "default",
+                      },
+                )
                 .pipe(Effect.provideService(DispatchModeLimit, undefined), Effect.orDie);
               yield* Ref.set(raised, true);
             }
@@ -137,7 +151,7 @@ const renameRacingTheUser = (threadId: ThreadId, userRaises: boolean) =>
       Effect.flatMap(({ content }) =>
         decodeOutcome(content.map((part) => (part.type === "text" ? part.text : "")).join("")),
       ),
-      Effect.provideService(McpInvocationContext.McpInvocationContext, supervisedClient),
+      Effect.provideService(McpInvocationContext.McpInvocationContext, caller),
       Effect.provideService(McpSchema.McpServerClient, mcpClient),
       Effect.provide(
         McpHttpServer.toolkitRegistration(RenameToolkit, handlers).pipe(
@@ -149,7 +163,7 @@ const renameRacingTheUser = (threadId: ThreadId, userRaises: boolean) =>
     return outcome;
   });
 
-const createSupervisedThread = (threadId: ThreadId) =>
+const createSupervisedThread = (threadId: ThreadId, interactionMode: "plan" | "default" = "default") =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
     yield* orchestrator.dispatch({
@@ -160,7 +174,7 @@ const createSupervisedThread = (threadId: ThreadId) =>
       title: "Before",
       modelSelection: { instanceId, model: "gpt-5" },
       runtimeMode: "approval-required",
-      interactionMode: "default",
+      interactionMode,
       branch: null,
       worktreePath: null,
       createdBy: "user",
@@ -168,17 +182,54 @@ const createSupervisedThread = (threadId: ThreadId) =>
     });
   });
 
+/** A Supervised client narrowed to plan mode (T3-Mode-Limit: approval-required/plan). */
+const planClient: McpInvocationContext.McpInvocationScope = {
+  ...supervisedClient,
+  client: {
+    sessionId: "race-plan",
+    label: "Claude Code",
+    access: "approval-required",
+    narrowedTo: { runtimeMode: "approval-required", interactionMode: "plan" },
+  },
+};
+
 it.layer(layerOrchestrator)("writesThreads against a mode raise", (it) => {
-  it.effect("refuses the write when the user raises the thread after the check", () =>
+  // The orchestrator's under-lock recheck still guards the interaction mode, which the build
+  // ceiling does not cap: a plan-limited caller's write is refused when the user raises the
+  // thread to default mode after the caller's check.
+  it.effect("refuses the write when the user raises the interaction mode after the check", () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = ThreadId.make("thread:race-interaction");
+      yield* createSupervisedThread(threadId, "plan");
+      const outcome = yield* renameRacingTheUser(threadId, true, "interaction", planClient);
+      assert.deepEqual(outcome, { code: "interaction_mode_escalation_denied" });
+      const shell = yield* projections.getThreadShell(threadId);
+      assert.equal(shell?.interactionMode, "default");
+      assert.equal(shell?.title, "Before");
+    }).pipe(
+      Effect.provide(
+        ThreadManagement.layer.pipe(
+          Layer.provide(ServerSettings.layerTest()),
+          Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
+        ),
+      ),
+    ),
+  );
+
+  // Tailor fork: the build ceiling is Supervised, so the user's raise to Full access is capped
+  // at approval-required; the thread never goes above the supervised caller, and the write
+  // goes through at the caller's own mode.
+  it.effect("caps the user's raise at Supervised, so the write stays within the caller's mode", () =>
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;
       const threadId = ThreadId.make("thread:race-raised");
       yield* createSupervisedThread(threadId);
       const outcome = yield* renameRacingTheUser(threadId, true);
-      assert.deepEqual(outcome, { code: "runtime_mode_escalation_denied" });
+      assert.deepEqual(outcome, { renamed: true });
       const shell = yield* projections.getThreadShell(threadId);
-      assert.equal(shell?.runtimeMode, "full-access");
-      assert.equal(shell?.title, "Before");
+      assert.equal(shell?.runtimeMode, "approval-required");
+      assert.equal(shell?.title, "Renamed by the agent");
     }).pipe(
       Effect.provide(
         ThreadManagement.layer.pipe(

@@ -20,7 +20,7 @@ import {
 } from "../provider/ClaudeModelCatalog.testFixtures.ts";
 import * as TextGeneration from "./TextGeneration.ts";
 import { sanitizeThreadTitle } from "@t3tools/provider-core/server/textGenerationUtils";
-import { makeClaudeTextGeneration } from "./ClaudeTextGeneration.ts";
+import { claudePrintToolArgs, makeClaudeTextGeneration } from "./ClaudeTextGeneration.ts";
 import { writeFakeCli } from "@t3tools/provider-testing/fakeCli";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
@@ -207,7 +207,7 @@ it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
               body: "Body",
             },
           }),
-          argsMustContain: `--model ${SYNTHETIC_CLAUDE_CAPABLE_MODEL}[expanded] --effort max --settings {"disableAllHooks":true,"fastMode":true}`,
+          argsMustContain: `--model ${SYNTHETIC_CLAUDE_CAPABLE_MODEL}[expanded] --effort max --settings {"disableAllHooks":true,"fastMode":true,"permissions":{"deny":["Edit(**/.claude/**)"`,
           claudeConfig: { customModels: [SYNTHETIC_CLAUDE_COLLIDING_ALIAS] },
         },
         (textGeneration) =>
@@ -234,6 +234,50 @@ it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
             expect(generated.title).toBe("Improve orchestration flow");
           }),
       ),
+  );
+
+  // Tailor fork: the review-guide investigation gets read-only tools, never Bash.
+  it.effect("gives the investigation run read-only tools only", () =>
+    Effect.sync(() => {
+    const args = claudePrintToolArgs(true);
+    expect(args).toEqual([
+      "--tools",
+      "Read",
+      "--allowedTools",
+      "Read(./**)",
+      "--disallowedTools",
+      "Bash,Grep,Glob,Edit,Write,NotebookEdit,WebFetch,WebSearch",
+    ]);
+    expect(args.join(" ")).not.toMatch(/Bash\(/);
+    expect(claudePrintToolArgs(false)).toEqual(["--tools", ""]);
+    }),
+  );
+
+  // Tailor fork: claude -p loads no settings files and runs outside the repository.
+  it.effect("runs PR content generation with no setting sources, outside the project", () =>
+    withFakeClaudeEnv(
+      {
+        output: JSON.stringify({ structured_output: { title: "Title", body: "Body" } }),
+        argsMustContain: "--setting-sources= ",
+        cwdMustNotBe: process.cwd(),
+      },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          const generated = yield* textGeneration.generatePrContent({
+            cwd: process.cwd(),
+            baseBranch: "main",
+            headBranch: "feature/x",
+            commitSummary: "Change",
+            diffSummary: "1 file changed",
+            diffPatch: "diff --git a/README.md b/README.md",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("claudeAgent"),
+              model: SYNTHETIC_CLAUDE_STANDARD_MODEL,
+            },
+          });
+          expect(generated.title).toBe("Title");
+        }),
+    ),
   );
 
   it.effect(

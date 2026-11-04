@@ -78,7 +78,8 @@ catalog:
   tailwindcss: 4.3.3
   tldts: 7.4.2
   typescript: npm:@tsc-rs/typescript@0.8.0
-  undici: 8.11.2
+  # Tailor fork: 8.12.2 fixes GHSA-qrxm-fqhp-jwvm, GHSA-xjj6-f33q-929c, GHSA-2m5v-pch6-74hx, GHSA-4w7w-5xrc-9h26.
+  undici: 8.12.2
   vite: npm:@voidzero-dev/vite-plus-core@1.4.0
   vite-plus: 1.4.0
   ws: 8.22.0
@@ -229,6 +230,16 @@ minimumReleaseAgeExclude:
   - agent-device@0.21.32
 
 overrides:
+  # Tailor (TailorAU/t3code fork): runtime security advisories, see tailor/SECURITY-REVIEW.md.
+  # @modelcontextprotocol/sdk < 1.32.0: GHSA-22jm-h49p-29qw (8.6), GHSA-f897-62hf-6gxq,
+  # GHSA-46jr-4wx8-v453, GHSA-6qxp-vccf-f47h, GHSA-rvq5-wwqv-78pq, GHSA-6prh-2h8m-c8cw.
+  "@modelcontextprotocol/sdk": 1.32.2
+  # proxy-addr < 2.0.8: GHSA-jqcg-44mw-7w3h (9.1, IP spoofing via IPv4-mapped IPv6 trust subnet).
+  proxy-addr: 2.0.8
+  # zod 4 < 4.6.6: GHSA-mrhx-c7xc-m3w5 (memory exhaustion while validating; used by the agent SDK).
+  "zod@^4": 4.6.6
+  # dompurify < 3.4.17: GHSA-cg2g-xh64-v4q7, GHSA-mrv2-3pqr-j5jr (sanitiser bypass in the web UI).
+  dompurify: 3.4.17
   # Pin every patched package, including transitive dependencies, so lockfile-free
   # release installs cannot drift past the patch. Update these with patchedDependencies.
   react-native-image-viewing: 0.2.2

@@ -22,8 +22,11 @@ import { loadRepoEnv } from "../../scripts/lib/public-config";
 import { thirdPartyLicensesPlugin } from "../../scripts/lib/third-party-licenses";
 import { tailwindPlugins } from "./vite/tailwind";
 import { warmBundledDevPlugin } from "./vite/warmBundledDev";
+import { assertNoRemoteBuildConfig } from "../../tailor/build/assertNoRemoteBuildConfig.ts";
 
 const repoEnv = loadRepoEnv();
+// Tailor fork: no Clerk, relay or relay-tracing value may be compiled in.
+assertNoRemoteBuildConfig({ ...process.env, ...repoEnv });
 Object.assign(process.env, repoEnv);
 
 // Signal single-origin dev explicitly; loadRepoEnv can restore deleted URL keys from .env.

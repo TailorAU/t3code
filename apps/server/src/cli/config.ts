@@ -23,7 +23,6 @@ import { Argument, Flag } from "effect/cli";
 import * as CliError from "effect/cli/CliError";
 
 import { readBootstrapEnvelope } from "../bootstrap.ts";
-import { resolveServiceLauncherMode } from "../cloud/serviceLauncherClient.ts";
 import * as ServerConfig from "../config.ts";
 import { expandHomePath, resolveBaseDir } from "../os-jank.ts";
 import { isProcessAlive, readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
@@ -424,17 +423,12 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
   // T3 Connect. `t3 service install` writes T3CODE_LAN=false for a new
   // service; one installed before T3CODE_LAN existed keeps listening.
   const lan = resolveOptionPrecedence(normalizedFlags.lan, Option.fromUndefinedOr(env.lan));
+  // Tailor fork: web mode binds loopback unless T3CODE_LAN/--lan is explicitly true; a
+  // managed service no longer defaults to listening on private networks.
   const privateNetworkOnly =
-    Option.isNone(explicitHost) &&
-    mode === "web" &&
-    (Option.isSome(lan)
-      ? lan.value
-      : yield* resolveServiceLauncherMode().pipe(
-          Effect.map((launcher) => launcher.managed),
-          Effect.orElseSucceed(() => false),
-        ));
+    Option.isNone(explicitHost) && mode === "web" && Option.isSome(lan) && lan.value;
   const host = Option.getOrElse(explicitHost, () =>
-    privateNetworkOnly ? "0.0.0.0" : mode === "desktop" ? "127.0.0.1" : undefined,
+    privateNetworkOnly ? "0.0.0.0" : "127.0.0.1",
   );
   const logLevel = Option.getOrElse(cliLogLevel, () => env.logLevel);
 
@@ -519,6 +513,8 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     logWebSocketEvents,
     tailscaleServeEnabled,
     tailscaleServePort,
+    // Tailor fork: a real server always requires the machine policy on Windows.
+    tailorPolicyRequired: true,
   };
 
   return config;

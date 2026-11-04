@@ -81,8 +81,19 @@ export const TAILOR_WEB_APP_CONTENT_SECURITY_POLICY = [
   "frame-ancestors 'none'",
 ].join("; ");
 
-const HTML_CONTENT_SECURITY_POLICY =
-  "sandbox allow-scripts allow-forms allow-popups allow-downloads";
+/**
+ * Tailor fork: agent-written HTML is sandboxed with no network and no forms
+ * (upstream: "sandbox allow-scripts allow-forms allow-popups allow-downloads").
+ */
+export const HTML_CONTENT_SECURITY_POLICY = [
+  "default-src 'none'",
+  "script-src 'unsafe-inline'",
+  "style-src 'unsafe-inline'",
+  "img-src data: blob:",
+  "connect-src 'none'",
+  "form-action 'none'",
+  "sandbox allow-scripts",
+].join("; ");
 
 // Proxies may strip disposition; force document-capable downloads to octet-stream.
 const DOWNLOAD_MIME_TYPE_PATTERN = /^[\w!#$&^.+-]+\/[\w!#$&^.+-]+$/;

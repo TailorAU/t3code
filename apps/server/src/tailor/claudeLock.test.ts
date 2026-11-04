@@ -28,10 +28,31 @@ describe("Tailor Claude query lock", () => {
       assert.strictEqual(locked.permissionMode, "default");
       assert.isUndefined(locked.allowDangerouslySkipPermissions);
     }
+    // The build ceiling is Supervised: acceptEdits is capped too.
     assert.strictEqual(
       ClaudeAdapterV2.tailorLockClaudeQueryOptions(baseOptions, "acceptEdits").permissionMode,
-      "acceptEdits",
+      "default",
     );
+    assert.strictEqual(
+      ClaudeAdapterV2.tailorLockClaudeQueryOptions(baseOptions, "plan").permissionMode,
+      "plan",
+    );
+  });
+
+  it("puts the denies in the flag tier as well as managedSettings", () => {
+    // SDK 0.3.276 drops managedSettings under a machine tier without parentSettingsBehavior
+    // "merge", so the flag tier must carry the same rules.
+    const locked = ClaudeAdapterV2.tailorLockClaudeQueryOptions(
+      { ...baseOptions, settings: { permissions: { deny: ["Read(./secret)"] } } } as never,
+      "default",
+    );
+    const flag = (locked.settings as { permissions: { deny: string[] } }).permissions.deny;
+    const managed = (locked.managedSettings as { permissions: { deny: string[] } }).permissions.deny;
+    for (const rule of managed) assert.include(flag, rule);
+    assert.include(flag, "Read(./secret)");
+    for (const rule of ["Edit(**/.git/hooks/**)", "Write(**/.git/config)", "Edit(**/.githooks/**)"]) {
+      assert.include(flag, rule);
+    }
   });
 
   it("disallows web tools and keeps existing denials", () => {

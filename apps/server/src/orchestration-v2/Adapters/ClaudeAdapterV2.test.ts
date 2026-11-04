@@ -659,7 +659,8 @@ describe("ClaudeAdapterV2 native protocol logging", () => {
       sdkSettings: { env: { ANTHROPIC_API_KEY: "secret-settings-key" } },
     });
     const logged = ClaudeAdapterV2.loggedClaudeQueryOptions(options);
-    assert.deepEqual(logged.settingKeys, ["showThinkingSummaries"]);
+    // Only T3's own keys: thinking summaries and the compiled deny rules.
+    assert.deepEqual(logged.settingKeys, ["showThinkingSummaries", "permissions"]);
     assert.notInclude(JSON.stringify(logged), "secret-settings-key");
   });
 });
@@ -916,7 +917,8 @@ describe("ClaudeAdapterV2 Auto-accept edits", () => {
             runtimePolicy,
           }),
         );
-        assert.equal(openedOptions?.permissionMode, "acceptEdits");
+        // Tailor fork: the build ceiling is Supervised, so Auto-accept edits runs as default.
+        assert.equal(openedOptions?.permissionMode, "default");
         const canUseTool = openedOptions?.canUseTool;
         assert.isFunction(canUseTool);
 
@@ -1071,7 +1073,10 @@ describe("ClaudeAdapterV2 user launch arguments (ignored in the Tailor fork)", (
       unknown
     >;
     assert.notProperty(settings, "hooks");
-    assert.notProperty(settings, "permissions");
+    // The only permissions in the flag tier are the compiled denies; no allow rule gets in.
+    const flagPermissions = settings.permissions as { allow?: unknown; deny?: string[] } | undefined;
+    assert.isUndefined(flagPermissions?.allow);
+    assert.include(flagPermissions?.deny ?? [], "Edit(**/.claude/**)");
     const deny = (options.managedSettings as { permissions?: { deny?: string[] } } | undefined)
       ?.permissions?.deny;
     assert.include(deny ?? [], "Edit(**/.claude/**)");
@@ -7568,9 +7573,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
               options: {
                 model: "claude-sonnet-4-6",
                 tools: { type: "preset", preset: "claude_code" },
-                // Tailor fork: the orchestrator clamps Full access to Auto-accept edits (acceptEdits);
+                // Tailor fork: the orchestrator clamps Full access to Supervised (default);
                 // web tools are disallowed.
-                permissionMode: "acceptEdits",
+                permissionMode: "default",
                 disallowedTools: ["WebSearch", "WebFetch"],
                 settings: { showThinkingSummaries: true },
                 sessionId: WAKE_NATIVE_SESSION,

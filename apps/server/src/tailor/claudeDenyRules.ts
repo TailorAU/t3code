@@ -74,7 +74,18 @@ export function tailorClaudeManagedSettings(
   if (paths.t3BaseDir !== undefined && paths.t3BaseDir.trim().length > 0) {
     bases.add(claudeAbsoluteRulePath(paths.t3BaseDir.trim()));
   }
-  const protectedConfig = ["**/.claude/**", "**/.mcp.json", "~/.claude.json"];
+  // Claude and MCP config, and git hooks and config (hooks, core.hooksPath, fsmonitor,
+  // external diff and textconv drivers all live there).
+  const protectedConfig = [
+    "**/.claude/**",
+    "**/.mcp.json",
+    "~/.claude.json",
+    "**/.git/hooks/**",
+    "**/.git/config",
+    "**/.git/info/attributes",
+    "**/.githooks/**",
+    "**/.husky/**",
+  ];
   const claudeHomeRules =
     paths.claudeHome === undefined || paths.claudeHome.trim().length === 0
       ? []

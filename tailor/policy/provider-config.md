@@ -64,7 +64,7 @@ affected.
 
 The server opens every Claude query with no settings files (`settingSources: []`), only
 T3's own MCP server, `WebSearch` and `WebFetch` disallowed, the permission mode capped at
-Auto-accept edits, and compiled deny rules (tailor/policy/README.md). Repository
+Supervised (`default`), and compiled deny rules (tailor/policy/README.md). Repository
 `CLAUDE.md` and `.claude/` files are not loaded. Instance launch arguments cannot raise the
 permission mode.
 

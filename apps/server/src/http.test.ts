@@ -29,7 +29,12 @@ import { ORCHESTRATION_PROTOCOL_HEADER } from "@t3tools/contracts";
 
 import * as ServerConfig from "./config.ts";
 
-import { assetResponseHeaders, assetFileResponse, downloadContentDisposition } from "./http.ts";
+import {
+  HTML_CONTENT_SECURITY_POLICY,
+  assetResponseHeaders,
+  assetFileResponse,
+  downloadContentDisposition,
+} from "./http.ts";
 import * as ServerHttp from "./http.ts";
 
 describe("MCP app asset responses", () => {
@@ -63,7 +68,7 @@ describe("MCP app asset responses", () => {
           expect(response.headers.get("etag")).toBeNull();
           expect(response.headers.get("last-modified")).toBeNull();
           expect(response.headers.get("content-security-policy")).toBe(
-            "sandbox allow-scripts allow-forms allow-popups allow-downloads",
+            HTML_CONTENT_SECURITY_POLICY,
           );
           expect(yield* Effect.promise(() => response.text())).toBe(
             method === "HEAD" ? "" : expected,
@@ -787,7 +792,7 @@ describe("assetResponseHeaders", () => {
       assetResponseHeaders("/attachments/upload.bin", { mimeType: "text/html" }),
     ).toMatchObject({
       "Content-Type": "text/html; charset=utf-8",
-      "Content-Security-Policy": "sandbox allow-scripts allow-forms allow-popups allow-downloads",
+      "Content-Security-Policy": HTML_CONTENT_SECURITY_POLICY,
     });
   });
 

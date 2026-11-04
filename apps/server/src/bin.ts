@@ -36,6 +36,10 @@ if (
     await runAcpMcpCliFastPath(command, process.argv.slice(3));
   } else {
     // Windows desktop launches without stdin; attach before reading, except on fast paths using pipes.
+    // Tailor fork: hooks, fsmonitor, ext transports and implicit bare repositories are off for
+    // every git process this server or its children start (tailor/gitHardening.ts).
+    const { applyTailorGitHardening } = await import("./tailor/gitHardening.ts");
+    applyTailorGitHardening();
     const { attachConsoleStdin } = await import("./cli/consoleStdin.ts");
     attachConsoleStdin();
     const { runCli } = await import("./binCli.ts");

@@ -17,8 +17,8 @@
   "runtimeMode": {
     "default": "approval-required",
     "lockDefault": true,
-    "max": "auto-accept-edits",
-    "$comment": "Compiled into the server (TAILOR_MAX_RUNTIME_MODE, DEFAULT_RUNTIME_MODE); these values document it and cannot raise it."
+    "max": "approval-required",
+    "$comment": "Compiled into the server (TAILOR_MAX_RUNTIME_MODE, DEFAULT_RUNTIME_MODE): Supervised on every path. These values document it and cannot raise it; raising it needs the t3server/t3agent split (SECURITY-REVIEW.md, T3-42)."
   },
   "serverEnvironment": {
     "T3CODE_HOST": "127.0.0.1",
@@ -75,6 +75,14 @@
           "Read(~/.t3/**)",
           "Edit(~/.t3/**)",
           "Write(~/.t3/**)",
+          "Edit(**/.git/hooks/**)",
+          "Write(**/.git/hooks/**)",
+          "Edit(**/.git/config)",
+          "Write(**/.git/config)",
+          "Edit(**/.githooks/**)",
+          "Write(**/.githooks/**)",
+          "Edit(**/.husky/**)",
+          "Write(**/.husky/**)",
           "WebSearch",
           "WebFetch"
         ]
@@ -107,7 +115,7 @@
   },
   "disabledDrivers": [],
   "connectorToken": {
-    "$comment": "Issued by install-policy.ps1 into %ProgramData%\\T3CodePolicy\\connector\\token, readable by the t3bridge account only, never printed. tailor:connector reaches only the five contract RPCs and five dispatch commands (RpcAuthorization.tailorConnectorAllows).",
+    "$comment": "Issued by the 'T3 token issuer' task, which runs as t3agent with T3's own CLI against the T3 home every day, into %ProgramData%\\T3CodePolicy\\connector-drop (t3agent may create the file but not read, list or delete it). The 'T3 token mover' task (SYSTEM, fixed code) moves it into connector\token with a t3bridge-only ACL set at creation. The issuer keeps the two newest connector sessions and revokes the rest. tailor:connector reaches only the five contract RPCs and five dispatch commands (RpcAuthorization.tailorConnectorAllows). install-policy.ps1 -ConnectorTokenDays sets the lifetime.",
     "scopes": [
       "tailor:connector"
     ],
@@ -124,5 +132,11 @@
   },
   "bridge": {
     "$comment": "The T3 bridge runs as t3bridge, opens no listener, and dials out only to loopback (T3) and the tailor.au API hosts given to install-policy.ps1 -TailorApiHosts (for example api.example.com). Its tailor.au key lives in %ProgramData%\\T3CodePolicy\\bridge, readable by t3bridge only."
+  },
+  "workspaces": {
+    "$comment": "Projects must be inside a workspace root while the policy is installed (workspacePolicy.ts). The installer creates %ProgramData%\\T3CodePolicy\\workspaces for Administrators, SYSTEM and t3agent only; -WorkspaceRoots adds more. See README.md, 'Getting code in and out'."
+  },
+  "gitHardening": {
+    "$comment": "Every git command T3 runs gets core.hooksPath=%ProgramData%\\T3CodePolicy\\git-hooks (empty, admin-owned), safe.bareRepository=explicit, core.fsmonitor=false and protocol.ext.allow=never, and diff, log and show get --no-ext-diff --no-textconv (gitHardening.ts)."
   }
 }

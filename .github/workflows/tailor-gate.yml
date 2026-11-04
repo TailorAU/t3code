@@ -73,7 +73,7 @@ jobs:
           CI: "1"
         run: ../../node_modules/.bin/vp test run --config ../../vite.config.ts --dir .
 
-      - name: Connector scopes, mode clamp, Claude lock, MCP access, registry, telemetry
+      - name: Connector scopes, mode clamp, Claude lock, git hardening, paths, CSP, MCP access, registry, telemetry
         shell: bash
         working-directory: apps/server
         env:
@@ -90,6 +90,7 @@ jobs:
           src/telemetry/AnalyticsService.test.ts
           src/provider/ProviderInstanceRegistryHydration.test.ts
           src/provider/ProviderRegistry.test.ts
+          src/http.test.ts
 
       - name: Machine managed-settings merge fixtures
         shell: pwsh
@@ -99,12 +100,14 @@ jobs:
         shell: pwsh
         run: ./tailor/policy/tests/ServiceAccounts.Tests.ps1
 
-      - name: Installer parses
+      - name: Installer and self-check parse
         shell: pwsh
         run: |
-          $t = $null; $e = $null
-          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD/tailor/policy/install-policy.ps1", [ref]$t, [ref]$e)
-          if ($e.Count -gt 0) { $e | ForEach-Object { Write-Error $_.Message }; exit 1 }
+          foreach ($file in 'install-policy.ps1', 'verify-install.ps1') {
+            $t = $null; $e = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD/tailor/policy/$file", [ref]$t, [ref]$e)
+            if ($e.Count -gt 0) { $e | ForEach-Object { Write-Error "$file : $($_.Message)" }; exit 1 }
+          }
 
   full-suite:
     name: Full suite, informational (windows-latest)

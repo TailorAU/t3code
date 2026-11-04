@@ -1,4 +1,6 @@
 import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
+import * as TailorMachinePolicy from "./tailor/machinePolicy.ts";
+import * as TailorWorkspacePolicy from "./tailor/workspacePolicy.ts";
 import { clampRuntimeMode } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -1867,6 +1869,40 @@ export const layerWsRpc = (
         return yield* mutateProjectWithClone(projectService, projectCloneTracker, mutation);
       });
 
+      // Tailor fork: worktrees stay inside their project or T3's worktree root, projects inside
+      // the policy's workspace roots, and nothing inside the policy folder (workspacePolicy.ts).
+      const tailorPathRules = () =>
+        TailorMachinePolicy.tailorPathRules(process.platform, config.worktreesDir);
+      const tailorWorktreeRefusal = Effect.fn("ws.tailor.worktreeRefusal")(function* (
+        target: { readonly projectId: ProjectId | null; readonly worktreePath: string | null },
+      ) {
+        const { projectId, worktreePath } = target;
+        if (worktreePath === null || projectId === null) return undefined;
+        const project = yield* projectStore
+          .get(projectId)
+          .pipe(Effect.orElseSucceed(() => Option.none<{ readonly workspaceRoot: string }>()));
+        if (Option.isNone(project)) return "The project was not found.";
+        return TailorWorkspacePolicy.checkWorktreePath(
+          worktreePath,
+          project.value.workspaceRoot,
+          tailorPathRules(),
+        );
+      });
+      const tailorCommandRefusal = (command: OrchestrationV2Command) =>
+        tailorWorktreeRefusal(
+          command.type === "thread.create"
+            ? { projectId: command.projectId, worktreePath: command.worktreePath }
+            : { projectId: null, worktreePath: null },
+        );
+      const tailorProjectRefusal = (mutation: ProjectMutation) =>
+        mutation.type === "project.create"
+          ? TailorWorkspacePolicy.checkProjectRoot(
+              mutation.workspaceRoot,
+              TailorWorkspacePolicy.managedProjectRoots(config.baseDir),
+              tailorPathRules(),
+            )
+          : undefined;
+
       const handlers = ServerWsRpcGroup.of({
         [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command) =>
           Effect.annotateCurrentSpan({
@@ -1886,6 +1922,19 @@ export const layerWsRpc = (
               ? { "orchestration_v2.source_thread_id": command.sourceThreadId }
               : {}),
           }).pipe(
+            Effect.andThen(tailorCommandRefusal(command)),
+            Effect.flatMap((refusal) =>
+              refusal === undefined
+                ? Effect.void
+                : Effect.fail(
+                    new OrchestrationV2DispatchCommandError({
+                      commandId: command.commandId,
+                      commandType: command.type,
+                      message: refusal,
+                      detail: refusal,
+                    }),
+                  ),
+            ),
             Effect.andThen(
               startup
                 .enqueueCommand(
@@ -2037,6 +2086,26 @@ export const layerWsRpc = (
             "orchestration_v2.command_id": input.commandId,
             "orchestration_v2.project_id": input.projectId,
           }).pipe(
+            Effect.andThen(
+              tailorWorktreeRefusal({
+                projectId: input.projectId,
+                worktreePath:
+                  input.workspaceStrategy.type === "existing_worktree"
+                    ? input.workspaceStrategy.worktreePath
+                    : null,
+              }),
+            ),
+            Effect.flatMap((refusal) =>
+              refusal === undefined
+                ? Effect.void
+                : Effect.fail(
+                    new OrchestrationV2ThreadLaunchError({
+                      commandId: input.commandId,
+                      projectId: input.projectId,
+                      message: refusal,
+                    }),
+                  ),
+            ),
             Effect.andThen(
               startup
                 .enqueueCommand(
@@ -2825,7 +2894,14 @@ export const layerWsRpc = (
             ),
           ),
         [WS_METHODS.projectsMutate]: (mutation) =>
-          startup.enqueueCommand(mutateProject(mutation)).pipe(
+          tailorProjectRefusal(mutation) !== undefined
+            ? Effect.fail(
+                new ProjectMutationError({
+                  commandId: mutation.commandId,
+                  message: tailorProjectRefusal(mutation)!,
+                }),
+              )
+            : startup.enqueueCommand(mutateProject(mutation)).pipe(
             Effect.mapError(
               (cause) =>
                 new ProjectMutationError({

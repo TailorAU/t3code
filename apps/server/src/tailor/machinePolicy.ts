@@ -41,6 +41,8 @@ export interface TailorInstalledPolicy {
   readonly claudeExe: string;
   readonly claudeExeSha256: string | undefined;
   readonly instanceEnvironmentAllowlist: ReadonlyArray<string>;
+  /** Project roots the installer created for t3agent; projects must be inside one. */
+  readonly workspaceRoots: ReadonlyArray<string>;
 }
 
 export type TailorPolicyState =
@@ -57,6 +59,7 @@ export function parseTailorInstalledPolicy(raw: string): TailorInstalledPolicy |
         readonly claudeExe?: unknown;
         readonly claudeExeSha256?: unknown;
         readonly instanceEnvironmentAllowlist?: unknown;
+        readonly workspaceRoots?: unknown;
       };
     };
     const installed = parsed.installed;
@@ -85,6 +88,11 @@ export function parseTailorInstalledPolicy(raw: string): TailorInstalledPolicy |
         listed === undefined
           ? TAILOR_INSTANCE_ENVIRONMENT_ALLOWLIST
           : TAILOR_INSTANCE_ENVIRONMENT_ALLOWLIST.filter((name) => listed.includes(name)),
+      workspaceRoots: Array.isArray(installed.workspaceRoots)
+        ? installed.workspaceRoots.filter(
+            (root): root is string => typeof root === "string" && root.length > 0,
+          )
+        : [],
     };
   } catch {
     return null;
@@ -179,4 +187,26 @@ export function filterInstanceEnvironment<E extends { readonly name: string }>(
   allowlist: ReadonlyArray<string> = TAILOR_INSTANCE_ENVIRONMENT_ALLOWLIST,
 ): ReadonlyArray<E> {
   return environment.filter((variable) => allowlist.includes(variable.name));
+}
+
+/**
+ * The path rules for projects and worktrees. With the policy installed, projects are limited
+ * to its workspace roots (plus T3's managed folders); otherwise only the policy folder itself
+ * is off limits.
+ */
+export function tailorPathRules(
+  platform: string,
+  worktreesRoot: string,
+): { readonly policyDir: string | undefined; readonly workspaceRoots: ReadonlyArray<string> | undefined; readonly worktreesRoot: string } {
+  const policyFile = tailorPolicyFilePath(platform);
+  const policyDir =
+    policyFile === undefined
+      ? undefined
+      : (platform === "win32" ? NodePath.win32 : NodePath.posix).dirname(policyFile);
+  const state = readTailorPolicyAt(policyFile);
+  return {
+    policyDir,
+    workspaceRoots: state._tag === "installed" ? state.policy.workspaceRoots : undefined,
+    worktreesRoot,
+  };
 }

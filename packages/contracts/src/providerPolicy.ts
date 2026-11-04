@@ -33,9 +33,10 @@ export type RuntimeMode = typeof RuntimeMode.Type;
 /**
  * Tailor fork (TailorAU/t3code): compile-time ceiling on every runtime mode the server
  * stores, hands to a provider, or grants to an MCP caller. Full access and Auto never
- * exist in this build; the most permissive mode is Auto-accept edits.
+ * exist in this build, and neither does Auto-accept edits: every mode runs Supervised
+ * (approval-required). Raising it needs the t3server/t3agent split (SECURITY-REVIEW T3-42).
  */
-export const TAILOR_MAX_RUNTIME_MODE: RuntimeMode = "auto-accept-edits";
+export const TAILOR_MAX_RUNTIME_MODE: RuntimeMode = "approval-required";
 const TAILOR_RUNTIME_MODE_RANK: Record<RuntimeMode, number> = {
   "approval-required": 0,
   "auto-accept-edits": 1,

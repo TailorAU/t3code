@@ -46,7 +46,15 @@ try {
   Assert-True ($bParsed.hooks.PreToolUse[0].hooks[0].command -eq 'audit.cmd') '(b) hooks kept'
   Assert-True ($bParsed.env.HTTPS_PROXY -eq 'http://proxy.example:8080') '(b) env kept'
   Assert-True ($bParsed.someFutureKey.nested[2].x -eq $true) '(b) unknown keys kept'
-  Assert-True (-not ($b.Created.file -or $b.Created.permissions -or $b.Created.deny)) '(b) created nothing'
+  Assert-True (-not ($b.Created.file -or $b.Created.permissions -or $b.Created.deny)) '(b) created no keys it did not need'
+  Assert-True ($bParsed.parentSettingsBehavior -eq 'merge' -and $b.Created.parentSettingsBehavior) '(b) adds parentSettingsBehavior merge and records it'
+
+  # parentSettingsBehavior: kept when already "merge", refused when set to anything else.
+  $already = Get-ManagedSettingsMerge -ExistingText '{ "parentSettingsBehavior": "merge" }' -Entries $ours
+  Assert-True (-not $already.Created.parentSettingsBehavior) 'an existing merge value is not recorded as ours'
+  $refusedParent = $false
+  try { [void](Get-ManagedSettingsMerge -ExistingText '{ "parentSettingsBehavior": "replace" }' -Entries $ours) } catch { $refusedParent = $true }
+  Assert-True $refusedParent 'a different parentSettingsBehavior is refused'
 
   # (c) Re-install is idempotent.
   $c = Get-ManagedSettingsMerge -ExistingText $b.Text -Entries $ours
@@ -82,6 +90,32 @@ try {
 } finally {
   Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# Undo record survives reruns: a rerun that adds nothing keeps what the first run added and created.
+$first = Get-ManagedSettingsMerge -ExistingText $null -Entries $ours
+$record1 = Merge-ManagedSettingsRecord -Previous $null -Path 'C:\x\managed-settings.json' -Added $first.Added -Created $first.Created
+$second = Get-ManagedSettingsMerge -ExistingText $first.Text -Entries $ours
+Assert-True ($second.Added.Count -eq 0 -and -not $second.Created.parentSettingsBehavior) 'a rerun adds nothing'
+$record2 = Merge-ManagedSettingsRecord -Previous ($record1 | ConvertTo-Json -Depth 5 | ConvertFrom-Json) -Path 'C:\x\managed-settings.json' -Added $second.Added -Created $second.Created
+Assert-True (@($record2.added).Count -eq @($ours | Select-Object -Unique).Count) 'the rerun record keeps every entry the first run added'
+Assert-True ($record2.created.file -and $record2.created.parentSettingsBehavior) 'and what it created'
+$undone = Get-ManagedSettingsRemoval -ExistingText $second.Text -Added @($record2.added) -Created $record2.created
+Assert-True $undone.DeleteFile 'uninstall after a rerun still removes a file the installer created'
+
+# Verify: unchanged against the baseline passes; another changed setting or a removed entry fails.
+$baselineText = '{ "model": "x", "permissions": { "deny": ["Bash(rm:*)"] } }'
+$merged = Get-ManagedSettingsMerge -ExistingText $baselineText -Entries $ours
+$ok = Test-ManagedSettingsUnchanged -CurrentText $merged.Text -BackupText $baselineText -Added $merged.Added -Created $merged.Created
+Assert-True $ok.Ok "verify passes on an untouched merge ($($ok.Reason))"
+$tampered = $merged.Text.Replace('"x"', '"y"')
+Assert-True (-not (Test-ManagedSettingsUnchanged -CurrentText $tampered -BackupText $baselineText -Added $merged.Added -Created $merged.Created).Ok) 'verify fails when another setting changed'
+$dropped = ($merged.Text | ConvertFrom-Json -AsHashtable)
+$dropped.permissions.deny = @($dropped.permissions.deny | Where-Object { $_ -ne $merged.Added[0] })
+Assert-True (-not (Test-ManagedSettingsUnchanged -CurrentText ($dropped | ConvertTo-Json -Depth 10) -BackupText $baselineText -Added $merged.Added -Created $merged.Created).Ok) 'verify fails when one of our entries is gone'
+$noMerge = ($merged.Text | ConvertFrom-Json -AsHashtable); $noMerge.parentSettingsBehavior = 'replace'
+Assert-True (-not (Test-ManagedSettingsUnchanged -CurrentText ($noMerge | ConvertTo-Json -Depth 10) -BackupText $baselineText -Added $merged.Added -Created $merged.Created).Ok) 'verify fails without parentSettingsBehavior merge'
+$fresh = Get-ManagedSettingsMerge -ExistingText $null -Entries $ours
+Assert-True (Test-ManagedSettingsUnchanged -CurrentText $fresh.Text -BackupText $null -Added $fresh.Added -Created $fresh.Created).Ok 'verify passes on a file the installer created'
 
 if ($failures.Count -gt 0) {
   $failures | ForEach-Object { Write-Host "FAIL: $_" }

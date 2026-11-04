@@ -39,39 +39,109 @@ Assert-True ($removed -match 'SeBatchLogonRight = \*S-1-5-32-544,\*S-1-5-32-551(
 Assert-True ($removed -notmatch 'SeDenyInteractiveLogonRight') 'removal drops a line it left empty'
 Assert-True ($removed -eq $inf) 'add then remove returns the original text'
 
-# Task plan: the account, never elevated, at startup, restarts, password logon.
-$task = Get-ServiceTaskPlan -TaskName 'T3 server' -Account 't3agent' -PwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' -LauncherPath 'C:\ProgramData\T3CodePolicy\service\start-t3.ps1'
-Assert-True ($task.User -eq '.\t3agent') 'task runs as the local account'
-Assert-True ($task.LogonType -eq 'Password' -and $task.RunLevel -eq 'Limited') 'password logon, not elevated'
-Assert-True ($task.Trigger -eq 'AtStartup' -and $task.RestartCount -gt 0) 'starts at boot and restarts'
-Assert-True ($task.Arguments.Contains('-File "C:\ProgramData\T3CodePolicy\service\start-t3.ps1"')) 'runs the launcher'
+# Task XML: the account, LeastPrivilege, password logon; SYSTEM only for the mover.
+$xml = [xml](Get-ServiceTaskXml -Description 'T3 server' -Account 't3agent' -PwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' -LauncherPath 'C:\ProgramData\T3CodePolicy\service\start-t3.ps1')
+$principal = $xml.Task.Principals.Principal
+Assert-True ($principal.UserId -eq '.\t3agent') 'task runs as the local account'
+Assert-True ($principal.LogonType -eq 'Password' -and $principal.RunLevel -eq 'LeastPrivilege') 'password logon, never elevated'
+Assert-True ($null -ne $xml.Task.Triggers.BootTrigger -and [int]$xml.Task.Settings.RestartOnFailure.Count -gt 0) 'starts at boot and restarts'
+Assert-True ($xml.Task.Actions.Exec.Arguments.Contains('-File "C:\ProgramData\T3CodePolicy\service\start-t3.ps1"')) 'runs the launcher'
+$moverXml = [xml](Get-ServiceTaskXml -Description 'mover' -System -PwshPath 'p.exe' -LauncherPath 'm.ps1' -Trigger Every10Minutes)
+Assert-True ($moverXml.Task.Principals.Principal.UserId -eq 'S-1-5-18' -and $null -eq $moverXml.Task.Principals.Principal.SelectSingleNode('*[local-name()="LogonType"]')) 'mover runs as SYSTEM'
+Assert-True ($moverXml.Task.Triggers.TimeTrigger.Repetition.Interval -eq 'PT10M') 'mover runs every ten minutes'
+$daily = [xml](Get-ServiceTaskXml -Description 'issuer' -Account 't3agent' -PwshPath 'p.exe' -LauncherPath 'i.ps1' -Trigger Daily)
+Assert-True ($null -ne $daily.Task.Triggers.CalendarTrigger -and $daily.Task.Settings.ExecutionTimeLimit -eq 'PT15M') 'issuer runs daily with a time limit'
+$both = $false; try { [void](Get-ServiceTaskXml -Description 'x' -Account 'a' -System -PwshPath 'p' -LauncherPath 'l') } catch { $both = $true }
+Assert-True $both 'account and SYSTEM together are refused'
+$escaped = Get-ServiceTaskXml -Description 'a<b>&"' -Account 't3agent' -PwshPath 'p.exe' -LauncherPath 'C:\x&y\l.ps1'
+Assert-True ($null -ne ([xml]$escaped)) 'task XML escapes descriptions and paths'
 
-# Access plan: no Users, no interactive user, token only for the bridge.
-$access = Get-T3AccessPlan -PolicyDir 'C:\ProgramData\T3CodePolicy' -AgentAccount 't3agent' -BridgeAccount 't3bridge'
-foreach ($entry in $access) {
-  Assert-True (-not ($entry.Access -match '^Users')) "no BUILTIN\Users access on $($entry.Path)"
+# Folder ACL plan: no Users, interactive user or Everyone anywhere; token for the bridge only.
+$plan = Get-T3FolderAclPlan -PolicyDir 'C:\ProgramData\T3CodePolicy' -ClaudeHomeName 'claude-home' -ExtraWorkspaceRoots @('D:\work')
+$principals = @($plan | ForEach-Object { $_.Grants } | ForEach-Object Principal | Select-Object -Unique)
+Assert-True (@($principals | Where-Object { @('agent', 'bridge', 'OwnerRights') -notcontains $_ }).Count -eq 0) 'only the service accounts and OWNER RIGHTS are granted anything'
+$byName = @{}; foreach ($e in $plan) { $byName[$e.Name] = $e }
+Assert-True (@($byName['connector'].Grants | Where-Object Principal -eq 'agent').Count -eq 0) 't3agent cannot read the connector token'
+Assert-True (@($byName['connector'].Grants | Where-Object Principal -eq 'bridge').Count -eq 1) 't3bridge reads the connector token'
+Assert-True (@($byName['t3-home'].Grants | Where-Object Principal -eq 'bridge').Count -eq 0) 't3bridge has no access to the T3 home'
+$readBits = [int64][Security.AccessControl.FileSystemRights]'ReadData, ReadExtendedAttributes, ReadAttributes'
+$dropAgent = @($byName['connector-drop'].Grants | Where-Object Principal -eq 'agent')
+Assert-True (@($dropAgent | Where-Object { ([int64][Security.AccessControl.FileSystemRights]$_.Rights -band $readBits) -ne 0 }).Count -eq 0) 't3agent cannot read or list the drop folder or its files'
+Assert-True ($byName['workspace-1'].Path -eq 'D:\work') 'extra workspace roots are planned'
+Assert-True ((Format-T3AclPlanEntry $byName['claude-home']) -match 'inside only') 'plan text shows inherit-only grants'
+
+# ACL comparison: exact match passes; extra, missing, inherited and unprotected entries fail.
+$sidMap = @{ Administrators = 'S-1-5-32-544'; SYSTEM = 'S-1-5-18'; OwnerRights = 'S-1-3-4'; agent = 'S-1-5-21-9-1001'; bridge = 'S-1-5-21-9-1002' }
+function New-Rule($sid, $rights, $inherit = 'ContainerInherit, ObjectInherit', $propagate = 'None', $inherited = $false) {
+  [pscustomobject]@{ Sid = $sid; Rights = [int64][Security.AccessControl.FileSystemRights]$rights; Inherit = $inherit; Propagate = $propagate; Allow = $true; IsInherited = $inherited }
 }
-$connector = $access | Where-Object { $_.Path.EndsWith('\connector') }
-Assert-True (($connector.Access -join ';') -notmatch 't3agent') 't3agent cannot read the connector token'
-Assert-True (($connector.Access -join ';') -match 't3bridge: read') 't3bridge reads the connector token'
-$home3 = $access | Where-Object { $_.Path.EndsWith('\t3-home') }
-Assert-True (($home3.Access -join ';') -notmatch 't3bridge') 't3bridge has no access to the T3 home'
+$good = @((New-Rule 'S-1-5-32-544' 'FullControl'), (New-Rule 'S-1-5-18' 'FullControl'), (New-Rule 'S-1-5-21-9-1002' 'ReadAndExecute, Synchronize'))
+$compare = { param($actual, $protected = $true, $owner = 'S-1-5-32-544') @(Compare-T3Acl -Entry $byName['connector'] -Actual $actual -Protected $protected -Owner $owner -SidMap $sidMap).Count }
+Assert-True ((& $compare $good) -eq 0) 'the planned ACL matches'
+Assert-True ((& $compare ($good + (New-Rule 'S-1-5-32-545' 'ReadAndExecute'))) -gt 0) 'an extra Users entry fails'
+Assert-True ((& $compare $good[0..1]) -gt 0) 'a missing grant fails'
+Assert-True ((& $compare $good $false) -gt 0) 'inheritance on fails'
+Assert-True ((& $compare $good $true 'S-1-5-21-9-1001') -gt 0) 'a non-admin owner fails'
+Assert-True ((& $compare ($good + (New-Rule 'S-1-5-21-9-1001' 'Modify' -inherited $true))) -gt 0) 'an inherited entry fails'
+$fileRules = @((New-Rule 'S-1-5-32-544' 'FullControl' 'None'), (New-Rule 'S-1-5-18' 'FullControl' 'None'), (New-Rule 'S-1-5-21-9-1002' 'Read, Synchronize' 'None'))
+$tokenEntry = [pscustomobject]@{ Grants = @([pscustomobject]@{ Principal = 'bridge'; Rights = 'Read, Synchronize'; Inherit = 'None'; Propagate = 'None' }) }
+Assert-True (@(Compare-T3Acl -Entry $tokenEntry -Actual $fileRules -Protected $true -Owner 'S-1-5-32-544' -SidMap $sidMap -File).Count -eq 0) 'a file ACL compares without inheritance flags'
 
-# Launchers: fixed environment, unsets, restart loop; hostile names refused.
+# Groups: only BUILTIN\Users is allowed.
+Assert-True ((Get-DisallowedGroups -Groups @([pscustomobject]@{ Name = 'Users'; Sid = 'S-1-5-32-545' })).Count -eq 0) 'Users is allowed'
+foreach ($g in @(@('Administrators', 'S-1-5-32-544'), @('Remote Desktop Users', 'S-1-5-32-555'), @('Backup Operators', 'S-1-5-32-551'), @('Hyper-V Administrators', 'S-1-5-32-578'), @('Remote Management Users', 'S-1-5-32-580'))) {
+  Assert-True ((Get-DisallowedGroups -Groups @([pscustomobject]@{ Name = $g[0]; Sid = $g[1] })).Count -eq 1) "$($g[0]) is refused"
+}
+
+# Launchers: verified-marker check first, fixed environment, unsets, restart loop.
+function Test-Parses([string] $text) { $errors = $null; [void][Management.Automation.Language.Parser]::ParseInput($text, [ref]$null, [ref]$errors); return ($errors.Count -eq 0) }
 $launcher = Get-T3LauncherText -T3Exe 'C:\Program Files\T3Code\t3.exe' -T3Home 'C:\ProgramData\T3CodePolicy\t3-home' `
-  -Environment ([ordered]@{ T3CODE_HOST = '127.0.0.1'; T3CODE_LAN = 'false' }) -MustBeUnset @('HTTPS_PROXY', 'NODE_OPTIONS')
+  -Environment ([ordered]@{ T3CODE_HOST = '127.0.0.1'; T3CODE_LAN = 'false' }) -MustBeUnset @('HTTPS_PROXY', 'NODE_OPTIONS') `
+  -MarkerPath 'C:\ProgramData\T3CodePolicy\service\verified.json' -RequiredFiles @('C:\Program Files\T3Code\t3.exe') -SettingsSeedPath 'C:\ProgramData\T3CodePolicy\service\t3-settings.seed.json'
+Assert-True (Test-Parses $launcher) 'the T3 launcher parses'
 Assert-True ($launcher.Contains("`$env:T3CODE_HOST = '127.0.0.1'")) 'launcher sets the policy environment'
 Assert-True ($launcher.Contains("Remove-Item -LiteralPath 'Env:HTTPS_PROXY'")) 'launcher clears proxy variables'
 Assert-True ($launcher.Contains("`$env:T3CODE_HOME = 'C:\ProgramData\T3CodePolicy\t3-home'")) 'launcher pins the T3 home'
-Assert-True ($launcher.Contains('serve')) 'launcher runs t3 serve'
+$loop = $launcher.IndexOf('while')
+Assert-True ($launcher.IndexOf('Test-T3Verified', $loop) -gt $loop -and $launcher.IndexOf('Test-T3Verified', $loop) -lt $launcher.IndexOf(' serve')) 'launcher checks the marker before every start'
+Assert-True ($launcher.Contains('t3-settings.seed.json')) 'the launcher (t3agent) seeds T3 settings, not the installer'
 $refused = $false
-try { [void](Get-T3LauncherText -T3Exe 'x.exe' -T3Home 'h' -Environment ([ordered]@{ 'PATH' = 'x' }) -MustBeUnset @()) } catch { $refused = $true }
+try { [void](Get-T3LauncherText -T3Exe 'x.exe' -T3Home 'h' -Environment ([ordered]@{ 'PATH' = 'x' }) -MustBeUnset @() -MarkerPath 'm' -RequiredFiles @('x')) } catch { $refused = $true }
 Assert-True $refused 'launcher refuses non-T3CODE variables'
-$quoted = Get-T3LauncherText -T3Exe "C:\it's\t3.exe" -T3Home 'h' -Environment ([ordered]@{}) -MustBeUnset @()
-Assert-True ($quoted.Contains("'C:\it''s\t3.exe'")) 'launcher quotes paths safely'
+$quoted = Get-T3LauncherText -T3Exe "C:\it's\t3.exe" -T3Home 'h' -Environment ([ordered]@{}) -MustBeUnset @() -MarkerPath 'm' -RequiredFiles @("C:\it's\t3.exe")
+Assert-True ($quoted.Contains("'C:\it''s\t3.exe'") -and (Test-Parses $quoted)) 'launcher quotes paths safely'
 $bridge = Get-BridgeLauncherText -BridgeExe 'C:\Program Files\T3Bridge\bridge.exe' -TokenPath 'C:\ProgramData\T3CodePolicy\connector\token' `
-  -KeyPath 'C:\ProgramData\T3CodePolicy\bridge\tailor-api-key' -T3Url 'http://127.0.0.1:3773' -MustBeUnset @('HTTPS_PROXY')
-Assert-True ($bridge.Contains("`$env:T3_BRIDGE_TOKEN_FILE = 'C:\ProgramData\T3CodePolicy\connector\token'")) 'bridge gets the token path, not the token'
+  -KeyPath 'C:\ProgramData\T3CodePolicy\bridge\tailor-api-key' -T3Url 'http://127.0.0.1:3773' -MustBeUnset @('HTTPS_PROXY') -MarkerPath 'm' -RequiredFiles @('b')
+Assert-True ($bridge.Contains("`$env:T3_BRIDGE_TOKEN_FILE = 'C:\ProgramData\T3CodePolicy\connector\token'") -and (Test-Parses $bridge)) 'bridge gets the token path, not the token'
+$issuer = Get-TokenIssuerText -T3Exe 't3.exe' -T3Home 'h' -DropPath 'C:\ProgramData\T3CodePolicy\connector-drop\token' -Ttl '7d' -MustBeUnset @() -MarkerPath 'm' -RequiredFiles @('t3.exe')
+Assert-True (Test-Parses $issuer) 'the issuer parses'
+Assert-True ($issuer.IndexOf('CreateNew') -lt $issuer.IndexOf('session issue')) 'the issuer claims the drop file before issuing'
+Assert-True ($issuer.Contains('-Skip 2') -and $issuer -notmatch 'Write-(Host|Output)[^\n]*issued') 'keeps the two newest sessions and never prints the token'
+$mover = Get-TokenMoverText -DropPath 'C:\d\token' -TokenPath 'C:\c\token' -AgentSid 'S-1-5-21-9-1001' -BridgeSid 'S-1-5-21-9-1002'
+Assert-True (Test-Parses $mover) 'the mover parses'
+Assert-True ($mover.Contains('ReparsePoint') -and $mover.Contains('hardlink') -and $mover.Contains("'S-1-5-21-9-1001'")) 'the mover refuses links and foreign owners'
+Assert-True ($mover.Contains('FileSystemAclExtensions]::Create') -and $mover.Contains('Move(')) 'the mover sets the ACL at creation, then renames'
+
+# Marker check: refuses without a marker, and refuses a marker a non-admin owns.
+$work = Join-Path ([IO.Path]::GetTempPath()) ('t3sa-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $work | Out-Null
+try {
+  $target = Join-Path $work 'tool.exe'; Set-Content -LiteralPath $target -Value 'one' -NoNewline
+  $markerPath = Join-Path $work 'verified.json'
+  . ([scriptblock]::Create((Get-MarkerCheckText -MarkerPath $markerPath -RequiredFiles @($target))))
+  Assert-True ((Test-T3Verified) -match 'no verified marker') 'no marker: refused'
+  @{ files = @(@{ path = $target; sha256 = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant() }) } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $markerPath
+  $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  if (-not $isAdmin) {
+    Assert-True ((Test-T3Verified) -match 'not owned by an administrator') 'a marker owned by a non-admin is refused'
+  }
+} finally { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+
+# The installer refuses to run from anywhere but the protected copy (here: the repository).
+$installer = Join-Path $PSScriptRoot '..' 'install-policy.ps1'
+$output = & pwsh -NoProfile -NonInteractive -File $installer -ExpectedSha256 'script=0' -T3Exe 'C:\none\t3.exe' -ClaudeExe 'C:\none\claude.exe' -WhatIf 2>&1 | Out-String
+Assert-True ($output -match 'protected copy') "the installer refuses to run outside the protected copy: $output"
+Assert-True ($LASTEXITCODE -ne 0) 'and exits non-zero'
 
 if ($failures.Count -gt 0) {
   $failures | Select-Object -Unique | ForEach-Object { Write-Host "FAIL: $_" }

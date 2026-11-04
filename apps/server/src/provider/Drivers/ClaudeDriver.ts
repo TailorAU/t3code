@@ -133,8 +133,20 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
     const tailorPolicy = TailorMachinePolicy.readTailorPolicy(yield* HostProcess.Platform);
     const tailorPolicyRequired =
       (yield* HostProcess.Platform) === "win32" && tailorConfig.tailorPolicyRequired === true;
+    // The probe and `claude -p` use this binary too, so check its hash here as well.
+    const tailorBinaryOk =
+      tailorPolicy._tag !== "installed" || tailorPolicy.policy.claudeExeSha256 === undefined
+        ? true
+        : yield* Effect.tryPromise(() =>
+            TailorMachinePolicy.sha256File(tailorPolicy.policy.claudeExe),
+          ).pipe(
+            Effect.map((hash) => hash === tailorPolicy.policy.claudeExeSha256),
+            Effect.orElseSucceed(() => false),
+          );
     const config: ClaudeSettings =
-      tailorPolicy._tag === "installed"
+      tailorPolicy._tag === "installed" && !tailorBinaryOk
+        ? { ...userConfig, launchArgs: "", binaryPath: TAILOR_POLICY_BLOCKED_BINARY }
+        : tailorPolicy._tag === "installed"
         ? {
             ...userConfig,
             launchArgs: "",

@@ -57,6 +57,18 @@ Severity: Critical, High, Medium, Low, Info. Status: Fixed (in this PR), Mitigat
 | T3-39 | T3-home deny rules did not follow `--base-dir`; attachments | Medium | Fixed |
 | T3-40 | Managed service defaulted to private-network bind; pnpm not pinned by integrity | Medium | Fixed |
 | T3-41 | Claude lanes share the operator's account, so any token the connector can read they can read | High | Fixed by design (t3bridge); relies on stage 2 |
+| T3-42 | Ceiling was Auto-accept edits while Claude and T3 share `t3agent` | High | Fixed (Supervised); raising it is an open design item |
+| T3-43 | SDK 0.3.276 drops `managedSettings` under a machine tier without `parentSettingsBehavior: "merge"` | High | Fixed |
+| T3-44 | Installer copied itself from an unprotected folder and imported modules by path | High | Fixed (UNVERIFIED elevated) |
+| T3-45 | Administrator code ran inside the T3 home; ACLs set by path | High | Fixed (UNVERIFIED elevated) |
+| T3-46 | Repository git hooks and config-driven commands ran for T3's git calls | High | Fixed |
+| T3-47 | `claude -p` loaded user/project setting sources and ran in the project (corrects T3-30) | High | Fixed |
+| T3-48 | Agent-made HTML pages could reach the network | Medium | Fixed |
+| T3-49 | `worktreePath` not validated | Medium | Fixed |
+| T3-50 | Projects could be created anywhere | Medium | Fixed |
+| T3-51 | Service accounts' groups not checked | Medium | Fixed (privileged groups refused; Users kept, documented) |
+| T3-52 | Uninstall leftovers, variable restore, undo ordering, password logging, probe hash | Low | Fixed (UNVERIFIED elevated) |
+| T3-53 | No self-check of an install | Medium | Fixed (`verify-install.ps1`; UNVERIFIED elevated) |
 
 ## Findings
 
@@ -145,7 +157,7 @@ is low, but it is fixed regardless.
 
 Upstream `DEFAULT_RUNTIME_MODE` is `full-access` and T3 has no admin policy file
 (tailor/policy/README.md). The fork sets the default to `approval-required` and compiles in
-a ceiling of `auto-accept-edits` (T3-17) that no setting can raise.
+a ceiling that no setting can raise: `auto-accept-edits` at first (T3-17), Supervised since round 3 (T3-42).
 
 ### T3-07 Connector token scope (Medium, Open)
 
@@ -268,7 +280,7 @@ The first draft capped modes only in the Claude adapter, so T3's own MCP tools s
 full-access caller and would run `t3_project_update`, `t3_project_clone` and
 `t3_environment_preferences_update` (all `McpToolAccess.writesEnvironment`, which needs a
 full-access/default caller). The fork now has a compile-time ceiling,
-`TAILOR_MAX_RUNTIME_MODE = "auto-accept-edits"` with `clampRuntimeMode`
+`TAILOR_MAX_RUNTIME_MODE` (`"auto-accept-edits"` then, `"approval-required"` since T3-42) with `clampRuntimeMode`
 (`packages/contracts/src/providerPolicy.ts`), applied at every entry:
 
 - `Orchestrator.dispatch`: every command, from a client or from the server itself
@@ -424,6 +436,10 @@ strict MCP, and carries the compiled deny rules. `claude -p` text generation car
 rules in its flag settings (hooks were already off). Both use the binary and home the driver
 takes from the machine policy (T3-31), never from user settings.
 
+**Correction (round 3).** The claim that `claude -p` was locked was wrong: it passed no
+`--setting-sources`, so the CLI still loaded user, project and local settings, and it ran in
+the project folder. Fixed in T3-47.
+
 ### T3-31 Policy configuration (High, Fixed; service accounts UNVERIFIED)
 
 The build contains the Claude driver only (`TAILOR_CLAUDE_ONLY`). When the machine policy is
@@ -517,11 +533,10 @@ through `dispatchCommand` exactly the five contract command types
 (`RpcAuthorization.tailorConnectorAllows`), whatever else the token carries. The contract test
 checks the lists against `tailor/contract/connector-rpc-contract.json`.
 
-The installer issues it (`t3 auth session issue --scope tailor:connector --ttl 7d --json`,
-run against the T3 home, output captured in memory and never printed) into
-`%ProgramData%\T3CodePolicy\connector\token`, readable by Administrators, SYSTEM and
-`t3bridge` only (T3-41). `-RotateConnectorToken` issues a new one and revokes the previous
-`tailor:connector` sessions. UNVERIFIED until an elevated run; end-to-end use of the token
+It is issued by the `t3agent` token issuer task and moved into
+`%ProgramData%\T3CodePolicy\connector\token` by the SYSTEM mover (T3-45), readable by
+Administrators, SYSTEM and `t3bridge` only (T3-41), and rotated daily with a 7-day lifetime,
+keeping the two newest sessions. UNVERIFIED until an elevated run; end-to-end use of the token
 against handlers that check scopes internally is not yet tested.
 
 ### T3-38 Content-Security-Policy (Medium, Fixed)
@@ -566,20 +581,175 @@ stage 2), never from an agent key. Until stage 2 ships, the bridge executes noth
 Residual: an administrator on the PC can read everything. UNVERIFIED until an elevated run
 (see T3-31).
 
+### T3-42 Ceiling was Auto-accept edits (High, Fixed; raising it is an open design item)
+
+Round 3 review: with Auto-accept edits, Claude edits files without asking, and Claude, its
+shell and `t3 serve` are all `t3agent`, so an edit can reach anything `t3agent` can write,
+including T3's own state. The compile-time ceiling is now Supervised (`approval-required`) on
+every path: `clampRuntimeMode` in the orchestrator, launches, settings, runtime policy and MCP
+callers, and `tailorCapPermissionMode` turns Claude's `acceptEdits`, `auto` and
+`bypassPermissions` into `default`. Tests: `modeClamp.test.ts`, `claudeModeCap.test.ts`,
+`claudeLock.test.ts`, the adapter tests.
+
+**Open design item.** Raising the ceiling again needs a t3server/t3agent split: `t3 serve`
+and T3's state under one account, Claude and its tools under another that cannot write T3's
+state or the policy. Not in this PR.
+
+### T3-43 SDK dropped managedSettings under a machine tier (High, Fixed)
+
+Claude Agent SDK 0.3.276 ignores an embedding app's `managedSettings` when a machine managed
+tier exists unless that tier sets `parentSettingsBehavior: "merge"`. Since the installer
+creates that tier, T3's compiled deny rules would have been dropped. Now:
+
+- every chat query (`tailorLockClaudeQueryOptions`), the capabilities probe and `claude -p`
+  carry the same deny rules in the flag-tier `settings` as well as `managedSettings`;
+- the installer adds `"parentSettingsBehavior": "merge"` to the machine file only if the key
+  is absent, records it as its own for uninstall, and refuses (changing nothing) if the key
+  has another value.
+
+Tests: `claudeLock.test.ts` (flag tier holds every managed rule), `ManagedSettingsMerge.Tests.ps1`
+(added when absent, kept when "merge", refused otherwise, removed on uninstall).
+
+### T3-44 Installer copy and module loading (High, Fixed; UNVERIFIED elevated)
+
+The installer used to copy itself into the protected folder from wherever it was started,
+and imported its modules by path. Now the documented first step is an elevated copy of the
+five files into `installer\` (created with its ACL at creation), a `Get-FileHash` check there,
+and a run from there. The script refuses to run from any other folder, or if the folder, its
+parent or any of the files is writable by a non-administrator or is a link
+(`Assert-AdminControlled`, `Assert-NoReparseTree`). It hashes each file once, requires
+`-ExpectedSha256` for all five, and loads the modules, the template and `verify-install.ps1`
+from those bytes (`New-Module -ScriptBlock`). `-Uninstall` runs the same way. Test: the
+installer refuses to run from the repository.
+
+### T3-45 Administrator code inside the T3 home (High, Fixed; UNVERIFIED elevated)
+
+The installer used to run `t3.exe auth session ...` elevated against the T3 home (which
+`t3agent` controls), seed T3's settings there, and set ACLs by path after creation. Now:
+
+- the token is issued by a `t3agent` scheduled task into `connector-drop\` (create only), and
+  moved into `connector\` by a SYSTEM task with fixed code that checks the file is not a link,
+  has one hard link, is owned by `t3agent` and holds one printable token, then creates the new
+  file with its ACL at creation and renames it into place;
+- rotation needs no admin step: the issuer runs daily, keeps the two newest connector
+  sessions and revokes the rest; the default lifetime stays 7 days (`-ConnectorTokenDays`);
+- T3's settings seed is written to `service\` and copied into the T3 home by the launcher,
+  as `t3agent`;
+- new folders and files get their ACL at creation; an existing folder or unchanged file has
+  its ACL reset through a handle opened without following links (`SetKernelObjectSecurity`),
+  never by path;
+- wherever admin code works in a folder it first checks that nothing in it is a link; admin
+  code never enters the T3 home, the Claude home's subfolders or the workspaces (uninstall
+  deletes them only after the accounts and their processes are gone, removing links as links).
+
+### T3-46 Git hooks and config-driven commands (High, Fixed)
+
+Repositories the agent works in could run code through git: hooks, `core.fsmonitor`,
+external diff and textconv drivers, `ext::` transports, and bare repositories planted in the
+tree. Every git command T3 starts now goes through one helper (`tailor/gitHardening.ts`):
+
+- `GIT_CONFIG_COUNT`/`KEY`/`VALUE` (command-line scope, the same as `-c`):
+  `core.hooksPath=%ProgramData%\T3CodePolicy\git-hooks` (empty, admin-owned, `t3agent` read),
+  `safe.bareRepository=explicit`, `core.fsmonitor=false`, `protocol.ext.allow=never`;
+  `GIT_EXTERNAL_DIFF` is removed;
+- `--no-ext-diff --no-textconv` for `diff`, `log`, `show`, `format-patch` and `whatchanged`.
+
+It is applied twice: to the process environment at the CLI entry (`bin.ts`), so Claude and
+the commands it runs inherit it, and by a `ChildProcessSpawner` decorator in the server layer
+(`tailor/gitSpawner.ts`), which rebuilds every git command's environment and arguments.
+`diff.external=` (empty) is not used: git treats an empty value as a program name and fails
+with "cannot spawn"; `--no-ext-diff` plus removing `GIT_EXTERNAL_DIFF` is the off switch.
+Claude's file tools may not edit `**/.git/hooks/**`, `**/.git/config`,
+`**/.git/info/attributes`, `**/.githooks/**` or `**/.husky/**`.
+
+Tests: `gitHardening.test.ts` (keys, idempotence, arguments, the decorator composed as in
+`server.ts`, and a source scan that `server.ts` and `bin.ts` are wired and no server code
+spawns git through `node:child_process`); `verify-install.ps1` runs a hook test on the machine.
+
+### T3-47 `claude -p` loaded setting sources in the project (High, Fixed)
+
+Correction to T3-30: `claude -p` text generation passed no `--setting-sources`, so the CLI
+loaded user, project and local settings, and ran in the project folder. It now passes
+`--setting-sources=` (empty) and runs in a new empty temporary folder; only the investigate
+run, which reads the repository, keeps the project folder (still with no setting sources and
+the deny rules). Test: `ClaudeTextGeneration.test.ts` checks the argv and the working folder.
+
+### T3-48 Agent-made HTML pages (Medium, Fixed)
+
+HTML the agent writes and T3 serves gets `default-src 'none'; script-src 'unsafe-inline';
+style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; form-action 'none';
+sandbox allow-scripts`: scripts run in an opaque origin with no network, no forms and no
+same-origin access. Tests: `csp.test.ts`, `http.test.ts`.
+
+### T3-49 Worktree paths (Medium, Fixed)
+
+`thread.create` and `launchThread` (`existing_worktree`) accepted any `worktreePath`. Both now
+refuse a path outside the project root and T3's managed worktree folder, and anything in the
+policy folder other than the workspace roots. Paths are compared after resolving the real
+path (junctions and links followed; for a missing path, its nearest existing ancestor),
+case-insensitively on Windows (`tailor/workspacePolicy.ts`, applied in `ws.ts`). Tests:
+`workspacePolicy.test.ts`, including a real junction.
+
+### T3-50 Projects anywhere (Medium, Fixed)
+
+With the policy installed, `project.create` refuses a root outside the workspace roots
+recorded in `t3-policy.json` (`workspaces\` plus `-WorkspaceRoots`) and T3's own managed
+project folders. The installer creates `workspaces\` for Administrators, SYSTEM and
+`t3agent` only; an extra root's parent must be admin-only so the folder cannot be swapped.
+How code gets in and out is in `policy/README.md`. Tests: `workspacePolicy.test.ts`.
+
+### T3-51 Service account groups (Medium, Fixed; Users kept)
+
+The installer refuses an existing account in any group but `BUILTIN\Users` (it used to remove
+it from Administrators silently), and the self-check fails on any other group. The accounts
+stay in `Users`: `Program Files` and `System32` grant read and execute through `Users`, so the
+accounts could not start PowerShell, `t3` or Claude without it. Nothing under `T3CodePolicy`
+grants `Users` anything. Not verified elevated.
+
+### T3-52 Lows from round 3 (Low, Fixed; UNVERIFIED elevated)
+
+- Uninstall now removes `service\`, `installer\`, `state\`, `connector-drop\`, `git-hooks\`,
+  the T3 home and the Claude home, stops the accounts' processes first, and removes the
+  deleted accounts' ACL entries from the kept workspaces.
+- It restores only the `T3CODE_*` machine variables it changed, to their earlier values
+  (recorded once, the first time each is changed).
+- The undo record is written before the machine managed-settings merge, and "added/created by
+  us" is merged across re-runs (`Merge-ManagedSettingsRecord`; tested).
+- Passwords reach Task Scheduler through the COM API, never a cmdlet parameter that module
+  logging would capture; Task Scheduler keeps them as LSA secrets.
+- The Claude binary's hash is checked when the driver builds its settings, so the probe and
+  `claude -p` refuse a changed binary as chat queries do.
+
+### T3-53 No self-check of an install (Medium, Fixed; UNVERIFIED elevated)
+
+`verify-install.ps1` is read-only (it writes only the marker and scratch files in temp) and
+runs at the end of every install. It checks the protected copy, every folder ACL against
+`Get-T3FolderAclPlan`, that the token is readable by `t3bridge` only and that no policy folder
+grants the interactive user, `Users`, `Authenticated Users`, `Everyone` or `INTERACTIVE`
+anything, the accounts' groups and rights, the tasks' account, logon type, run level and
+launcher, the firewall profiles and rules, the machine managed-settings entries against the
+install-time baseline, the binary and service-file hashes, and that a repository hook does not
+run with T3's git settings. On a full PASS it writes the verified marker, and every launcher
+refuses to start without a current one whose hashes match. Checks it cannot script are printed
+as a checklist. The reviewer's first-run checks 1 to 7 were not available to this worker; the
+seven printed checks are this worker's definition and should be compared with them.
+
 ## What was verified
 
-- Locally on Windows (frozen lockfile): the contracts suite (161/161, including the contract,
-  connector-scope and build-guard tests) and the gate's server tests (496 passed, 1 upstream
-  skip), now including `ClaudeAdapterV2.test.ts`, the probe, text generation and CLI config
-  tests. Server `src` and contracts typecheck clean. The managed-settings merge fixtures pass.
-  The installer previews with `-WhatIf` under PowerShell 7: it refuses a missing hash, a
-  user-writable binary and a bad host name, and shows the exact machine-file diff.
-- The service-account planning tests pass (passwords, user-rights INF edits including
-  add-then-remove round trip, task plan, access plan with no Users or interactive user,
-  launchers). The installer previews the accounts, rights, folders and ACLs, tasks, token and
-  firewall rules with `-WhatIf` without creating anything.
+- Locally on Windows (frozen lockfile), round 3: the contracts suite (161/161) and the gate's
+  server tests (535 passed, 1 upstream skip; 18 files, now including the git hardening,
+  workspace path, CSP and `http.test.ts` tests). Server `src` and contracts typecheck clean.
+  The PowerShell tests pass: the managed-settings merge (including `parentSettingsBehavior`,
+  re-run records and the verify comparison) and the service-account module (task XML, folder
+  ACL plan and comparison, group refusal, launchers, issuer and mover parse and order, the
+  marker check, and the installer refusing to run outside the protected copy). Both scripts
+  parse; the modules and the self-check load from bytes; the self-check refuses to run
+  unelevated.
 - Not verified (UNVERIFIED): anything that needs an elevated run on a real machine: the
-  accounts, secedit changes, scheduled tasks, folder creation and ACLs, token issuance, the
-  firewall rules, the policy guard and binary hash on a real install. Also not verified: a
-  full build, the full upstream suite, the CSP in a browser, the connector token end to end,
-  and the live egress capture (T3-01).
+  accounts and group checks, secedit, task registration through COM, folder creation and the
+  handle-based ACL reset, the token issuer and mover, the firewall rules, the self-check's
+  PASS path and the marker, uninstall, and the policy guard and binary hash on a real
+  install. The `-WhatIf` preview could not be run here, because it now needs the protected
+  copy in an admin-only folder. Also not verified: a full build, the full upstream suite
+  (the git spawner decorator is unit-tested, not exercised through the whole server), the
+  CSPs in a browser, the connector token end to end, and the live egress capture (T3-01).

@@ -236,6 +236,33 @@ it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
       ),
   );
 
+  // Tailor fork: claude -p loads no settings files and runs outside the repository.
+  it.effect("runs PR content generation with no setting sources, outside the project", () =>
+    withFakeClaudeEnv(
+      {
+        output: JSON.stringify({ structured_output: { title: "Title", body: "Body" } }),
+        argsMustContain: "--setting-sources= ",
+        cwdMustNotBe: process.cwd(),
+      },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          const generated = yield* textGeneration.generatePrContent({
+            cwd: process.cwd(),
+            baseBranch: "main",
+            headBranch: "feature/x",
+            commitSummary: "Change",
+            diffSummary: "1 file changed",
+            diffPatch: "diff --git a/README.md b/README.md",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("claudeAgent"),
+              model: SYNTHETIC_CLAUDE_STANDARD_MODEL,
+            },
+          });
+          expect(generated.title).toBe("Title");
+        }),
+    ),
+  );
+
   it.effect(
     "generates thread titles outside the project with tools, skills, and hooks disabled",
     () =>

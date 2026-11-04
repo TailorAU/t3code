@@ -1638,7 +1638,8 @@ export function makeClaudeQueryOptions(input: {
 
 /** Tailor fork: Bypass and Auto become default; every other Claude mode is kept. */
 export function tailorCapPermissionMode(mode: PermissionMode): PermissionMode {
-  return mode === "bypassPermissions" || mode === "auto" ? "default" : mode;
+  // Tailor fork: the build ceiling is Supervised, so acceptEdits is capped too.
+  return mode === "bypassPermissions" || mode === "auto" || mode === "acceptEdits" ? "default" : mode;
 }
 
 /** Tailor fork: user launch arguments and --settings are ignored everywhere in this build. */
@@ -1683,15 +1684,31 @@ export function tailorLockClaudeQueryOptions(
     strictMcpConfig: _strictMcpConfig,
     ...rest
   } = options;
+  const deny = tailorClaudeManagedSettings(environment, {
+    ...paths,
+    claudeHome: paths.claudeHome ?? environment?.CLAUDE_CONFIG_DIR,
+  });
+  // Also in the flag tier: SDK 0.3.276 drops `managedSettings` when a machine managed tier
+  // exists without parentSettingsBehavior "merge" (sdk.d.ts), so the denies must not rely on it.
+  const flagSettings = (typeof rest.settings === "object" && rest.settings !== null
+    ? rest.settings
+    : {}) as { permissions?: { deny?: ReadonlyArray<string> } } & Record<string, unknown>;
+  const settings = {
+    ...flagSettings,
+    permissions: {
+      ...flagSettings.permissions,
+      deny: Array.from(
+        new Set([...(flagSettings.permissions?.deny ?? []), ...deny.permissions.deny]),
+      ),
+    },
+  } as unknown as ClaudeSdkSettings;
   return {
     ...rest,
+    settings,
     permissionMode: tailorCapPermissionMode(requestedMode ?? "default"),
     settingSources: [],
     ...(paths.managedMcpConfig === true ? {} : { strictMcpConfig: true }),
-    managedSettings: tailorClaudeManagedSettings(environment, {
-      ...paths,
-      claudeHome: paths.claudeHome ?? environment?.CLAUDE_CONFIG_DIR,
-    }) as unknown as ClaudeSdkSettings,
+    managedSettings: deny as unknown as ClaudeSdkSettings,
     disallowedTools: Array.from(
       new Set([...(rest.disallowedTools ?? []), ...TAILOR_CLAUDE_DISALLOWED_TOOLS]),
     ),
@@ -2650,9 +2667,10 @@ export function claudeRuntimeQueryPolicyForRuntimePolicy(
       ? "default"
       : "auto"
     : requestedMode;
-  // Tailor fork: Bypass and Auto never reach Claude, at open or on a live mode change; the
-  // build's ceiling is auto-accept-edits (acceptEdits).
-  const ceilinged = uncappedMode === "bypassPermissions" || uncappedMode === "auto";
+  // Tailor fork: Bypass, Auto and acceptEdits never reach Claude, at open or on a live mode
+  // change; the build's ceiling is Supervised (default with approvals).
+  const ceilinged =
+    uncappedMode === "bypassPermissions" || uncappedMode === "auto" || uncappedMode === "acceptEdits";
   const permissionMode: PermissionMode = ceilinged ? "default" : uncappedMode;
   const readOnlyTools =
     sandboxPolicyKindForClaudeRuntimePolicy(runtimePolicy) === "readOnly"

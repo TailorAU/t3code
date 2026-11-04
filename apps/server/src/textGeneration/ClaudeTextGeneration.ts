@@ -187,10 +187,12 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
     );
 
     const runClaudeCommand = Effect.fn("runClaudeJson.runClaudeCommand")(function* () {
+      // Tailor fork: every non-investigating run gets an empty temporary cwd. The prompt
+      // already carries the content (diffs, messages), and tools are off, so it needs no repo.
       const workingDirectory =
-        operation === "generateThreadTitle"
+        operation === "generateThreadTitle" || !investigate
           ? yield* fileSystem
-              .makeTempDirectoryScoped({ prefix: "t3code-claude-title-" })
+              .makeTempDirectoryScoped({ prefix: "t3code-claude-p-" })
               .pipe(
                 Effect.mapError((cause) =>
                   normalizeCliError("claude", operation, cause, "Failed to create title directory"),
@@ -211,6 +213,8 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
           ...(cliEffort ? ["--effort", cliEffort] : []),
           "--settings",
           settingsJson,
+          // Tailor fork: no user, project or local settings file is loaded.
+          "--setting-sources=",
           ...(investigate
             ? [
                 "--tools",

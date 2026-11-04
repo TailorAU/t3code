@@ -34,7 +34,7 @@ function ConvertTo-ManagedSettingsText($settings) {
 function Get-ManagedSettingsMerge {
   # [object], not [string]: PowerShell turns a $null string argument into "".
   param([AllowNull()][object] $ExistingText, [Parameter(Mandatory)][string[]] $Entries)
-  $created = [ordered]@{ file = ($null -eq $ExistingText); permissions = $false; deny = $false }
+  $created = [ordered]@{ file = ($null -eq $ExistingText); permissions = $false; deny = $false; parentSettingsBehavior = $false }
   $settings = if ($null -eq $ExistingText) { [ordered]@{} } else { ConvertFrom-ManagedSettingsText $ExistingText }
   if (-not $settings.Contains('permissions')) { $settings['permissions'] = [ordered]@{}; $created.permissions = $true }
   $permissions = $settings['permissions']
@@ -53,6 +53,16 @@ function Get-ManagedSettingsMerge {
     if (-not $current.Contains($entry)) { $current.Add($entry); $added.Add($entry) }
   }
   $permissions['deny'] = $current.ToArray()
+  # Claude Agent SDK 0.3.276 drops an embedding app's managedSettings when a machine managed
+  # tier exists, unless that tier sets parentSettingsBehavior "merge" (sdk.d.ts). Add it only
+  # if absent; never change an administrator's other choice.
+  if (-not $settings.Contains('parentSettingsBehavior')) {
+    $settings['parentSettingsBehavior'] = 'merge'
+    $created.parentSettingsBehavior = $true
+  } elseif ($settings['parentSettingsBehavior'] -ne 'merge') {
+    throw ('managed-settings.json sets parentSettingsBehavior to "' + $settings['parentSettingsBehavior'] +
+      '". T3 needs "merge" so its own deny rules are not dropped; change it deliberately or pass -SkipMachineManagedSettings. Nothing was changed.')
+  }
   $text = ConvertTo-ManagedSettingsText $settings
   # Validate the merged result by parsing it again before anyone writes it.
   [void](ConvertFrom-ManagedSettingsText $text)
@@ -71,6 +81,10 @@ function Get-ManagedSettingsRemoval {
       if ($kept.Count -eq 0 -and $null -ne $Created -and $Created.deny) { $permissions.Remove('deny') }
     }
     if ($permissions.Count -eq 0 -and $null -ne $Created -and $Created.permissions) { $settings.Remove('permissions') }
+  }
+  if ($null -ne $Created -and $Created.Contains('parentSettingsBehavior') -and $Created.parentSettingsBehavior -and
+      $settings.Contains('parentSettingsBehavior')) {
+    $settings.Remove('parentSettingsBehavior')
   }
   $deleteFile = ($settings.Count -eq 0 -and $null -ne $Created -and $Created.file)
   $text = if ($deleteFile) { $null } else { ConvertTo-ManagedSettingsText $settings }
@@ -97,4 +111,53 @@ function Get-ManagedSettingsBackupPath([string] $Path) {
   return "$Path.t3bak-" + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
 }
 
-Export-ModuleMember -Function Get-ManagedSettingsMerge, Get-ManagedSettingsRemoval, Write-ManagedSettingsAtomically, Get-ManagedSettingsBackupPath, ConvertFrom-ManagedSettingsText
+<#
+  Combines the undo record from an earlier run with this run's merge, so "created by us" and
+  "added by us" survive reruns (a rerun that finds our entries already there adds nothing,
+  but they are still ours to remove).
+#>
+function Merge-ManagedSettingsRecord {
+  param($Previous, [Parameter(Mandatory)][string] $Path, [string[]] $Added = @(), $Created)
+  $all = [System.Collections.Generic.List[string]]::new()
+  $flags = [ordered]@{ file = $false; permissions = $false; deny = $false; parentSettingsBehavior = $false }
+  foreach ($source in @($Previous, [pscustomobject]@{ added = $Added; created = $Created })) {
+    if ($null -eq $source) { continue }
+    foreach ($entry in @($source.added)) { if ($entry -and -not $all.Contains([string]$entry)) { $all.Add([string]$entry) } }
+    if ($null -ne $source.created) {
+      foreach ($name in @($flags.Keys)) {
+        $value = if ($source.created -is [System.Collections.IDictionary]) { $source.created[$name] } else { $source.created.PSObject.Properties[$name]?.Value }
+        if ($value) { $flags[$name] = $true }
+      }
+    }
+  }
+  return [ordered]@{ path = $Path; added = $all.ToArray(); created = $flags }
+}
+
+<#
+  verify-install.ps1: true when the file holds every recorded entry, parentSettingsBehavior is
+  "merge", and with our entries taken out it equals the pre-merge backup ($BackupText; $null
+  when the installer created the file).
+#>
+function Test-ManagedSettingsUnchanged {
+  param([Parameter(Mandatory)][string] $CurrentText, [AllowNull()][object] $BackupText, [string[]] $Added = @(), $Created)
+  $current = ConvertFrom-ManagedSettingsText $CurrentText
+  $deny = @()
+  if ($current.Contains('permissions') -and $current['permissions'] -is [System.Collections.IDictionary] -and $current['permissions'].Contains('deny')) {
+    $deny = @($current['permissions']['deny'])
+  }
+  $missing = @($Added | Where-Object { $deny -notcontains $_ })
+  if ($missing.Count -gt 0) { return [pscustomobject]@{ Ok = $false; Reason = "missing deny entries: $($missing -join ', ')" } }
+  if ($current['parentSettingsBehavior'] -ne 'merge') { return [pscustomobject]@{ Ok = $false; Reason = 'parentSettingsBehavior is not "merge"' } }
+  $removal = Get-ManagedSettingsRemoval -ExistingText $CurrentText -Added $Added -Created $Created
+  if ($null -eq $BackupText) {
+    if ($removal.DeleteFile) { return [pscustomobject]@{ Ok = $true; Reason = '' } }
+    return [pscustomobject]@{ Ok = $false; Reason = 'the file has settings this installer did not add (no backup to compare)' }
+  }
+  $canonical = { param($text) (ConvertFrom-ManagedSettingsText $text) | ConvertTo-Json -Depth 100 -Compress }
+  $before = & $canonical $BackupText
+  $after = if ($removal.DeleteFile) { '{}' } else { & $canonical $removal.Text }
+  if ($before -ne $after) { return [pscustomobject]@{ Ok = $false; Reason = 'other settings differ from the pre-install backup' } }
+  return [pscustomobject]@{ Ok = $true; Reason = '' }
+}
+
+Export-ModuleMember -Function Merge-ManagedSettingsRecord, Test-ManagedSettingsUnchanged, Get-ManagedSettingsMerge, Get-ManagedSettingsRemoval, Write-ManagedSettingsAtomically, Get-ManagedSettingsBackupPath, ConvertFrom-ManagedSettingsText

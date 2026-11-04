@@ -30,7 +30,7 @@ describe("Tailor Claude mode cap", () => {
     }
   });
 
-  it("leaves Supervised and Auto-accept edits as they are", () => {
+  it("leaves Supervised as it is and caps Auto-accept edits too", () => {
     assert.strictEqual(
       ClaudeAdapterV2.claudeRuntimeQueryPolicyForRuntimePolicy(policyFor("approval-required"), locked)
         .permissionMode,
@@ -39,7 +39,7 @@ describe("Tailor Claude mode cap", () => {
     assert.strictEqual(
       ClaudeAdapterV2.claudeRuntimeQueryPolicyForRuntimePolicy(policyFor("auto-accept-edits"), locked)
         .permissionMode,
-      "acceptEdits",
+      "default",
     );
   });
 

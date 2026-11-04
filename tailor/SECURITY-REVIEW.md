@@ -31,6 +31,7 @@ Severity: Critical, High, Medium, Low, Info. Status: Fixed (in this PR), Mitigat
 | T3-13 | Upstream release binaries do not contain this patch | High | Open |
 | T3-14 | Firewall allowlist is IP-based; Bedrock addresses rotate | Medium | Open |
 | T3-15 | Claude binary's own dependencies are outside our lockfile | Info | Accepted |
+| T3-16 | Other high/critical dependency advisories in the lockfile | High | Fixed for the server path; rest Open |
 
 ## Findings
 
@@ -121,13 +122,14 @@ thread in any runtime mode or switch one (`thread.runtime-mode.set`).
 
 Fixes in this PR:
 - The Claude instance's `settings.json` (installed read-only to non-admins) disables
-  Bypass and Auto. T3 already downgraded Full access when Bypass is disabled; it did
-  **not** cap a requested Auto. The fork now caps Auto too, and fails closed when the
-  settings cannot be read (`claudeRuntimeQueryPolicyForRuntimePolicy` and
-  `queryPolicyForTurn` in `ClaudeAdapterV2.ts`; test
-  `apps/server/src/tailor/claudeModeCap.test.ts`). Note T3 passes
-  `settingSources: ["project", "local"]` for a custom Claude home, so the Claude
-  binary itself does not read that file: the cap is enforced by T3.
+  Bypass and Auto. T3 already downgraded Full access when Bypass is disabled. But T3
+  passes `settingSources: ["project", "local"]` for a custom Claude home, so the
+  Claude binary never reads that file, and a requested **Auto** ran as Auto. The fork
+  now reads the custom home's `settings.json` for a requested Auto and runs it as
+  Supervised when Auto is disabled or the file is unreadable (`queryPolicyForTurn` and
+  `claudeRuntimeQueryPolicyForRuntimePolicy` in `ClaudeAdapterV2.ts`; test
+  `apps/server/src/tailor/claudeModeCap.test.ts`). Project, local and managed
+  settings keep upstream behaviour: Claude enforces those itself.
 - The settings seed sets `defaultRuntimeMode: approval-required`; the connector always
   sends `approval-required`.
 
@@ -232,12 +234,34 @@ in `@anthropic-ai/claude-agent-sdk` are already removed by upstream overrides; T
 runs the binary set as the instance's `binaryPath`. Its egress is limited by the
 Claude firewall rule and its update and telemetry switches.
 
+### T3-16 Other dependency advisories (High; Fixed for the server path, rest Open)
+
+Once forked, Dependabot listed 328 open alerts on `v0.1.6` (most in the vendored
+`.repos/` reference checkouts, the mobile app and build tooling). The high and
+critical ones in the root lockfile, triaged by whether the server or the web UI it
+serves loads them:
+
+| Package | Advisories | In the server path | Action |
+| --- | --- | --- | --- |
+| `undici` 8.11.2 | GHSA-qrxm-fqhp-jwvm, GHSA-xjj6-f33q-929c, GHSA-2m5v-pch6-74hx, GHSA-4w7w-5xrc-9h26 | yes (server HTTP client) | Catalog bumped to 8.12.2 |
+| `zod` 4.6.5 | GHSA-mrhx-c7xc-m3w5 | yes (agent SDK, MCP SDK) | Override 4.6.6 |
+| `dompurify` 3.4.16 | GHSA-cg2g-xh64-v4q7, GHSA-mrv2-3pqr-j5jr | web UI served to the local browser, which holds full scopes | Override 3.4.17 |
+| `seroval` 1.5.4 | GHSA-p6vx-979v-rg4c (9.8) and four more | web UI router (client-side serialisation) | Open: minor bump to 1.6.8 needs the router tested |
+| `shell-quote` 1.10.0 | GHSA-pqg4-j6r4-53mv (8.1) | no (React DevTools, development) | Open, not shipped in the server |
+| `undici` 7.x | as above | no (Electron download at build time) | Open, build only |
+| `node-forge`, `sharp`, `path-to-regexp` 6.1.0, `body-parser` | various | no (mobile, marketing and build tooling) | Open, not shipped in the server |
+
+Follow-up: a Dependabot or `pnpm audit --prod` step scoped to the server and web
+packages in the gate.
+
 ## What was verified
 
-- Locally on Windows: the contract test and the contracts suite subset, the server
-  scope test, the Claude mode cap test, `ClaudeAdapterV2`, `RpcAuthorization`,
-  `AnalyticsService` and provider registry tests with the Cursor driver off; the
-  installer with `-WhatIf` under PowerShell 7 and Windows PowerShell 5.1, and its
-  address arithmetic. See the PR body for the exact runs.
+- Locally on Windows: the full contracts suite with the contract test, the server
+  scope and Claude mode cap tests, `RpcAuthorization`, `AnalyticsService` and the
+  provider registry tests with the Cursor driver off; the installer with `-WhatIf`
+  under PowerShell 7 and Windows PowerShell 5.1, and its address arithmetic.
+  `ClaudeAdapterV2.test.ts` has 13 failures on Windows at upstream `v0.1.6` (path and
+  attachment tests) and the same 13 with this patch, so the Windows-only gate does not
+  run it. The custom-home Auto read in `queryPolicyForTurn` has no integration test yet.
 - Not verified: a full build, the full upstream suite, an installed `t3.exe`, the
   firewall rules applied, and the live egress capture (T3-01).

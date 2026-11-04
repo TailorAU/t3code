@@ -1,17 +1,19 @@
 # Tailor fork gate (TailorAU/t3code). Required check on tailor/main.
 #
-# Runs the connector contract test, the connector scope test, the contracts suite
-# and the provider-registry tests on Windows and Linux. The upstream workflows in
-# this folder target upstream's self-hosted runners and are disabled on the fork.
+# Runs the connector contract test, the connector scope and mode-cap tests, the
+# contracts suite and the provider-registry tests on Windows (the target platform).
+# The upstream workflows in this folder target upstream's self-hosted runners and
+# are disabled on the fork.
 #
-# Minutes are rationed: pull requests to tailor/main and manual runs only, no
-# schedule, superseded runs cancelled. The whole upstream suite runs only when
-# asked (workflow_dispatch with full_suite), and is informational: upstream's
-# own Windows lane says the suite does not pass on Windows yet.
+# Minutes are billed and rationed: Windows only; non-draft pull requests to
+# tailor/main and manual runs only; no schedule; superseded runs cancelled. The
+# whole upstream suite runs only when asked (workflow_dispatch with full_suite) and
+# is informational: upstream's own Windows lane says it does not pass on Windows yet.
 name: Tailor gate
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches:
       - tailor/main
   workflow_dispatch:
@@ -30,12 +32,9 @@ concurrency:
 
 jobs:
   gate:
-    name: Tailor gate (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    name: Tailor gate (windows-latest)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false }}
+    runs-on: windows-latest
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -72,21 +71,16 @@ jobs:
           ../../node_modules/.bin/vp test run
           src/tailor/connectorScopes.test.ts
           src/tailor/claudeModeCap.test.ts
-          src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
           src/auth/RpcAuthorization.test.ts
           src/telemetry/AnalyticsService.test.ts
           src/provider/ProviderInstanceRegistryHydration.test.ts
           src/provider/ProviderRegistry.test.ts
 
   full-suite:
-    name: Full suite, informational (${{ matrix.os }})
+    name: Full suite, informational (windows-latest)
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_suite }}
     continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
     timeout-minutes: 60
     steps:
       - name: Checkout

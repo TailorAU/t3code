@@ -4743,18 +4743,29 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
         ) {
           const requestedMode = permissionModeForClaudeRuntimePolicy(turnInput.runtimePolicy);
-          // Tailor fork: check the managed settings for Auto as well as Full access.
-          if (requestedMode !== "bypassPermissions" && requestedMode !== "auto") {
+          if (requestedMode === "auto" && customHome) {
+            // Tailor fork: Claude skips a custom home's settings.json (settingSources leave out
+            // "user"), so its disableAutoMode would never apply. Enforce it here; an unreadable
+            // file fails closed to Supervised.
+            const home = yield* readBypassSettings(path.join(homePath, "settings.json")).pipe(
+              Effect.map(claudeBypassAvailability),
+              Effect.option,
+            );
+            return claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy, {
+              bypassDisabled: false,
+              autoDisabled: Option.isNone(home) || home.value.autoDisabled,
+            });
+          }
+          if (requestedMode !== "bypassPermissions") {
             return claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy);
           }
           const cwd = turnInput.runtimePolicy.cwd;
           if (bypassCache === null || bypassCache.cwd !== cwd) {
             const resolved = yield* resolveBypassAvailability(cwd).pipe(Effect.option);
             if (Option.isNone(resolved)) {
-              // Unreadable settings fail closed; a requested Auto then runs Supervised.
               return claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy, {
                 bypassDisabled: true,
-                autoDisabled: requestedMode === "auto",
+                autoDisabled: false,
               });
             }
             bypassCache = { cwd, availability: resolved.value };

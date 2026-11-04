@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import { tailorClaudeManagedSettings } from "../tailor/claudeDenyRules.ts";
+import { withTailorGitConfig } from "../tailor/gitHardening.ts";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -36,19 +37,25 @@ import {
 } from "../provider/Drivers/ClaudeHome.ts";
 
 const CLAUDE_TIMEOUT_MS = 180_000;
-/** `--tools` takes bare names; patterns go in the allow list. */
-const CLAUDE_INVESTIGATION_TOOLS = "Read,Grep,Glob,Bash";
-/** In dontAsk mode every call outside this list, Bash included, is refused. */
-const CLAUDE_INVESTIGATION_ALLOWED = [
-  "Read",
-  "Grep",
-  "Glob",
-  "Bash(git diff:*)",
-  "Bash(git log:*)",
-  "Bash(git show:*)",
-].join(",");
-// Denies override allows; block git --output/-o because allowed trailing args can otherwise write anywhere.
-const CLAUDE_INVESTIGATION_DENIED = ["Bash(git * --output*)", "Bash(git * -o *)"].join(",");
+/**
+ * Tailor fork: the review-guide investigation runs in dontAsk mode, where every allowed call
+ * runs without a prompt, so it gets read-only tools only: no Bash (upstream allowed
+ * `git diff/log/show`, which bypassed Supervised), Read scoped to the repository, and the
+ * compiled deny rules on top. Grep and Glob follow the Read rules.
+ */
+export const TAILOR_CLAUDE_INVESTIGATION_ARGS = [
+  "--tools",
+  "Read,Grep,Glob",
+  "--allowedTools",
+  "Read(./**),Grep,Glob",
+  "--disallowedTools",
+  "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch",
+] as const;
+
+/** The `claude -p` tool arguments: none, or the read-only investigation set. */
+export function claudePrintToolArgs(investigate: boolean): ReadonlyArray<string> {
+  return investigate ? TAILOR_CLAUDE_INVESTIGATION_ARGS : ["--tools", ""];
+}
 
 const ClaudeOutputEnvelope = Schema.Struct({
   structured_output: Schema.Unknown,
@@ -85,7 +92,11 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
 ) {
   const commandSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const fileSystem = yield* FileSystem.FileSystem;
-  const claudeEnvironment = yield* makeClaudeEnvironment(claudeSettings, environment);
+  // Tailor fork: the same git hardening as every other T3 git call, for anything `claude -p`
+  // starts (gitHardening.ts).
+  const claudeEnvironment = withTailorGitConfig(
+    yield* makeClaudeEnvironment(claudeSettings, environment),
+  );
   const scopedModelCatalog = modelCatalog.pipe(
     Effect.map((catalog) => scopeClaudeModelCatalog(catalog, claudeSettings.customModels)),
   );
@@ -215,16 +226,7 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
           settingsJson,
           // Tailor fork: no user, project or local settings file is loaded.
           "--setting-sources=",
-          ...(investigate
-            ? [
-                "--tools",
-                CLAUDE_INVESTIGATION_TOOLS,
-                "--allowedTools",
-                CLAUDE_INVESTIGATION_ALLOWED,
-                "--disallowedTools",
-                CLAUDE_INVESTIGATION_DENIED,
-              ]
-            : ["--tools", ""]),
+          ...claudePrintToolArgs(investigate !== undefined),
           "--disable-slash-commands",
           // managed-mcp.json already isolates servers and makes Claude reject this flag.
           ...(managedMcpConfig ? [] : ["--strict-mcp-config"]),

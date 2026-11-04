@@ -20,7 +20,7 @@ import {
 } from "../provider/ClaudeModelCatalog.testFixtures.ts";
 import * as TextGeneration from "./TextGeneration.ts";
 import { sanitizeThreadTitle } from "@t3tools/provider-core/server/textGenerationUtils";
-import { makeClaudeTextGeneration } from "./ClaudeTextGeneration.ts";
+import { claudePrintToolArgs, makeClaudeTextGeneration } from "./ClaudeTextGeneration.ts";
 import { writeFakeCli } from "@t3tools/provider-testing/fakeCli";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
@@ -234,6 +234,23 @@ it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
             expect(generated.title).toBe("Improve orchestration flow");
           }),
       ),
+  );
+
+  // Tailor fork: the review-guide investigation gets read-only tools, never Bash.
+  it.effect("gives the investigation run read-only tools only", () =>
+    Effect.sync(() => {
+    const args = claudePrintToolArgs(true);
+    expect(args).toEqual([
+      "--tools",
+      "Read,Grep,Glob",
+      "--allowedTools",
+      "Read(./**),Grep,Glob",
+      "--disallowedTools",
+      "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch",
+    ]);
+    expect(args.join(" ")).not.toMatch(/Bash\(/);
+    expect(claudePrintToolArgs(false)).toEqual(["--tools", ""]);
+    }),
   );
 
   // Tailor fork: claude -p loads no settings files and runs outside the repository.

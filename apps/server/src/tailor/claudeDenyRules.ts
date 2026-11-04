@@ -74,15 +74,18 @@ export function tailorClaudeManagedSettings(
   if (paths.t3BaseDir !== undefined && paths.t3BaseDir.trim().length > 0) {
     bases.add(claudeAbsoluteRulePath(paths.t3BaseDir.trim()));
   }
-  // Claude and MCP config, and git hooks and config (hooks, core.hooksPath, fsmonitor,
-  // external diff and textconv drivers all live there).
+  // Claude and MCP config, and everything git reads commands from: the whole .git folder
+  // (hooks, config, info/attributes), user git config, attributes and submodule files
+  // (filter, diff and textconv drivers, hooks paths, helpers).
   const protectedConfig = [
     "**/.claude/**",
     "**/.mcp.json",
     "~/.claude.json",
-    "**/.git/hooks/**",
-    "**/.git/config",
-    "**/.git/info/attributes",
+    "**/.git/**",
+    "~/.gitconfig",
+    "~/.config/git/**",
+    "**/.gitattributes",
+    "**/.gitmodules",
     "**/.githooks/**",
     "**/.husky/**",
   ];

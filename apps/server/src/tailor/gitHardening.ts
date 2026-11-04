@@ -6,12 +6,26 @@
  * - `core.hooksPath` = an empty, admin-owned folder, so no repository hook ever runs;
  * - `safe.bareRepository=explicit`, so a planted bare repository is never opened implicitly;
  * - `core.fsmonitor=false`, so no repository-configured monitor command runs;
- * - `protocol.ext.allow=never`, so no `ext::` transport runs a command;
- * - and for diff-producing commands, `--no-ext-diff --no-textconv`, so no configured external
- *   diff or textconv command runs.
+ * - `protocol.ext.allow=never` and `protocol.file.allow=user`, so no `ext::` transport runs a
+ *   command and `file://` is not used implicitly (submodules);
+ * - `credential.helper=` (empty: the helper list is cleared), so no configured helper runs;
+ * - `core.sshCommand=ssh`, so a repository cannot name another ssh program;
+ * - `commit.gpgSign=false` and `tag.gpgSign=false`, so no signing program runs;
+ * - `GIT_CONFIG_GLOBAL` = an empty admin-owned file and `GIT_CONFIG_NOSYSTEM=1`, so no global
+ *   or system config (includes, filters, aliases, helpers) is read;
+ * - `GIT_EXTERNAL_DIFF`, `GIT_SSH`, `GIT_SSH_COMMAND` and `GIT_ASKPASS` removed;
+ * - and for diff-producing commands (diff, log, show, format-patch, whatchanged, blame,
+ *   diff-tree, stash show), `--no-ext-diff --no-textconv`.
  *
  * `-c diff.external=` is NOT used: with an empty value git tries to spawn "" and every diff
- * fails ("cannot spawn"), so it is not an off switch. `--no-ext-diff` is.
+ * fails ("cannot spawn"), so it is not an off switch. `--no-ext-diff` is. Likewise
+ * `core.sshCommand=` (empty) would break every ssh remote, so it is set to plain `ssh`.
+ *
+ * `filter.<driver>.clean/smudge/process` cannot be switched off for every driver name with
+ * `-c`. The control is that no config can define one: global and system config are off, a
+ * clone never carries repository config, and Claude may not edit anything under `.git/`,
+ * `~/.gitconfig`, `~/.config/git/`, `.gitattributes` or `.gitmodules` (claudeDenyRules.ts);
+ * the agent's own shell commands are Supervised.
  *
  * Two layers apply it: `applyTailorGitHardening(process.env)` at server start (inherited by
  * every child), and `tailorGitCommand` in a ChildProcessSpawner decorator (server.ts) for
@@ -21,7 +35,21 @@ import * as NodePath from "node:path";
 
 import * as TailorMachinePolicy from "./machinePolicy.ts";
 
-const DIFF_PRODUCING_SUBCOMMANDS = new Set(["diff", "log", "show", "format-patch", "whatchanged"]);
+const DIFF_PRODUCING_SUBCOMMANDS = new Set([
+  "diff",
+  "log",
+  "show",
+  "format-patch",
+  "whatchanged",
+  "blame",
+  "diff-tree",
+]);
+/** Subcommands whose second word produces a diff (`git stash show`). */
+const DIFF_PRODUCING_SUB_SUBCOMMANDS: Readonly<Record<string, ReadonlySet<string>>> = {
+  stash: new Set(["show"]),
+};
+
+const REMOVED_GIT_ENVIRONMENT = ["GIT_EXTERNAL_DIFF", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS"];
 
 /** The empty hooks folder the installer creates; a path that cannot exist if it is unknown. */
 export function tailorGitHooksDirectory(platform: string = process.platform): string {
@@ -34,12 +62,33 @@ export function tailorGitHooksDirectory(platform: string = process.platform): st
   return "/etc/t3code-policy/git-hooks";
 }
 
+/** The empty admin-owned global config file the installer creates (NUL when unknown). */
+export function tailorGitGlobalConfigFile(platform: string = process.platform): string {
+  if (platform === "win32") {
+    const programData = TailorMachinePolicy.windowsProgramDataFolder();
+    return programData === undefined
+      ? "NUL"
+      : NodePath.win32.join(
+          programData,
+          TailorMachinePolicy.TAILOR_POLICY_FOLDER_NAME,
+          "git-config",
+          "gitconfig",
+        );
+  }
+  return "/dev/null";
+}
+
 export function tailorGitConfig(hooksDirectory: string): ReadonlyArray<readonly [string, string]> {
   return [
     ["core.hooksPath", hooksDirectory],
     ["safe.bareRepository", "explicit"],
     ["core.fsmonitor", "false"],
     ["protocol.ext.allow", "never"],
+    ["protocol.file.allow", "user"],
+    ["credential.helper", ""],
+    ["core.sshCommand", "ssh"],
+    ["commit.gpgSign", "false"],
+    ["tag.gpgSign", "false"],
   ];
 }
 
@@ -50,6 +99,7 @@ export function tailorGitConfig(hooksDirectory: string): ReadonlyArray<readonly 
 export function withTailorGitConfig(
   env: Readonly<Record<string, string | undefined>>,
   hooksDirectory: string = tailorGitHooksDirectory(),
+  globalConfigFile: string = tailorGitGlobalConfigFile(),
 ): Record<string, string | undefined> {
   const next: Record<string, string | undefined> = { ...env };
   const countRaw = next.GIT_CONFIG_COUNT;
@@ -66,8 +116,10 @@ export function withTailorGitConfig(
     count++;
   }
   next.GIT_CONFIG_COUNT = String(count);
-  // An external diff from the environment would bypass --no-ext-diff's config check.
-  delete next.GIT_EXTERNAL_DIFF;
+  next.GIT_CONFIG_GLOBAL = globalConfigFile;
+  next.GIT_CONFIG_NOSYSTEM = "1";
+  // Programs named by the environment would bypass the config above.
+  for (const name of REMOVED_GIT_ENVIRONMENT) delete next[name];
   return next;
 }
 
@@ -78,7 +130,7 @@ export function applyTailorGitHardening(env: NodeJS.ProcessEnv = process.env): v
     if (value === undefined) delete env[key];
     else env[key] = value;
   }
-  delete env.GIT_EXTERNAL_DIFF;
+  for (const name of REMOVED_GIT_ENVIRONMENT) delete env[name];
 }
 
 export function isGitExecutable(command: string): boolean {
@@ -95,8 +147,15 @@ export function withTailorGitArgs(args: ReadonlyArray<string>): ReadonlyArray<st
     index += arg === "-c" || arg === "-C" || arg === "--git-dir" || arg === "--work-tree" ? 2 : 1;
   }
   const subcommand = args[index];
-  if (subcommand === undefined || !DIFF_PRODUCING_SUBCOMMANDS.has(subcommand)) return args;
-  const rest = args.slice(index + 1);
+  if (subcommand === undefined) return args;
+  let at = index;
+  if (!DIFF_PRODUCING_SUBCOMMANDS.has(subcommand)) {
+    const second = DIFF_PRODUCING_SUB_SUBCOMMANDS[subcommand];
+    const next = args[index + 1];
+    if (second === undefined || next === undefined || !second.has(next)) return args;
+    at = index + 1;
+  }
+  const rest = args.slice(at + 1);
   const extra = ["--no-ext-diff", "--no-textconv"].filter((flag) => !rest.includes(flag));
-  return [...args.slice(0, index + 1), ...extra, ...rest];
+  return [...args.slice(0, at + 1), ...extra, ...rest];
 }

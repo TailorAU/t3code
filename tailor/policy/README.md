@@ -17,7 +17,7 @@ configuration only for the rest. The policy always wins over user settings.
 | Most permissive mode capped at Supervised | Compile-time ceiling `TAILOR_MAX_RUNTIME_MODE = "approval-required"`, applied to every command, launch, settings read, provider turn and MCP caller; Claude's `acceptEdits`, `auto` and `bypassPermissions` all become `default` | Build (cannot be configured) |
 | Default mode Supervised | `DEFAULT_RUNTIME_MODE = "approval-required"`; the connector also always sends it | Build |
 | Repository and user Claude settings, hooks and `.mcp.json` ignored | Every Claude query, the probe and `claude -p`: no setting sources, strict MCP, compiled deny rules in both `managedSettings` and the flag-tier settings, permission mode capped whatever the launch arguments say; `claude -p` runs in an empty temporary folder | Build |
-| Repository git hooks and config-driven commands off | Every git command T3 runs: `core.hooksPath` = the empty admin-owned `git-hooks\`, `safe.bareRepository=explicit`, `core.fsmonitor=false`, `protocol.ext.allow=never`, `--no-ext-diff --no-textconv`; edits to `.git/hooks`, `.git/config`, `.githooks` and `.husky` denied | Build |
+| Repository git hooks and config-driven commands off | Every git command T3 runs: no global or system config (`GIT_CONFIG_GLOBAL` = an empty admin-owned file, `GIT_CONFIG_NOSYSTEM=1`), `core.hooksPath` = the empty admin-owned `git-hooks\`, `safe.bareRepository=explicit`, `core.fsmonitor=false`, `protocol.ext.allow=never`, `protocol.file.allow=user`, no credential helper, `core.sshCommand=ssh`, no signing, `--no-ext-diff --no-textconv`; edits to `.git/**`, `~/.gitconfig`, `~/.config/git/**`, `.gitattributes`, `.gitmodules`, `.githooks` and `.husky` denied | Build |
 | Projects and worktrees stay in their roots | Projects only inside the workspace roots; worktrees only inside their project or T3's worktree folder; real paths compared | Build reads the admin-only file |
 | Policy Claude home and binary required | With `%ProgramData%\T3CodePolicy\t3-policy.json` present, a Claude query refuses to start unless the instance uses the recorded Claude home and binary; an unreadable policy also refuses | Build reads the admin-only file |
 | No standing grants | "Accept for session" approves one call only | Build |
@@ -79,10 +79,14 @@ Get-FileHash -LiteralPath ($files | ForEach-Object { Join-Path $dest $_ }) -Algo
 Compare each hash with the reviewed commit's, then run from there, passing the same hashes:
 
 ```powershell
-& "$dest\install-policy.ps1" -WhatIf `
+pwsh -NoProfile -File "$dest\install-policy.ps1" -WhatIf `
   -ExpectedSha256 'script=<hex>,verify=<hex>,template=<hex>,module=<hex>,accounts=<hex>' `
   -T3Exe 'C:\Program Files\T3Code\t3.exe' -ClaudeExe 'C:\Program Files\T3Code\claude\claude.exe'
 ```
+
+Always start the scripts with `pwsh -NoProfile -File`: no profile runs elevated. The scripts
+also pin `PSModulePath` to PowerShell's own folder and System32 and import the Windows modules
+they use by full path, so nothing on a user-writable module path can shadow a cmdlet.
 
 The script reads each file once, checks its hash, and loads the modules, the template and the
 self-check from those bytes (`New-Module -ScriptBlock`), never by reading the paths again. A
@@ -113,6 +117,9 @@ handle, never by path. No folder grants anything to the interactive user, `Users
 | `state\` | admins | The undo record and the managed-settings baseline. |
 | `service\` | admins; both accounts read | Launchers, the T3 settings seed, the token issuer and mover, and `verified.json` (the marker). |
 | `git-hooks\` | admins; `t3agent` read | Empty. `core.hooksPath` for every git command T3 runs. |
+| `git-config\` | admins; `t3agent` read | `gitconfig`, empty: `GIT_CONFIG_GLOBAL` for every git command T3 runs. |
+| `run\` | admins; `t3agent` modify; `t3bridge` read | `t3-server.json`: the PID of the `t3 serve` the launcher started (bridge contract). |
+| `probe\` | admins; `t3agent` create only | The self-check probe's result, read and deleted by the self-check. |
 | `t3-home\` | admins; `t3agent` modify | T3's base dir. On first start the launcher (as `t3agent`) copies the seed into `userdata\settings.json`. No admin code runs here. |
 | `claude-home\` | admins; `t3agent` see below | Claude home. `t3agent` may read it, create subfolders, modify `.claude.json` and work inside subfolders, but cannot create or replace files at the root. |
 | `connector-drop\` | admins; `t3agent` create only | Where the issuer leaves a new token. `t3agent` can create a file but not list, read or delete. |
@@ -131,6 +138,8 @@ handle, never by path. No folder grants anything to the interactive user, `Users
 | `-AgentAccount` | no | `t3agent` | Local account created to run `t3 serve`, its Claude and the token issuer |
 | `-BridgeAccount` | no | `t3bridge` | Local account created to run the bridge and read the connector token |
 | `-BridgeExe` | no | none | The bridge executable; registers its task (admin-only folder, hash recorded) |
+| `-BridgeChecksServer` | with `-BridgeExe` | | Confirms the bridge build checks the T3 listener before every connection (bridge contract) |
+| `-GitExe` | no | `git` on PATH | The git the self-check uses (admin-only folder, at least 2.50.1, hash recorded) |
 | `-TailorApiHosts` | with `-BridgeExe` | none | tailor.au API host names the bridge may reach (for example api.example.com) |
 | `-WorkspaceRoots` | no | none | More project roots besides `workspaces\`; each gets an admins + `t3agent` ACL, and its parent must be admin-only |
 | `-ConnectorTokenDays` | no | `7` | Lifetime of each connector token (2 to 30); a new one is issued daily |
@@ -152,11 +161,15 @@ step:
 
 1. `\T3CodePolicy\T3 token issuer` runs as `t3agent` daily (and once after install). It claims
    `connector-drop\token` (create only), issues a `tailor:connector` token with T3's own CLI
-   against the T3 home, writes it there, and revokes every connector session but the two
-   newest. The token is never printed.
+   against the T3 home (retrying once), writes it there, and revokes every connector session
+   but the new one and the one before it, which the bridge still holds until the mover runs.
+   `-RotateConnectorToken` runs the same script through `T3 token rotate now` with
+   `-RevokeAllPrevious`: every previous connector session is revoked at once. The token is
+   never printed.
 2. `\T3CodePolicy\T3 token mover` runs as SYSTEM every ten minutes, from fixed code in
-   `service\`. It takes the drop file only if it is a plain file with one link, owned by
-   `t3agent`, holding one printable token; writes `connector\token.new` with its ACL
+   `service\`. It deletes anything else in the drop folder, then takes the drop file only if
+   it is a plain file with one link, owned by `t3agent`, holding one printable token (read
+   from the open handle, at most 4096 bytes); writes `connector\token.new` with its ACL
    (admins, `t3bridge` read) set at creation; renames it over `connector\token`; deletes the
    drop file. It never parses or runs anything `t3agent` wrote.
 
@@ -169,7 +182,7 @@ If anything looks wrong (a token may have leaked, the self-check fails unexpecte
 behaves oddly), from an elevated PowerShell 7:
 
 ```powershell
-& "$env:ProgramData\T3CodePolicy\installer\install-policy.ps1" -EmergencyRevoke
+pwsh -NoProfile -File "$env:ProgramData\T3CodePolicy\installer\install-policy.ps1" -EmergencyRevoke
 ```
 
 It runs from the protected copy under the same rules (it refuses a writable or changed copy;
@@ -202,7 +215,11 @@ after resolving junctions and links, case-insensitively; nothing else under `T3C
 is allowed.
 
 - **In.** Clone through T3 (the clone runs as `t3agent`, into a workspace root), or as an
-  administrator copy a tree into `workspaces\<name>`: it inherits the folder's ACL.
+  administrator copy a tree into `workspaces\<name>` with `Copy-Item` (not `robocopy /SEC`
+  or anything that copies ACLs): it inherits the folder's ACL. `-WorkspaceRoots` refuses a
+  folder that exists and is not empty, because its children would keep their old ACLs; give a
+  new or empty folder and copy code in afterwards. The self-check walks every workspace tree
+  and fails on any entry for anyone but Administrators, SYSTEM and `t3agent`.
 - **Out.** Push from T3 (each git command is a Supervised approval; `t3agent` needs its own
   repository credential, which is a separate decision and not set up here), or as an
   administrator copy the tree out.
@@ -210,14 +227,33 @@ is allowed.
 
 ## Self-check and the verified marker
 
-`verify-install.ps1` (elevated, from the protected copy) reports PASS or FAIL per check: the
-protected copy's hashes, every folder ACL against the plan, the token readable by `t3bridge`
-only, the accounts (no group but `Users`, batch logon only), the tasks (password logon,
-LeastPrivilege, the right launcher; the mover as SYSTEM), the firewall profiles and rules,
-the machine managed-settings entries against the install-time baseline, the binary and
-service-file hashes, and that a repository hook does not run with T3's git settings. It then
-prints the checks a person has to do (non-elevated access denied to the token, `runas` refused,
-Supervised enforced, projects outside the roots refused, the egress capture).
+`verify-install.ps1` (elevated, `pwsh -NoProfile -File`, only from the protected copy) reports
+PASS or FAIL per check:
+
+- the protected copy's hashes; every folder ACL against the plan; the workspace trees;
+- the token readable by `t3bridge` only (recorded: an elevated administrator can read it); the
+  bridge key's ACL;
+- the accounts: groups read by SID, no group but `Users`, batch logon only, and a diff of all
+  user rights against the pre-install export in `state\pre-install.json` that allows only the
+  four service-account rights for the two accounts;
+- a live probe: the on-demand task `T3 self-check probe` runs as `t3agent` and records its
+  privileges, groups and integrity level and tries to read the token and to write the policy
+  file, `service\`, the Claude home root, `git-hooks\`, the global git config, `connector\`
+  and `installer\`; every attempt must be denied (reading the policy must work);
+- every task: account, password logon, LeastPrivilege, exactly one action running the right
+  launcher, and a security descriptor that lets only Administrators and SYSTEM change, start
+  or stop it;
+- firewall profiles and rules; the machine managed tier (our entries, nothing that loosens the
+  lock, no `HKLM\SOFTWARE\Policies\ClaudeCode`); binary and service-file hashes;
+- git: the installed `git.exe` by full path, at least version 2.50.1, an empty global config,
+  and a repository hook that does not run with T3's git settings;
+- after an emergency revoke, the signing key is newer than the revoke.
+
+Any FAIL removes the marker and also stops the T3 and bridge tasks. It then prints the checks
+a person has to do, with exact prompts and commands: non-elevated access, `runas`, Supervised
+enforcement, deny variants (case, 8.3 name, `C:\Users\All Users\...`, `\\?\`), fail-closed
+tests (policy file removed, one byte of `claude.exe` changed), hooks and Bash approvals,
+projects outside the roots, and egress (DNS, the browser, both CSPs).
 
 On a full PASS it writes `service\verified.json` (admin-owned, the accounts read) with the
 SHA-256 of every file the launchers use; on any FAIL it removes it. Each launcher refuses to
@@ -251,7 +287,9 @@ them as LSA secrets (readable by SYSTEM, as for any "run whether user is logged 
 task). They are never written to disk or a log. Local policy grants "log on as a batch job" and
 denies interactive, Remote Desktop and network logon. An existing account in any group but
 `Users` (Administrators, Remote Desktop Users, Backup Operators, Hyper-V Administrators, Remote
-Management Users and so on) makes the installer refuse.
+Management Users and so on) makes the installer refuse. Groups are read by SID through ADSI;
+any error reading them fails closed. The installer creates the accounts itself and records
+their SIDs before anything else; it refuses an account of the same name it did not create.
 
 Both accounts stay in `BUILTIN\Users`: `Program Files` and `System32` grant read and execute
 through `Users`, so without it the accounts could not start PowerShell, `t3` or Claude. Nothing
@@ -261,6 +299,26 @@ under `T3CodePolicy` grants `Users` anything.
 | --- | --- | --- |
 | `t3agent` | `t3 serve` and its Claude (`T3 server`, at startup, restarts), the token issuer (`T3 token issuer`, daily) | `t3-home\`, `claude-home\` as above, `workspaces\`, `service\` and `t3-policy.json` (read), `connector-drop\` (create only) |
 | `t3bridge` | The T3 bridge, if `-BridgeExe` is given (`T3 bridge`) | `connector\` and `bridge\` (read), `service\` (read) |
+
+## Bridge contract: the bridge authenticates the server
+
+The bridge must not send the token to whatever listens on the T3 port: while T3 is stopped,
+any account (the operator's lanes included) can bind `127.0.0.1:3773`. So:
+
+- the T3 launcher (as `t3agent`) starts `t3 serve` and writes its PID to `run\t3-server.json`
+  (`run\`: `t3agent` modify, `t3bridge` read, nobody else);
+- before every connection, the bridge reads that file, checks it is a plain file owned by
+  `t3agent` (`T3_BRIDGE_SERVER_OWNER_SID`), and checks that the only listener on the T3 port
+  is that PID (`GetExtendedTcpTable` / `Get-NetTCPConnection`), and sends the token only then.
+  A non-admin account cannot read another account's process image or owner, so the published
+  PID is what ties the listener to `t3agent`;
+- the bridge launcher runs the same check before it starts the bridge (`Test-T3ServerListener`),
+  and passes `T3_BRIDGE_SERVER_PID_FILE` and `T3_BRIDGE_SERVER_OWNER_SID` to it.
+
+`-BridgeExe` is refused unless `-BridgeChecksServer` is also given: the operator confirms that
+the bridge build implements the per-connection check above. A named pipe with an ACL
+(`t3agent` server, `t3bridge` client) would be stronger and is the planned follow-up; it needs
+a pipe listener in T3's server.
 
 ## Design choice: who can hold the T3 token
 
@@ -280,12 +338,19 @@ under `T3CodePolicy` grants `Users` anything.
 ## Uninstall
 
 `-Uninstall` (from the protected copy) first has `t3agent` rotate every signing key (so every
-issued token is invalid even before the files go), then stops and removes the five tasks, stops every process
-running as either account, removes the accounts, their rights and profiles, the firewall
-rules, and restores only the `T3CODE_*` machine variables it changed to their earlier values.
-It removes only what it added to the machine managed-settings file, then deletes `service\`,
-`connector\`, `connector-drop\`, `bridge\`, `git-hooks\`, `t3-home\`, `claude-home\`,
-`t3-policy.json`, `state\` and `installer\` (links are removed, never followed). Workspaces
+issued token is invalid even before the files go), then stops and removes the tasks and the
+`\T3CodePolicy` task folder, stops every process running as either account, and removes the
+accounts, their rights and profiles, but only accounts this installer created (their SIDs are
+recorded; an account that already existed is never reset or deleted, and the install refuses
+to use one). It removes the firewall rules, restores only the `T3CODE_*` machine variables it
+changed to their earlier values, and removes only what it added to the machine
+managed-settings file. The `*.t3bak-*` backups of that file are kept on purpose; the
+`Program Files\ClaudeCode` folder is removed only if the installer created it and it is
+empty. It then deletes `service\`, `connector\`, `connector-drop\`, `bridge\`, `git-hooks\`,
+`git-config\`, `run\`, `probe\`, `t3-home\`, `claude-home\`, `t3-policy.json`, `state\` and
+`installer\` (links are removed, never followed), and finally prints a diff of managed
+settings, user rights, tasks, firewall rules and `T3CODE_*` variables against the
+pre-install snapshot. Workspaces
 hold code, so they are kept, with the deleted accounts' ACL entries removed from the whole
 tree; the policy folder is kept only if something is left in it, with its ACL reset to
 admins only.
@@ -296,6 +361,9 @@ admins only.
   through COM, the handle-based ACL reset, the token issuer and mover, the firewall rules, the
   self-check and the marker) has only been parse-checked and unit-tested. The first elevated
   run on a real machine is the test.
+- **The bridge's own server check.** The launcher checks the T3 listener before starting the
+  bridge; the per-connection check is the bridge's (tailor-app), and a named pipe with an ACL
+  is the stronger follow-up.
 - **The agent and its own shell share `t3agent`.** Claude and the commands it runs are the
   same account as `t3 serve`, so ACLs cannot separate them. Hence the Supervised ceiling
   (SECURITY-REVIEW.md, T3-42).

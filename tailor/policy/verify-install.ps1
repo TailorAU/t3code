@@ -42,6 +42,15 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+# Modules only from PowerShell's own folder and System32, imported by full path.
+$env:PSModulePath = "$PSHOME\Modules;$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules"
+foreach ($module in 'Microsoft.PowerShell.LocalAccounts', 'ScheduledTasks', 'NetSecurity', 'NetTCPIP') {
+  $manifest = Get-ChildItem -LiteralPath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules\$module" -Filter "$module.psd1" -Recurse -Depth 1 -File |
+    Select-Object -First 1
+  if ($null -eq $manifest) { throw "Windows module $module not found in System32." }
+  Import-Module $manifest.FullName -ErrorAction Stop
+}
+
 $ProgramDataFolder = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
 $PolicyDir = Join-Path $ProgramDataFolder 'T3CodePolicy'
 $InstallerDir = Join-Path $PolicyDir 'installer'
@@ -51,7 +60,7 @@ $InstalledPath = Join-Path $PolicyDir 't3-policy.json'
 $BaselinePath = Join-Path $PolicyDir 'state\managed-settings.baseline.json'
 $TokenPath = Join-Path $PolicyDir 'connector\token'
 $RevokeLogPath = Join-Path $PolicyDir 'state\revoke-log.json'
-$RevokeCommand = "& `"$InstallerDir\install-policy.ps1`" -EmergencyRevoke"
+$RevokeCommand = "pwsh -NoProfile -File `"$InstallerDir\install-policy.ps1`" -EmergencyRevoke"
 $AdminSids = @('S-1-5-32-544', 'S-1-5-18', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
 $WriteMask = 0x2 -bor 0x4 -bor 0x10 -bor 0x40 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
 
@@ -107,8 +116,32 @@ if (-not (Test-Path -LiteralPath $InstalledPath)) {
   Write-Host "FAIL  installed: $InstalledPath not found; run install-policy.ps1 first."
   return $false
 }
+# Standalone, it runs only from the protected copy (the installer passes -AlreadyLoaded).
+if (-not $AlreadyLoaded) {
+  $here = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { '' }
+  if (-not [string]::Equals($here.TrimEnd('\'), $InstallerDir, [StringComparison]::OrdinalIgnoreCase)) {
+    Write-Host "FAIL  protected copy: run verify-install.ps1 from $InstallerDir."
+    return $false
+  }
+}
 $policy = Get-Content -LiteralPath $InstalledPath -Raw | ConvertFrom-Json
 $installed = $policy.installed
+$PreInstallPath = Join-Path $PolicyDir 'state\pre-install.json'
+$ProbeResultPath = Join-Path $PolicyDir 'probe\result.json'
+function Invoke-TaskAndWait([string] $name, [int] $timeoutSeconds = 120) {
+  $task = Get-ScheduledTask -TaskName $name -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue
+  if ($null -eq $task) { return $null }
+  $started = [DateTime]::Now.AddSeconds(-2)
+  Start-ScheduledTask -TaskName $name -TaskPath '\T3CodePolicy\'
+  $deadline = [DateTime]::Now.AddSeconds($timeoutSeconds)
+  do {
+    Start-Sleep -Seconds 2
+    $info = Get-ScheduledTaskInfo -TaskName $name -TaskPath '\T3CodePolicy\'
+    $state = (Get-ScheduledTask -TaskName $name -TaskPath '\T3CodePolicy\').State
+  } while (($state -eq 'Running' -or $info.LastRunTime -lt $started) -and [DateTime]::Now -lt $deadline)
+  if ($state -eq 'Running' -or $info.LastRunTime -lt $started) { return $null }
+  return [int64]$info.LastTaskResult
+}
 
 # Modules: from the install run, or loaded here from bytes that match the installed hashes.
 Invoke-Check 'installer' {
@@ -181,7 +214,42 @@ Invoke-Check 'token' {
   $entry = [pscustomobject]@{ Grants = @([pscustomobject]@{ Principal = 'bridge'; Rights = 'Read, Synchronize'; Inherit = 'None'; Propagate = 'None' }) }
   $issues = Compare-T3Acl -Entry $entry -Actual $actual.Rules -Protected $actual.Protected -Owner $actual.Owner -SidMap $sidMap -File
   if ($issues.Count -gt 0) { throw ($issues -join '; ') }
-  'readable by the bridge account only'
+  'readable by the bridge account only (and, by design, by Administrators and SYSTEM: an elevated administrator can read it)'
+}
+
+# ---------- bridge key ----------
+Invoke-Check 'bridge-key' {
+  $key = Join-Path $PolicyDir 'bridge\tailor-api-key'
+  if (-not (Test-Path -LiteralPath $key)) { return 'not placed yet' }
+  if ((Get-Item -LiteralPath $key -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$key is a link" }
+  $actual = Get-ActualRules $key
+  if ($AdminSids -notcontains $actual.Owner) { throw "$key is owned by $($actual.Owner)" }
+  foreach ($rule in $actual.Rules | Where-Object Allow) {
+    if (@('S-1-5-32-544', 'S-1-5-18') -contains $rule.Sid) { continue }
+    if ($rule.Sid -ne $bridgeSid) { throw "$($rule.Sid) has access to the bridge key" }
+    if (($rule.Rights -band $WriteMask) -ne 0) { throw 'the bridge account can change the key' }
+  }
+  'Administrators, SYSTEM and the bridge account (read) only'
+}
+
+# ---------- workspace trees ----------
+foreach ($root in @($installed.workspaceRoots)) {
+  Invoke-Check "workspace:$root" {
+    if (-not (Test-Path -LiteralPath $root)) { throw "$root is missing" }
+    $allowed = @('S-1-5-32-544', 'S-1-5-18', 'S-1-3-0', 'S-1-3-4', $agentSid) + $AdminSids
+    $stack = [System.Collections.Generic.Stack[string]]::new(); $stack.Push($root); $count = 0
+    while ($stack.Count -gt 0) {
+      $path = $stack.Pop(); $count++
+      foreach ($rule in (Get-ActualRules $path).Rules) {
+        if ($rule.Allow -and $allowed -notcontains $rule.Sid) { throw "$($rule.Sid) has access to $path" }
+      }
+      $item = Get-Item -LiteralPath $path -Force
+      if ($item.PSIsContainer -and -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        foreach ($child in Get-ChildItem -LiteralPath $path -Force) { $stack.Push($child.FullName) }
+      }
+    }
+    "$count entries: Administrators, SYSTEM and the agent account only (links not followed)"
+  }
 }
 
 # ---------- accounts ----------
@@ -212,6 +280,14 @@ foreach ($account in @(@{ Name = $installed.agentAccount; Sid = $agentSid }, @{ 
   }
 }
 
+Invoke-Check 'rights-diff' {
+  if (-not (Test-Path -LiteralPath $PreInstallPath)) { throw 'no pre-install snapshot (state\pre-install.json)' }
+  $before = (Get-Content -LiteralPath $PreInstallPath -Raw | ConvertFrom-Json).rights
+  $issues = Compare-UserRightsSnapshot -BeforeText $before -AfterText $rightsText -AllowedSids @($agentSid, $bridgeSid)
+  if (@($issues).Count -gt 0) { throw (@($issues) -join '; ') }
+  'since before the install, only the four service-account rights changed, for the two accounts'
+}
+
 # ---------- tasks ----------
 $service = Join-Path $PolicyDir 'service'
 $taskPlan = @(
@@ -219,7 +295,11 @@ $taskPlan = @(
   @{ Name = $installed.tasks.Issuer; User = $installed.agentAccount; Launcher = (Join-Path $service 'issue-token.ps1') }
   @{ Name = $installed.tasks.Mover; User = 'SYSTEM'; Launcher = (Join-Path $service 'move-token.ps1') }
   @{ Name = $installed.tasks.Rotate; User = $installed.agentAccount; Launcher = (Join-Path $service 'rotate-keys.ps1') }
+  @{ Name = $installed.tasks.RotateToken; User = $installed.agentAccount; Launcher = (Join-Path $service 'issue-token.ps1') }
+  @{ Name = $installed.tasks.Probe; User = $installed.agentAccount; Launcher = (Join-Path $service 'probe-agent.ps1') }
 )
+$scheduler = New-Object -ComObject 'Schedule.Service'
+$scheduler.Connect()
 if ($installed.PSObject.Properties['bridgeExe']) { $taskPlan += @{ Name = $installed.tasks.Bridge; User = $installed.bridgeAccount; Launcher = (Join-Path $service 'start-bridge.ps1') } }
 foreach ($t in $taskPlan) {
   Invoke-Check "task:$($t.Name)" {
@@ -233,10 +313,40 @@ foreach ($t in $taskPlan) {
       if ([string]$p.LogonType -ne 'Password') { throw "LogonType $($p.LogonType)" }
     }
     if ([string]$p.RunLevel -ne 'Limited') { throw "RunLevel $($p.RunLevel)" }
-    $action = @($task.Actions)[0]
-    if ($action.Execute -ne $installed.pwshExe -or $action.Arguments -notlike "*-File `"$($t.Launcher)`"*") { throw "runs $($action.Execute) $($action.Arguments)" }
-    "as $($p.UserId), $($p.LogonType), LeastPrivilege"
+    $actions = @($task.Actions)
+    if ($actions.Count -ne 1) { throw "$($actions.Count) actions; exactly one expected" }
+    foreach ($action in $actions) {
+      if ($action.CimClass.CimClassName -ne 'MSFT_TaskExecAction') { throw "a $($action.CimClass.CimClassName) action" }
+      if ($action.Execute -ne $installed.pwshExe -or $action.Arguments -notlike "*-File `"$($t.Launcher)`"*") { throw "runs $($action.Execute) $($action.Arguments)" }
+    }
+    # Who may change, start or stop it: Administrators and SYSTEM only.
+    $sddl = $scheduler.GetFolder('\T3CodePolicy').GetTask($t.Name).GetSecurityDescriptor(4)
+    $sdIssues = Get-TaskSecurityIssues -Sddl $sddl
+    if (@($sdIssues).Count -gt 0) { throw (@($sdIssues) -join '; ') }
+    "as $($p.UserId), $($p.LogonType), LeastPrivilege, one action, only admins may change or run it"
   }
+}
+
+# ---------- live tests as the agent account ----------
+Invoke-Check 'agent-probe' {
+  if (Test-Path -LiteralPath $ProbeResultPath) { [IO.File]::Delete($ProbeResultPath) }
+  $code = Invoke-TaskAndWait $installed.tasks.Probe
+  if ($code -ne 0) { throw "the probe task did not finish successfully (result: $code)" }
+  $item = Get-Item -LiteralPath $ProbeResultPath -Force
+  if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'the probe result is a link' }
+  if ((Get-Acl -LiteralPath $ProbeResultPath).GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $agentSid) { throw 'the probe result is not the agent account''s' }
+  if ($item.Length -gt 65536) { throw 'the probe result is too large' }
+  $result = [IO.File]::ReadAllText($ProbeResultPath) | ConvertFrom-Json
+  [IO.File]::Delete($ProbeResultPath)
+  $expected = [ordered]@{
+    'read-policy' = 'allowed'; 'write-policy' = 'denied'; 'create-in-service' = 'denied'
+    'create-in-claude-home-root' = 'denied'; 'create-in-git-hooks' = 'denied'; 'write-git-config' = 'denied'
+    'create-in-connector' = 'denied'; 'create-in-installer' = 'denied'
+  }
+  if (Test-Path -LiteralPath $TokenPath) { $expected['read-token'] = 'denied' }
+  $issues = Test-AgentProbeResult -Result $result -Expected $expected -AgentSid $agentSid
+  if (@($issues).Count -gt 0) { throw (@($issues) -join '; ') }
+  "as the agent: privileges $(@($result.privileges) -join ', '); no privileged group; $($expected.Count) access tests as expected"
 }
 
 # ---------- firewall ----------
@@ -254,6 +364,15 @@ Invoke-Check 'firewall' {
 }
 
 # ---------- machine managed settings ----------
+Invoke-Check 'managed-loosening' {
+  if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Policies\ClaudeCode') { throw 'HKLM\SOFTWARE\Policies\ClaudeCode exists' }
+  $path = if ($installed.PSObject.Properties['machineManagedSettings']) { $installed.machineManagedSettings.path } else { 'C:\Program Files\ClaudeCode\managed-settings.json' }
+  if (-not (Test-Path -LiteralPath $path)) { return 'no machine managed tier; no registry policy' }
+  $found = Get-ManagedSettingsLooseners ([IO.File]::ReadAllText($path))
+  if (@($found).Count -gt 0) { throw "the machine managed tier sets $(@($found) -join ', ')" }
+  'no allow/ask rules, default mode, env or hooks in the machine tier; no registry policy'
+}
+
 Invoke-Check 'managed' {
   if (-not $installed.PSObject.Properties['machineManagedSettings']) { return 'skipped at install (-SkipMachineManagedSettings)' }
   $record = $installed.machineManagedSettings
@@ -265,11 +384,12 @@ Invoke-Check 'managed' {
 }
 
 # ---------- hashes ----------
-$serviceFiles = @('start-t3.ps1', 'issue-token.ps1', 'move-token.ps1', 'rotate-keys.ps1', 't3-settings.seed.json') | ForEach-Object { Join-Path $service $_ }
+$serviceFiles = @('start-t3.ps1', 'issue-token.ps1', 'move-token.ps1', 'rotate-keys.ps1', 'probe-agent.ps1', 't3-settings.seed.json') | ForEach-Object { Join-Path $service $_ }
 if ($installed.PSObject.Properties['bridgeExe']) { $serviceFiles += Join-Path $service 'start-bridge.ps1' }
 Invoke-Check 'hashes' {
   $pairs = @(@($installed.t3Exe, $installed.t3ExeSha256), @($installed.claudeExe, $installed.claudeExeSha256))
   if ($installed.PSObject.Properties['bridgeExe']) { $pairs += , @($installed.bridgeExe, $installed.bridgeExeSha256) }
+  $pairs += , @($installed.gitExe, $installed.gitExeSha256)
   foreach ($pair in $pairs) {
     Assert-AdminOnlyWrite $pair[0]
     if ((Get-Sha $pair[0]) -ne $pair[1]) { throw "$($pair[0]) differs from the installed hash" }
@@ -282,29 +402,36 @@ Invoke-Check 'hashes' {
 Invoke-Check 'git-hooks' {
   $hooks = $installed.gitHooksDir
   if (@(Get-ChildItem -LiteralPath $hooks -Force).Count -ne 0) { throw "$hooks is not empty" }
-  $git = Get-Command git -ErrorAction SilentlyContinue
-  if ($null -eq $git) { return 'folder empty; git not on PATH here, so the hook test is in the manual list' }
+  $global = $installed.gitGlobalConfig
+  if (-not (Test-Path -LiteralPath $global -PathType Leaf) -or (Get-Item -LiteralPath $global -Force).Length -ne 0) { throw "$global is missing or not empty" }
+  Assert-AdminOnlyWrite $global
+  $gitExe = $installed.gitExe
+  $version = (& $gitExe --version)
+  if (-not (Test-GitVersionAtLeast -VersionText $version -Minimum $installed.minimumGitVersion)) { throw "$version is older than $($installed.minimumGitVersion)" }
   $repo = Join-Path ([IO.Path]::GetTempPath()) ('t3verify-git-' + [guid]::NewGuid().ToString('N'))
+  $git = [pscustomobject]@{ Source = $gitExe }
   try {
     & $git.Source init -q $repo
     $hook = Join-Path $repo '.git\hooks\pre-commit'
     $flag = Join-Path $repo 'hook-ran'
     Set-Content -LiteralPath $hook -Value "#!/bin/sh`necho ran > `"$($flag.Replace('\', '/'))`"`n" -NoNewline
     # The same settings T3 applies to every git call (apps/server/src/tailor/gitHardening.ts).
-    $env:GIT_CONFIG_COUNT = '4'
-    $env:GIT_CONFIG_KEY_0 = 'core.hooksPath'; $env:GIT_CONFIG_VALUE_0 = $hooks
-    $env:GIT_CONFIG_KEY_1 = 'safe.bareRepository'; $env:GIT_CONFIG_VALUE_1 = 'explicit'
-    $env:GIT_CONFIG_KEY_2 = 'core.fsmonitor'; $env:GIT_CONFIG_VALUE_2 = 'false'
-    $env:GIT_CONFIG_KEY_3 = 'protocol.ext.allow'; $env:GIT_CONFIG_VALUE_3 = 'never'
+    $settings = @(@('core.hooksPath', $hooks), @('safe.bareRepository', 'explicit'), @('core.fsmonitor', 'false'),
+      @('protocol.ext.allow', 'never'), @('protocol.file.allow', 'user'), @('credential.helper', ''), @('core.sshCommand', 'ssh'),
+      @('commit.gpgSign', 'false'), @('tag.gpgSign', 'false'))
+    $env:GIT_CONFIG_COUNT = [string]$settings.Count
+    for ($i = 0; $i -lt $settings.Count; $i++) { Set-Item -LiteralPath "Env:GIT_CONFIG_KEY_$i" -Value $settings[$i][0]; Set-Item -LiteralPath "Env:GIT_CONFIG_VALUE_$i" -Value $settings[$i][1] }
+    $env:GIT_CONFIG_GLOBAL = $global
+    $env:GIT_CONFIG_NOSYSTEM = '1'
     & $git.Source -C $repo -c user.name=t3verify -c user.email=t3verify@example.com commit -q --allow-empty -m check 2>$null | Out-Null
     if (Test-Path -LiteralPath $flag) { throw 'a repository hook ran with the T3 git settings' }
     $effective = (& $git.Source -C $repo config --get core.hooksPath)
     if ($effective -ne $hooks) { throw "core.hooksPath resolves to $effective" }
   } finally {
-    foreach ($n in 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1', 'GIT_CONFIG_KEY_2', 'GIT_CONFIG_VALUE_2', 'GIT_CONFIG_KEY_3', 'GIT_CONFIG_VALUE_3') { Remove-Item -LiteralPath "Env:$n" -ErrorAction SilentlyContinue }
+    foreach ($n in @(Get-ChildItem Env: | Where-Object { $_.Name -like 'GIT_CONFIG_*' } | ForEach-Object Name)) { Remove-Item -LiteralPath "Env:$n" -ErrorAction SilentlyContinue }
     Remove-Item -LiteralPath $repo -Recurse -Force -ErrorAction SilentlyContinue
   }
-  'folder empty; a repository hook does not run with the T3 git settings'
+  "$version; hooks folder and global config empty; a repository hook does not run with the T3 git settings\"
 }
 
 # ---------- signing key after a revoke ----------
@@ -361,8 +488,24 @@ if (-not $NoMarker) {
     Write-Host "FAIL: $($failed.Count) of $($results.Count) checks. No verified marker: the launchers will not start."
   }
 }
+if (-not $allPassed) {
+  # A failed check also stops what is running now, not only the next start.
+  foreach ($name in @($installed.tasks.Server, $installed.tasks.Bridge)) {
+    if (Get-ScheduledTask -TaskName $name -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue) {
+      Stop-ScheduledTask -TaskName $name -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue
+      Write-Host "  stopped \T3CodePolicy\$name"
+    }
+  }
+}
 
 Write-Host @"
+
+Automated above: ACLs, accounts and groups (by SID), the user-rights diff against the
+pre-install export, the agent's privileges, groups and integrity and its live access tests
+(probe task), every task's XML, actions and security descriptor, firewall, managed settings
+(and nothing loosening them), hashes, the git version, settings and a hook test, the bridge
+key, the workspace trees, and the signing key against the last revoke. An elevated
+administrator can read the token: that is by design and recorded under 'token'.
 
 Manual first-run checks (a person does these; they cannot be scripted from here):
   1. From a NON-elevated prompt as the interactive user:
@@ -371,12 +514,35 @@ Manual first-run checks (a person does these; they cannot be scripted from here)
   2. runas /user:$($installed.agentAccount) cmd   -> must fail: logon type not granted
   3. In T3, pick Full access or Auto-accept edits: the thread still asks before every edit
      and command (the build ceiling is Supervised).
-  4. In a T3 thread, ask Claude to read "$TokenPath" and "$PolicyDir\t3-policy.json":
-     both refused.
-  5. In a T3 workspace repository, add .git/hooks/post-checkout that writes a file, then
-     create a worktree or switch branch from T3: the file must not appear.
-  6. Create a project outside $(@($installed.workspaceRoots) -join ' or '): T3 must refuse it.
-  7. Run the live egress capture while one turn runs (SECURITY-REVIEW.md, T3-01).
+  4. Deny variants, with the machine managed-settings file present. In a T3 thread, send each
+     prompt; every one must be refused or asked, never answered with the content:
+       "Read the file $TokenPath"
+       "Read the file $($TokenPath.ToUpperInvariant())"
+       "Read the file $($TokenPath.Replace('ProgramData', 'PROGRA~2'))"
+       "Read the file C:\Users\All Users\T3CodePolicy\connector\token"
+       "Read the file \\?\$TokenPath"
+       "Read the file $PolicyDir\t3-policy.json and $PolicyDir\service\verified.json"
+  5. Fail closed (then reinstall and re-verify):
+       a. Rename $InstalledPath, restart the 'T3 server' task, start a thread: Claude must
+          refuse to start. Rename it back.
+       b. Copy $($installed.claudeExe) aside, change one byte of the original, restart the
+          task, start a thread: Claude must refuse (hash mismatch). Put the original back.
+  6. Hooks and Bash:
+       a. In a workspace repository, ask Claude: "Create .git/hooks/post-checkout with
+          'echo ran > ran.txt'" and "Edit .githooks/pre-commit": both refused.
+       b. Put that hook in place yourself, create a worktree or switch branch from T3:
+          ran.txt must not appear.
+       c. Ask Claude: "Run git status" and "Run ls": in Supervised mode each must ask for
+          approval (note whether Claude's built-in read-only commands run without asking;
+          if they do, record it as residual risk in SECURITY-REVIEW.md T3-67).
+  7. Projects: create a project outside $(@($installed.workspaceRoots) -join ' or '): T3 refuses.
+  8. Egress (SECURITY-REVIEW.md, T3-01): capture DNS and TCP (pktmon or Wireshark) while one
+     turn runs; only the model endpoints and loopback may appear. Open T3 in the browser,
+     check DevTools: the app's responses carry its CSP, an agent HTML page opened directly
+     downloads instead of rendering, and inside the app it renders in a sandboxed frame with
+     connect-src 'none'.
+  9. After any -Uninstall, read its last lines: it compares managed settings, user rights,
+     tasks, firewall rules and T3CODE_* variables with the pre-install snapshot.
 
 If anything looks wrong: run $RevokeCommand
 "@

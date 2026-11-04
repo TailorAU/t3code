@@ -160,4 +160,26 @@ function Test-ManagedSettingsUnchanged {
   return [pscustomobject]@{ Ok = $true; Reason = '' }
 }
 
-Export-ModuleMember -Function Merge-ManagedSettingsRecord, Test-ManagedSettingsUnchanged, Get-ManagedSettingsMerge, Get-ManagedSettingsRemoval, Write-ManagedSettingsAtomically, Get-ManagedSettingsBackupPath, ConvertFrom-ManagedSettingsText
+<#
+  Settings in the machine managed tier that would loosen T3's lock for every session: allow or
+  ask rules, a default permission mode, or environment variables. The installer refuses and
+  verify-install.ps1 fails while any is present (the administrator removes them deliberately).
+  Pure; $ExistingText = $null means there is no file.
+#>
+function Get-ManagedSettingsLooseners {
+  param([AllowNull()][object] $ExistingText)
+  if ($null -eq $ExistingText) { return @() }
+  $settings = ConvertFrom-ManagedSettingsText ([string]$ExistingText)
+  $found = [System.Collections.Generic.List[string]]::new()
+  if ($settings.Contains('permissions') -and $settings['permissions'] -is [System.Collections.IDictionary]) {
+    foreach ($key in 'allow', 'ask', 'defaultMode', 'additionalDirectories') {
+      if ($settings['permissions'].Contains($key)) { $found.Add("permissions.$key") }
+    }
+  }
+  foreach ($key in 'defaultMode', 'env', 'apiKeyHelper', 'hooks') {
+    if ($settings.Contains($key)) { $found.Add($key) }
+  }
+  return $found.ToArray()
+}
+
+Export-ModuleMember -Function Get-ManagedSettingsLooseners, Merge-ManagedSettingsRecord, Test-ManagedSettingsUnchanged, Get-ManagedSettingsMerge, Get-ManagedSettingsRemoval, Write-ManagedSettingsAtomically, Get-ManagedSettingsBackupPath, ConvertFrom-ManagedSettingsText

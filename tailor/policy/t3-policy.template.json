@@ -75,14 +75,20 @@
           "Read(~/.t3/**)",
           "Edit(~/.t3/**)",
           "Write(~/.t3/**)",
-          "Edit(**/.git/hooks/**)",
-          "Write(**/.git/hooks/**)",
-          "Edit(**/.git/config)",
-          "Write(**/.git/config)",
           "Edit(**/.githooks/**)",
           "Write(**/.githooks/**)",
           "Edit(**/.husky/**)",
           "Write(**/.husky/**)",
+          "Edit(**/.git/**)",
+          "Write(**/.git/**)",
+          "Edit(~/.gitconfig)",
+          "Write(~/.gitconfig)",
+          "Edit(~/.config/git/**)",
+          "Write(~/.config/git/**)",
+          "Edit(**/.gitattributes)",
+          "Write(**/.gitattributes)",
+          "Edit(**/.gitmodules)",
+          "Write(**/.gitmodules)",
           "WebSearch",
           "WebFetch"
         ]
@@ -137,6 +143,6 @@
     "$comment": "Projects must be inside a workspace root while the policy is installed (workspacePolicy.ts). The installer creates %ProgramData%\\T3CodePolicy\\workspaces for Administrators, SYSTEM and t3agent only; -WorkspaceRoots adds more. See README.md, 'Getting code in and out'."
   },
   "gitHardening": {
-    "$comment": "Every git command T3 runs gets core.hooksPath=%ProgramData%\\T3CodePolicy\\git-hooks (empty, admin-owned), safe.bareRepository=explicit, core.fsmonitor=false and protocol.ext.allow=never, and diff, log and show get --no-ext-diff --no-textconv (gitHardening.ts)."
+    "$comment": "Every git command T3 runs gets GIT_CONFIG_GLOBAL = an empty admin-owned file (%ProgramData%\\T3CodePolicy\\git-config\\gitconfig), GIT_CONFIG_NOSYSTEM=1, core.hooksPath = the empty admin-owned git-hooks folder, safe.bareRepository=explicit, core.fsmonitor=false, protocol.ext.allow=never, protocol.file.allow=user, credential.helper= (cleared), core.sshCommand=ssh, commit.gpgSign=false and tag.gpgSign=false; diff, log, show, blame, diff-tree and stash show get --no-ext-diff --no-textconv (gitHardening.ts)."
   }
 }

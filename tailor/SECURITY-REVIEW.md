@@ -70,6 +70,19 @@ Severity: Critical, High, Medium, Low, Info. Status: Fixed (in this PR), Mitigat
 | T3-52 | Uninstall leftovers, variable restore, undo ordering, password logging, probe hash | Low | Fixed (UNVERIFIED elevated) |
 | T3-53 | No self-check of an install | Medium | Fixed (`verify-install.ps1`; UNVERIFIED elevated) |
 | T3-54 | No way to invalidate every issued token at once | High | Fixed (`-EmergencyRevoke`; UNVERIFIED elevated) |
+| T3-55 | Review-guide `claude -p` run allowed `git diff/log/show` without approval | High | Fixed |
+| T3-56 | Git still read global/system config and repository-configured programs | High | Fixed (filters: controlled by config denial, documented) |
+| T3-57 | Machine managed tier or a registry policy could loosen the lock | High | Fixed |
+| T3-58 | Extra workspace roots kept their children's old ACLs | Medium | Fixed (refused; tree walked by the self-check) |
+| T3-59 | Agent HTML could open as a top-level page | Medium | Fixed (frame only, otherwise a download) |
+| T3-60 | `thread.metadata.update` and MCP worktree paths not checked | Medium | Fixed |
+| T3-61 | `-RotateConnectorToken` kept old connector sessions valid | Medium | Fixed |
+| T3-62 | Group membership read by name; errors ignored | Medium | Fixed (by SID through ADSI, fail closed) |
+| T3-63 | Mover read the size from the path; drop folder not swept; no issue retry | Low | Fixed |
+| T3-64 | Profiles and user module paths in elevated runs | Low | Fixed (`pwsh -NoProfile`, pinned `PSModulePath`) |
+| T3-65 | Uninstall and account ownership gaps; the password's managed copy | Low | Fixed (UNVERIFIED elevated) |
+| T3-66 | The bridge could send the token to an impostor listener | High | Fixed in the launcher and gated (`-BridgeChecksServer`); the bridge's own per-connection check is in the bridge repo (Open) |
+| T3-67 | Self-check missed first-run checks | Medium | Fixed (automated where possible, the rest printed as exact steps) |
 
 ## Findings
 
@@ -754,25 +767,140 @@ Tests: `signingKeys.test.ts` (a token verified across a restart stops verifying 
 rotation, with `InvalidSessionTokenSignatureError`; new tokens work), and the revoke plan,
 rotation script, on-demand task and freshness check in `ServiceAccounts.Tests.ps1`.
 
+### T3-55 Review-guide investigation (High, Fixed)
+
+The `claude -p` review-guide run uses `--permission-mode dontAsk`, where allowed tools run
+without a prompt, and upstream allowed `Bash(git diff/log/show:*)`: shell commands outside
+Supervised, with git's config-driven programs. It now gets `--tools Read,Grep,Glob`,
+`--allowedTools Read(./**),Grep,Glob` (Read scoped to the repository; Grep and Glob follow
+the Read rules and the compiled deny rules) and `--disallowedTools
+Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch`, and every `claude -p` gets the git
+hardening in its environment. Test: `ClaudeTextGeneration.test.ts` asserts the argv.
+
+### T3-56 Git configuration (High, Fixed)
+
+Every T3 git call now also gets `GIT_CONFIG_GLOBAL` = an empty admin-owned file
+(`git-config\gitconfig`), `GIT_CONFIG_NOSYSTEM=1`, `protocol.file.allow=user`,
+`credential.helper=` (cleared), `core.sshCommand=ssh` (an empty value would break ssh
+remotes), `commit.gpgSign=false` and `tag.gpgSign=false`; `GIT_SSH`, `GIT_SSH_COMMAND` and
+`GIT_ASKPASS` are removed; `blame`, `diff-tree` and `stash show` get `--no-ext-diff
+--no-textconv` too. Claude may not edit anything under `**/.git/**`, `~/.gitconfig`,
+`~/.config/git/**`, `**/.gitattributes` or `**/.gitmodules`.
+`filter.<driver>.clean/smudge/process` cannot be switched off for every driver name with `-c`;
+the control is that no config can define a driver: global and system config are off, a clone
+carries no repository config, Claude cannot edit config or attributes, and the agent's own
+shell is Supervised. The self-check requires git 2.50.1 or later (by full path from the
+policy). Tests: `gitHardening.test.ts`, `claudeLock.test.ts`.
+
+### T3-57 Machine tier and registry policy (High, Fixed)
+
+The installer refuses, and the self-check fails, while the machine `managed-settings.json`
+has `permissions.allow`, `permissions.ask`, `permissions.defaultMode`,
+`permissions.additionalDirectories`, `defaultMode`, `env`, `apiKeyHelper` or `hooks`, or
+while `HKLM\SOFTWARE\Policies\ClaudeCode` exists. Test: `ManagedSettingsMerge.Tests.ps1`.
+
+### T3-58 Extra workspace roots (Medium, Fixed)
+
+An existing non-empty `-WorkspaceRoots` folder is refused (its children would keep the
+operator's or `Users`' entries), and the root is recorded before it is created. The self-check
+walks every workspace tree (links not followed) and fails on any allow entry for anyone but
+Administrators, SYSTEM, CREATOR OWNER, OWNER RIGHTS and `t3agent`.
+
+### T3-59 Agent HTML as a top-level page (Medium, Fixed)
+
+HTML assets are served inline only when the browser says the request is for a frame
+(`Sec-Fetch-Dest: iframe` or `frame`); any other request, a top-level navigation or one
+without the header, gets `Content-Disposition: attachment`, `application/octet-stream` and
+`default-src 'none'; sandbox`. Test: `http.test.ts`. A browser that sends no
+`Sec-Fetch-Dest` gets downloads only (fail closed).
+
+### T3-60 Worktree paths, everywhere (Medium, Fixed)
+
+With the machine policy installed, `Orchestrator.dispatch` checks the worktree of every
+`thread.create` and `thread.metadata.update` (client, MCP or server), and the MCP project
+toolkit's existing-worktree check applies the same rules (`workspacePolicy.ts`).
+
+### T3-61 Connector token rotation (Medium, Fixed)
+
+`-RotateConnectorToken` runs the issuer through the on-demand task `T3 token rotate now` with
+`-RevokeAllPrevious`: every previous connector session is revoked. The daily run keeps one
+previous session (the bridge's until the mover runs). `-EmergencyRevoke` disables both tasks
+and rotates the signing keys, which invalidates every session whatever the issuer kept.
+
+### T3-62 Group membership (Medium, Fixed)
+
+Groups are read by SID through ADSI (WinNT provider); any error throws, so the installer and
+the self-check fail closed.
+
+### T3-63 Mover and issuer (Low, Fixed)
+
+The mover deletes everything else in the drop folder on every run, reads at most 4097 bytes
+from the open handle (no size read from the path) and discards anything outside 16 to 4096
+printable bytes. The issuer retries once.
+
+### T3-64 Elevated runs (Low, Fixed)
+
+The documented commands are `pwsh -NoProfile -File`. The installer, the self-check and every
+generated script pin `PSModulePath` to `$PSHOME` and System32; the installer and self-check
+import LocalAccounts, ScheduledTasks, NetSecurity and NetTCPIP by full path.
+
+### T3-65 Uninstall and accounts (Low, Fixed; UNVERIFIED elevated)
+
+The installer records the accounts it creates (intent first, then the SID) and refuses an
+existing account of the same name it did not create; uninstall removes only recorded
+accounts. Uninstall removes the `\T3CodePolicy` task folder, the `Program Files\ClaudeCode`
+folder only if the installer created it and it is empty, and keeps the managed-settings
+backups on purpose. A pre-install snapshot (`state\pre-install.json`: managed settings, user
+rights, tasks, firewall rules, `T3CODE_*` variables) is taken on the first install and
+uninstall prints the diff against it. The managed string copy of each password is
+overwritten in place after registration, as the BSTR is zeroed. Tests: the snapshot and
+rights comparisons in `ServiceAccounts.Tests.ps1`.
+
+### T3-66 Bridge authenticates the server (High; launcher Fixed, bridge Open)
+
+While T3 is down any account can bind the T3 port and receive the token. The T3 launcher
+(as `t3agent`) now publishes the server PID in `run\t3-server.json` (`t3agent` modify,
+`t3bridge` read, nobody else), and the bridge launcher starts the bridge only when that file
+is owned by `t3agent` and the only listener on the T3 port is that PID. The bridge must repeat
+the check before every connection (README, "Bridge contract"); `-BridgeExe` is refused
+without `-BridgeChecksServer`. Open: the bridge's own check (tailor-app) and, stronger, a
+named pipe with an ACL, which needs a pipe listener in T3's server. Residual: PID reuse
+between the check and the connection.
+
+### T3-67 First-run checks (Medium, Fixed; UNVERIFIED elevated)
+
+The self-check now automates the user-rights diff, the agent's privileges, groups and
+integrity and live access tests (probe task), each task's actions and security descriptor,
+the bridge key ACL, the workspace trees, the machine tier, the git version, and records that
+an elevated administrator can read the token. Deny variants, fail-closed tests, hooks and
+Bash approvals, and egress are printed as exact manual steps. Built-in read-only Bash
+auto-approval in default mode is to be recorded by that manual step.
+
 ## What was verified
 
-- Locally on Windows (frozen lockfile), round 3: the contracts suite (161/161) and the gate's
-  server tests (536 passed, 1 upstream skip; 19 files, now including the git hardening,
-  workspace path, CSP, signing-key rotation and `http.test.ts` tests). `t3 auth
-  rotate-signing-keys` ran from source against a throwaway base dir and replaced all four keys. Server `src` and contracts typecheck clean.
-  The PowerShell tests pass: the managed-settings merge (including `parentSettingsBehavior`,
-  re-run records and the verify comparison) and the service-account module (task XML, folder
-  ACL plan and comparison, group refusal, launchers, issuer and mover parse and order, the
-  marker check, the emergency revoke plan, rotation script and key freshness check, and the
-  installer refusing to run outside the protected copy). Both scripts
-  parse; the modules and the self-check load from bytes; the self-check refuses to run
-  unelevated.
-- Not verified (UNVERIFIED): anything that needs an elevated run on a real machine: the
-  accounts and group checks, secedit, task registration through COM, folder creation and the
-  handle-based ACL reset, the token issuer and mover, the emergency revoke and key rotation
-  task, the firewall rules, the self-check's
-  PASS path and the marker, uninstall, and the policy guard and binary hash on a real
-  install. The `-WhatIf` preview could not be run here, because it now needs the protected
-  copy in an admin-only folder. Also not verified: a full build, the full upstream suite
-  (the git spawner decorator is unit-tested, not exercised through the whole server), the
-  CSPs in a browser, the connector token end to end, and the live egress capture (T3-01).
+- Locally on Windows (frozen lockfile), round 4: the contracts suite (161/161) and the gate's
+  server tests (545 passed, 1 upstream skip; 19 files, including git hardening, workspace
+  paths, CSP and the frame-only HTML rule, signing-key rotation, the investigation argv and
+  `http.test.ts`). Server `src` and contracts typecheck clean. `t3 auth rotate-signing-keys`
+  ran from source against a throwaway base dir and replaced all four keys.
+- The PowerShell tests pass: managed settings (`parentSettingsBehavior`, rerun records, the
+  verify comparison, loosening keys) and the service-account module (task XML and extra
+  arguments, ACL plan and comparison including the probe and run folders, group refusal,
+  launchers with the module-path pin and the published server PID, the bridge listener check,
+  issuer retry and revoke-all, mover bounded read and sweep, the marker check, the revoke plan,
+  key freshness, user-rights and pre-install diffs, task security descriptors, the agent probe
+  and its judgement, the git version floor, wiping the managed password copy, and the
+  installer refusing to run outside the protected copy). Both scripts parse; the modules and
+  the self-check load from bytes; the pinned module imports and ADSI group reads work on this
+  PC; the self-check refuses to run unelevated.
+- Upstream MCP suites outside the gate (`src/mcp`) have failures that come from the
+  Supervised ceiling (tests that expect full-access or auto callers); they are not in the gate.
+- Not verified (UNVERIFIED): anything that needs an elevated run on a real machine: accounts
+  and their recorded ownership, secedit, COM task registration and security descriptors,
+  folder ACLs and the handle reset, the token issuer, mover and rotate-now task, the probe
+  task, the emergency revoke, the firewall rules, the self-check's PASS path and marker,
+  uninstall and its diff, and the policy guard and binary hash on a real install. The
+  `-WhatIf` preview needs the protected copy, so it was not run here. Also not verified: a
+  full build, the full upstream suite, the CSPs and the frame-only rule in a browser, the
+  connector token end to end, the bridge's own server check, and the live egress capture
+  (T3-01).

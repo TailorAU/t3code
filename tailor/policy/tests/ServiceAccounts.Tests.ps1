@@ -97,30 +97,42 @@ foreach ($g in @(@('Administrators', 'S-1-5-32-544'), @('Remote Desktop Users', 
 function Test-Parses([string] $text) { $errors = $null; [void][Management.Automation.Language.Parser]::ParseInput($text, [ref]$null, [ref]$errors); return ($errors.Count -eq 0) }
 $launcher = Get-T3LauncherText -T3Exe 'C:\Program Files\T3Code\t3.exe' -T3Home 'C:\ProgramData\T3CodePolicy\t3-home' `
   -Environment ([ordered]@{ T3CODE_HOST = '127.0.0.1'; T3CODE_LAN = 'false' }) -MustBeUnset @('HTTPS_PROXY', 'NODE_OPTIONS') `
-  -MarkerPath 'C:\ProgramData\T3CodePolicy\service\verified.json' -RequiredFiles @('C:\Program Files\T3Code\t3.exe') -SettingsSeedPath 'C:\ProgramData\T3CodePolicy\service\t3-settings.seed.json'
+  -MarkerPath 'C:\ProgramData\T3CodePolicy\service\verified.json' -RequiredFiles @('C:\Program Files\T3Code\t3.exe') -SettingsSeedPath 'C:\ProgramData\T3CodePolicy\service\t3-settings.seed.json' `
+  -ServerPidFile 'C:\ProgramData\T3CodePolicy\run\t3-server.json'
 Assert-True (Test-Parses $launcher) 'the T3 launcher parses'
+Assert-True ($launcher.IndexOf('PSModulePath') -lt $launcher.IndexOf('while')) 'the launcher pins its module path'
+Assert-True ($launcher.Contains('t3-server.json') -and $launcher.IndexOf('-PassThru') -lt $launcher.IndexOf('WriteAllText($pidFile')) 'the launcher publishes the server PID it started'
 Assert-True ($launcher.Contains("`$env:T3CODE_HOST = '127.0.0.1'")) 'launcher sets the policy environment'
 Assert-True ($launcher.Contains("Remove-Item -LiteralPath 'Env:HTTPS_PROXY'")) 'launcher clears proxy variables'
 Assert-True ($launcher.Contains("`$env:T3CODE_HOME = 'C:\ProgramData\T3CodePolicy\t3-home'")) 'launcher pins the T3 home'
 $loop = $launcher.IndexOf('while')
-Assert-True ($launcher.IndexOf('Test-T3Verified', $loop) -gt $loop -and $launcher.IndexOf('Test-T3Verified', $loop) -lt $launcher.IndexOf(' serve')) 'launcher checks the marker before every start'
+Assert-True ($launcher.IndexOf('Test-T3Verified', $loop) -gt $loop -and $launcher.IndexOf('Test-T3Verified', $loop) -lt $launcher.IndexOf('Start-Process')) 'launcher checks the marker before every start'
 Assert-True ($launcher.Contains('t3-settings.seed.json')) 'the launcher (t3agent) seeds T3 settings, not the installer'
 $refused = $false
-try { [void](Get-T3LauncherText -T3Exe 'x.exe' -T3Home 'h' -Environment ([ordered]@{ 'PATH' = 'x' }) -MustBeUnset @() -MarkerPath 'm' -RequiredFiles @('x')) } catch { $refused = $true }
+try { [void](Get-T3LauncherText -T3Exe 'x.exe' -T3Home 'h' -Environment ([ordered]@{ 'PATH' = 'x' }) -MustBeUnset @() -MarkerPath 'm' -RequiredFiles @('x') -ServerPidFile 'p') } catch { $refused = $true }
 Assert-True $refused 'launcher refuses non-T3CODE variables'
-$quoted = Get-T3LauncherText -T3Exe "C:\it's\t3.exe" -T3Home 'h' -Environment ([ordered]@{}) -MustBeUnset @() -MarkerPath 'm' -RequiredFiles @("C:\it's\t3.exe")
+$quoted = Get-T3LauncherText -T3Exe "C:\it's\t3.exe" -T3Home 'h' -Environment ([ordered]@{}) -MustBeUnset @() -MarkerPath 'm' -RequiredFiles @("C:\it's\t3.exe") -ServerPidFile 'p'
 Assert-True ($quoted.Contains("'C:\it''s\t3.exe'") -and (Test-Parses $quoted)) 'launcher quotes paths safely'
 $bridge = Get-BridgeLauncherText -BridgeExe 'C:\Program Files\T3Bridge\bridge.exe' -TokenPath 'C:\ProgramData\T3CodePolicy\connector\token' `
-  -KeyPath 'C:\ProgramData\T3CodePolicy\bridge\tailor-api-key' -T3Url 'http://127.0.0.1:3773' -MustBeUnset @('HTTPS_PROXY') -MarkerPath 'm' -RequiredFiles @('b')
+  -KeyPath 'C:\ProgramData\T3CodePolicy\bridge\tailor-api-key' -T3Url 'http://127.0.0.1:3773' -MustBeUnset @('HTTPS_PROXY') -MarkerPath 'm' -RequiredFiles @('b') `
+  -ServerPidFile 'C:\ProgramData\T3CodePolicy\run\t3-server.json' -AgentSid 'S-1-5-21-9-1001' -T3Port 3773
 Assert-True ($bridge.Contains("`$env:T3_BRIDGE_TOKEN_FILE = 'C:\ProgramData\T3CodePolicy\connector\token'") -and (Test-Parses $bridge)) 'bridge gets the token path, not the token'
+$bridgeLoop = $bridge.IndexOf('while')
+Assert-True ($bridge.IndexOf('Test-T3ServerListener', $bridgeLoop) -gt $bridgeLoop -and $bridge.IndexOf('Test-T3ServerListener', $bridgeLoop) -lt $bridge.IndexOf('bridge.exe', $bridgeLoop)) 'the bridge starts only after the listener check'
+Assert-True ($bridge.Contains('-LocalPort 3773') -and $bridge.Contains("'S-1-5-21-9-1001'") -and $bridge.Contains('T3_BRIDGE_SERVER_PID_FILE')) 'the listener check uses the port, the agent SID and the PID file'
 $issuer = Get-TokenIssuerText -T3Exe 't3.exe' -T3Home 'h' -DropPath 'C:\ProgramData\T3CodePolicy\connector-drop\token' -Ttl '7d' -MustBeUnset @() -MarkerPath 'm' -RequiredFiles @('t3.exe')
 Assert-True (Test-Parses $issuer) 'the issuer parses'
 Assert-True ($issuer.IndexOf('CreateNew') -lt $issuer.IndexOf('session issue')) 'the issuer claims the drop file before issuing'
-Assert-True ($issuer.Contains('-Skip 2') -and $issuer -notmatch 'Write-(Host|Output)[^\n]*issued') 'keeps the two newest sessions and never prints the token'
+Assert-True ($issuer.Contains('RevokeAllPrevious') -and $issuer.Contains('-Skip $keep') -and $issuer -notmatch 'Write-(Host|Output)[^\n]*issued') 'daily keeps one previous token, -RevokeAllPrevious keeps none, and the token is never printed'
+Assert-True ($issuer.Contains('$attempt -le 2') -or $issuer.Contains('`$attempt -le 2')) 'issuing is retried once'
+Assert-True ($issuer.Contains('sessionId -ne $newSession')) 'the new session is never revoked'
 $mover = Get-TokenMoverText -DropPath 'C:\d\token' -TokenPath 'C:\c\token' -AgentSid 'S-1-5-21-9-1001' -BridgeSid 'S-1-5-21-9-1002'
 Assert-True (Test-Parses $mover) 'the mover parses'
 Assert-True ($mover.Contains('ReparsePoint') -and $mover.Contains('hardlink') -and $mover.Contains("'S-1-5-21-9-1001'")) 'the mover refuses links and foreign owners'
 Assert-True ($mover.Contains('FileSystemAclExtensions]::Create') -and $mover.Contains('Move(')) 'the mover sets the ACL at creation, then renames'
+Assert-True ($mover.Contains('[byte[]]::new(4097)') -and -not $mover.Contains('$in.Length') -and -not $mover.Contains('$item.Length')) 'the mover reads a bounded number of bytes from the open handle'
+Assert-True ($mover.IndexOf('Sweep') -lt $mover.IndexOf('Test-Path -LiteralPath $drop')) 'the mover sweeps the drop folder first'
+Assert-True ($mover.Contains('PSModulePath')) 'the mover pins its module path'
 
 # Marker check: refuses without a marker, and refuses a marker a non-admin owns.
 $work = Join-Path ([IO.Path]::GetTempPath()) ('t3sa-' + [guid]::NewGuid().ToString('N'))
@@ -137,14 +149,91 @@ try {
   }
 } finally { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
 
+
+# Folder plan: probe (create only), run (agent modify, bridge read), git-config (agent read).
+$plan2 = Get-T3FolderAclPlan -PolicyDir 'C:\P' -ClaudeHomeName 'claude-home'
+$by2 = @{}; foreach ($e in $plan2) { $by2[$e.Name] = $e }
+Assert-True ($null -ne $by2['probe'] -and @($by2['probe'].Grants | Where-Object { $_.Principal -eq 'agent' -and $_.Rights -match 'Read' -and $_.Rights -notmatch 'ReadPermissions' }).Count -eq 0) 'the agent cannot read the probe folder'
+Assert-True (@($by2['run'].Grants | Where-Object Principal -eq 'bridge').Count -eq 1 -and @($by2['run'].Grants | Where-Object { $_.Principal -eq 'bridge' -and $_.Rights -match 'Modify|Write' }).Count -eq 0) 'the bridge reads the run folder only'
+Assert-True (@($by2['git-config'].Grants | Where-Object { $_.Principal -eq 'agent' -and $_.Rights -match 'Modify|Write' }).Count -eq 0) 'the agent cannot change the global git config'
+
+# Listener ownership (bridge).
+Assert-True ($null -eq (Test-ListenerOwnership -ListenerPids @(4242) -PublishedPid 4242)) 'the published T3 PID holding the port passes'
+Assert-True ($null -ne (Test-ListenerOwnership -ListenerPids @(999) -PublishedPid 4242)) 'another process on the port fails'
+Assert-True ($null -ne (Test-ListenerOwnership -ListenerPids @(4242, 999) -PublishedPid 4242)) 'a second listener fails'
+Assert-True ($null -ne (Test-ListenerOwnership -ListenerPids @() -PublishedPid 4242)) 'nothing listening fails'
+Assert-True ($null -ne (Test-ListenerOwnership -ListenerPids @(4242) -PublishedPid $null)) 'no published PID fails'
+$listenerText = Get-ListenerCheckText -ServerPidFile 'C:\P\run\t3-server.json' -AgentSid 'S-1-5-21-9-1001' -T3Port 3773
+Assert-True (Test-Parses $listenerText) 'the listener check parses'
+
+# User rights: only our SIDs added to our four rights.
+$sidA = 'S-1-5-21-9-1001'; $sidB = 'S-1-5-21-9-1002'
+$before = "[Unicode]`r`nUnicode=yes`r`n[Privilege Rights]`r`nSeBatchLogonRight = *S-1-5-32-544`r`nSeShutdownPrivilege = *S-1-5-32-545`r`n"
+$after = Update-UserRightsInf -InfText $before -Changes (Get-ServiceAccountRightsPlan -Sid $sidA)
+$after = Update-UserRightsInf -InfText $after -Changes (Get-ServiceAccountRightsPlan -Sid $sidB)
+Assert-True (@(Compare-UserRightsSnapshot -BeforeText $before -AfterText $after -AllowedSids @($sidA, $sidB)).Count -eq 0) 'the install diff is exactly our four rights'
+$extraRight = Update-UserRightsInf -InfText $after -Changes ([ordered]@{ SeServiceLogonRight = @{ Add = $sidA } })
+Assert-True (@(Compare-UserRightsSnapshot -BeforeText $before -AfterText $extraRight -AllowedSids @($sidA, $sidB)).Count -eq 1) 'another right for our account is reported'
+$otherSid = Update-UserRightsInf -InfText $after -Changes ([ordered]@{ SeBatchLogonRight = @{ Add = 'S-1-5-21-9-7777' } })
+Assert-True (@(Compare-UserRightsSnapshot -BeforeText $before -AfterText $otherSid -AllowedSids @($sidA, $sidB)).Count -eq 1) 'another SID in our right is reported'
+$lost = Update-UserRightsInf -InfText $after -Changes ([ordered]@{ SeShutdownPrivilege = @{ Remove = 'S-1-5-32-545' } })
+Assert-True (@(Compare-UserRightsSnapshot -BeforeText $before -AfterText $lost -AllowedSids @($sidA, $sidB)).Count -eq 1) 'a removed right is reported'
+Assert-True (@(Compare-UserRightsSnapshot -BeforeText $before -AfterText $after).Count -gt 0) 'with no allowed SIDs (uninstall), any change is reported'
+
+# Uninstall diff against the pre-install snapshot.
+$snapBefore = [ordered]@{ variables = [ordered]@{ T3CODE_X = 'a' }; tasks = @(); taskFolder = $false; firewallRules = @(); managedSettings = '{"a":1}'; rights = $before }
+$same = [ordered]@{ variables = [ordered]@{ T3CODE_X = 'a' }; tasks = @(); taskFolder = $false; firewallRules = @(); managedSettings = '{"a":1}'; rights = $before }
+Assert-True (@(Compare-PreInstallSnapshot -Before ($snapBefore | ConvertTo-Json -Depth 5 | ConvertFrom-Json) -After $same).Count -eq 0) 'a clean uninstall shows no difference'
+$dirty = [ordered]@{ variables = [ordered]@{ T3CODE_X = 'b'; T3CODE_Y = '1' }; tasks = @('\T3CodePolicy\T3 server'); taskFolder = $true; firewallRules = @('T3Policy-1'); managedSettings = '{"a":2}'; rights = $after }
+$diff = @(Compare-PreInstallSnapshot -Before $snapBefore -After $dirty)
+foreach ($want in 'T3CODE_X', 'T3CODE_Y', 'task \T3CodePolicy', 'task folder', 'firewall rule', 'managed-settings', 'user rights') {
+  Assert-True (@($diff | Where-Object { $_.Contains($want) }).Count -gt 0) "the uninstall diff reports $want"
+}
+
+# Task security descriptors: only admins may change, start or stop.
+Assert-True (@(Get-TaskSecurityIssues -Sddl 'D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;AU)').Count -eq 0) 'admins full, others read: fine'
+Assert-True (@(Get-TaskSecurityIssues -Sddl 'D:(A;;FA;;;BA)(A;;FRFX;;;AU)').Count -eq 1) 'others may run it: reported'
+Assert-True (@(Get-TaskSecurityIssues -Sddl 'D:(A;;GA;;;BU)').Count -eq 1) 'users full: reported'
+
+# The agent probe and its judgement.
+$probeTests = [ordered]@{ 'read-token' = @{ Path = 'C:\P\connector\token'; Mode = 'Read' }; 'create-in-service' = @{ Path = 'C:\P\service'; Mode = 'CreateIn' } }
+$probeText = Get-AgentProbeText -ResultPath 'C:\P\probe\result.json' -Tests $probeTests
+Assert-True (Test-Parses $probeText) 'the probe parses'
+Assert-True ($probeText.Contains('whoami.exe" /priv') -and $probeText.Contains('/groups') -and $probeText.Contains('CreateNew')) 'the probe records privileges and groups and writes create-only'
+Assert-True ($probeText -notmatch 'ReadAll|Get-Content') 'the probe never reads file content'
+$badName = $false; try { [void](Get-AgentProbeText -ResultPath 'r' -Tests ([ordered]@{ 'x; rm' = @{ Path = 'p'; Mode = 'Read' } })) } catch { $badName = $true }
+Assert-True $badName 'probe test names are restricted'
+$goodResult = [pscustomobject]@{ user = $sidA; privileges = @('SeChangeNotifyPrivilege', 'SeIncreaseWorkingSetPrivilege'); groups = @('S-1-5-32-545', 'S-1-16-8192'); tests = [pscustomobject]@{ 'read-token' = 'denied'; 'create-in-service' = 'denied' } }
+$expectedProbe = [ordered]@{ 'read-token' = 'denied'; 'create-in-service' = 'denied' }
+Assert-True (@(Test-AgentProbeResult -Result $goodResult -Expected $expectedProbe -AgentSid $sidA).Count -eq 0) 'a standard agent passes'
+$badResult = [pscustomobject]@{ user = $sidA; privileges = @('SeChangeNotifyPrivilege', 'SeDebugPrivilege'); groups = @('S-1-5-32-544', 'S-1-16-12288'); tests = [pscustomobject]@{ 'read-token' = 'allowed'; 'create-in-service' = 'denied' } }
+Assert-True (@(Test-AgentProbeResult -Result $badResult -Expected $expectedProbe -AgentSid $sidA).Count -eq 4) 'extra privilege, admin group, high integrity and a readable token are all reported'
+Assert-True (@(Test-AgentProbeResult -Result $goodResult -Expected $expectedProbe -AgentSid $sidB).Count -eq 1) 'a probe run as another account is reported'
+
+# git version floor.
+Assert-True (Test-GitVersionAtLeast -VersionText 'git version 2.51.2.windows.1' -Minimum '2.50.1') '2.51.2 passes 2.50.1'
+Assert-True (-not (Test-GitVersionAtLeast -VersionText 'git version 2.49.0.windows.1' -Minimum '2.50.1')) '2.49.0 fails'
+Assert-True (-not (Test-GitVersionAtLeast -VersionText 'nonsense' -Minimum '2.50.1')) 'an unreadable version fails'
+
+# Task XML extra arguments (the rotate-now task) and their restriction.
+$withArgs = [xml](Get-ServiceTaskXml -Description 'rotate now' -Account 't3agent' -PwshPath 'p.exe' -LauncherPath 'i.ps1' -Trigger OnDemand -ExtraArguments '-RevokeAllPrevious')
+Assert-True ($withArgs.Task.Actions.Exec.Arguments.EndsWith('"i.ps1" -RevokeAllPrevious')) 'extra arguments follow the launcher'
+$badArgs = $false; try { [void](Get-ServiceTaskXml -Description 'x' -Account 'a' -PwshPath 'p' -LauncherPath 'l' -ExtraArguments '; calc') } catch { $badArgs = $true }
+Assert-True $badArgs 'extra arguments are restricted'
+
+# The managed copy of a password can be wiped in place.
+$secret = [string]::new([char[]]'not-a-real-password')
+Clear-ManagedString $secret
+Assert-True ($secret.Trim([char]0).Length -eq 0) 'the managed string copy is zeroed'
+
 # Emergency revoke: the plan, in order, touching only the expected targets.
-$tasks = [ordered]@{ Server = 'T3 server'; Bridge = 'T3 bridge'; Issuer = 'T3 token issuer'; Mover = 'T3 token mover'; Rotate = 'T3 key rotation' }
+$tasks = [ordered]@{ Server = 'T3 server'; Bridge = 'T3 bridge'; Issuer = 'T3 token issuer'; Mover = 'T3 token mover'; Rotate = 'T3 key rotation'; RotateToken = 'T3 token rotate now'; Probe = 'T3 self-check probe' }
 $revoke = Get-EmergencyRevokePlan -Tasks $tasks -Accounts @('t3agent', 't3bridge') -MarkerPath 'C:\P\service\verified.json' `
   -TokenPath 'C:\P\connector\token' -DropDir 'C:\P\connector-drop' -RevokeLogPath 'C:\P\state\revoke-log.json'
 $actions = @($revoke | ForEach-Object Action)
 $indexOf = { param($action, $target) for ($n = 0; $n -lt $revoke.Count; $n++) { if ($revoke[$n].Action -eq $action -and ($null -eq $target -or $revoke[$n].Target -eq $target)) { return $n } }; return -1 }
 Assert-True ($actions[0] -eq 'RemoveMarker') 'the marker goes first, so nothing restarts during the revoke'
-foreach ($name in 'T3 server', 'T3 bridge', 'T3 token issuer', 'T3 token mover') {
+foreach ($name in 'T3 server', 'T3 bridge', 'T3 token issuer', 'T3 token mover', 'T3 token rotate now') {
   Assert-True ((& $indexOf 'DisableTask' $name) -ge 0) "$name is disabled"
   Assert-True ((& $indexOf 'DisableTask' $name) -lt (& $indexOf 'RotateKeys' $null)) "$name is disabled before the keys rotate"
 }

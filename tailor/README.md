@@ -28,9 +28,10 @@ Patches to upstream code, each marked `Tailor fork` in a comment:
 - `apps/server/src/cli/config.ts`: loopback bind by default.
 - `apps/server/src/server.ts`, `apps/server/src/bin.ts`: every git command hardened (`tailor/gitSpawner.ts`, `tailor/gitHardening.ts`).
 - `apps/server/src/ws.ts`: worktree and project paths checked (`tailor/workspacePolicy.ts`).
-- `apps/server/src/textGeneration/ClaudeTextGeneration.ts`: `claude -p` with no setting sources, in a temporary folder.
+- `apps/server/src/orchestration-v2/Orchestrator.ts`, `apps/server/src/mcp/toolkits/project/handlers.ts`: worktree paths checked for every command and MCP launch.
+- `apps/server/src/textGeneration/ClaudeTextGeneration.ts`: `claude -p` with no setting sources, in a temporary folder, git-hardened, and read-only tools for the review-guide run.
 - `apps/server/src/telemetry/AnalyticsService.ts`: analytics default off.
-- `apps/server/src/http.ts`: web app CSP and agent HTML CSP. `packages/shared/src/favicon.ts`, `apps/web/src/openVsxThemes.ts`: third-party fetches off.
+- `apps/server/src/http.ts`: web app CSP; agent HTML only inside a frame, otherwise a download. `packages/shared/src/favicon.ts`, `apps/web/src/openVsxThemes.ts`: third-party fetches off.
 - `apps/server/vite.config.ts`, `apps/web/vite.config.ts`: build refuses Clerk and relay values (`tailor/build/`).
 - `.github/workflows/`: only `tailor-gate.yml`, actions pinned by SHA.
 

@@ -122,14 +122,42 @@ export function downloadContentDisposition(fileName?: string): string {
   }`;
 }
 
+/**
+ * Tailor fork: agent HTML is rendered only inside a frame (the browser says so with
+ * `Sec-Fetch-Dest: iframe`/`frame`). Any other request for it, a top-level navigation
+ * included, or one without the header, gets it as a download.
+ */
+export function isFramedRequest(fetchDest: string | undefined): boolean {
+  const value = fetchDest?.trim().toLowerCase();
+  return value === "iframe" || value === "frame";
+}
+
+function wouldServeInlineHtml(filePath: string, mimeType: string | undefined): boolean {
+  const lowerPath = filePath.toLowerCase();
+  const inline = mimeType?.split(";", 1)[0]?.trim();
+  if (inline !== undefined && isSafeInlineMediaMimeType(inline)) return false;
+  if (inline !== undefined && isSafeInlineDocumentMimeType(inline)) {
+    return inline.toLowerCase() === "text/html";
+  }
+  return lowerPath.endsWith(".html") || lowerPath.endsWith(".htm");
+}
+
 export function assetResponseHeaders(
   filePath: string,
   options?: {
     readonly download?: boolean;
     readonly fileName?: string;
     readonly mimeType?: string;
+    readonly fetchDest?: string;
   },
 ): Record<string, string> {
+  if (
+    !options?.download &&
+    wouldServeInlineHtml(filePath, options?.mimeType) &&
+    !isFramedRequest(options?.fetchDest)
+  ) {
+    return assetResponseHeaders(filePath, { ...options, download: true });
+  }
   const lowerPath = filePath.toLowerCase();
   const inlineMimeType = options?.mimeType?.split(";", 1)[0]?.trim();
   return {
@@ -198,6 +226,7 @@ export const assetFileResponse = Effect.fn("assetFileResponse")(function* (
     readonly mimeType?: string;
     readonly file?: OpenMediaFile;
     readonly renderIntent?: "mcp-app";
+    readonly fetchDest?: string;
   },
   rangeHeader?: string,
   ifRangeHeader?: string,
@@ -482,7 +511,9 @@ export const layerAssetRoute = HttpRouter.add(
       );
     }
     return yield* assetFileResponse(
-      asset,
+      request.headers["sec-fetch-dest"] === undefined
+        ? asset
+        : { ...asset, fetchDest: request.headers["sec-fetch-dest"] },
       request.method === "GET" ? request.headers.range : undefined,
       request.headers["if-range"],
       request.method === "HEAD" ? "HEAD" : "GET",

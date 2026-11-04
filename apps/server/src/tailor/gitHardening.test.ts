@@ -24,15 +24,35 @@ const configOf = (env: Record<string, string | undefined>) => {
 };
 
 describe("Tailor git hardening", () => {
-  it("sets the hooks path, bare-repository, fsmonitor and ext-transport keys", () => {
-    const env = withTailorGitConfig({ PATH: "/bin", GIT_EXTERNAL_DIFF: "evil" }, "/empty-hooks");
+  it("sets every hardening key, an empty global config and no system config", () => {
+    const env = withTailorGitConfig(
+      {
+        PATH: "/bin",
+        GIT_EXTERNAL_DIFF: "evil",
+        GIT_SSH_COMMAND: "evil",
+        GIT_SSH: "evil",
+        GIT_ASKPASS: "evil",
+        GIT_CONFIG_GLOBAL: "/home/x/.gitconfig",
+      },
+      "/empty-hooks",
+      "/empty-config",
+    );
     assert.deepEqual(configOf(env), {
       "core.hooksPath": "/empty-hooks",
       "safe.bareRepository": "explicit",
       "core.fsmonitor": "false",
       "protocol.ext.allow": "never",
+      "protocol.file.allow": "user",
+      "credential.helper": "",
+      "core.sshCommand": "ssh",
+      "commit.gpgSign": "false",
+      "tag.gpgSign": "false",
     });
-    assert.isUndefined(env.GIT_EXTERNAL_DIFF);
+    assert.strictEqual(env.GIT_CONFIG_GLOBAL, "/empty-config");
+    assert.strictEqual(env.GIT_CONFIG_NOSYSTEM, "1");
+    for (const name of ["GIT_EXTERNAL_DIFF", "GIT_SSH_COMMAND", "GIT_SSH", "GIT_ASKPASS"]) {
+      assert.isUndefined(env[name], name);
+    }
     assert.strictEqual(env.PATH, "/bin");
   });
 
@@ -42,9 +62,9 @@ describe("Tailor git hardening", () => {
       "/h",
     );
     assert.strictEqual(first.GIT_CONFIG_KEY_0, "user.name");
-    assert.strictEqual(first.GIT_CONFIG_COUNT, "5");
+    assert.strictEqual(first.GIT_CONFIG_COUNT, "10");
     const second = withTailorGitConfig(first, "/h");
-    assert.strictEqual(second.GIT_CONFIG_COUNT, "5");
+    assert.strictEqual(second.GIT_CONFIG_COUNT, "10");
   });
 
   it("applies to the process environment so every child inherits it", () => {
@@ -70,6 +90,26 @@ describe("Tailor git hardening", () => {
       "-p",
     ]);
     assert.deepEqual(withTailorGitArgs(["status", "--porcelain"]), ["status", "--porcelain"]);
+    assert.deepEqual(withTailorGitArgs(["blame", "-L1,2", "f"]), [
+      "blame",
+      "--no-ext-diff",
+      "--no-textconv",
+      "-L1,2",
+      "f",
+    ]);
+    assert.deepEqual(withTailorGitArgs(["diff-tree", "-p", "HEAD"]).slice(0, 3), [
+      "diff-tree",
+      "--no-ext-diff",
+      "--no-textconv",
+    ]);
+    assert.deepEqual(withTailorGitArgs(["stash", "show", "-p"]), [
+      "stash",
+      "show",
+      "--no-ext-diff",
+      "--no-textconv",
+      "-p",
+    ]);
+    assert.deepEqual(withTailorGitArgs(["stash", "list"]), ["stash", "list"]);
     assert.deepEqual(withTailorGitArgs(["-C", "/repo", "show", "HEAD"]).slice(0, 5), [
       "-C",
       "/repo",

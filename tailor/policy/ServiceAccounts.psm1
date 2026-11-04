@@ -116,7 +116,8 @@ function Get-ServiceTaskXml {
     [switch] $System,
     [Parameter(Mandatory)][string] $PwshPath,
     [Parameter(Mandatory)][string] $LauncherPath,
-    [ValidateSet('Startup', 'Daily', 'Every10Minutes', 'OnDemand')][string] $Trigger = 'Startup'
+    [ValidateSet('Startup', 'Daily', 'Every10Minutes', 'OnDemand')][string] $Trigger = 'Startup',
+    [ValidatePattern('^[A-Za-z0-9 -]*$')][string] $ExtraArguments = ''
   )
   if ($System -eq [bool]$Account) { throw 'Pass exactly one of -Account or -System.' }
   $x = { param($v) [Security.SecurityElement]::Escape([string]$v) }
@@ -133,7 +134,7 @@ function Get-ServiceTaskXml {
   }
   $restart = if ($Trigger -eq 'Startup') { '<RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>' } else { '' }
   $limit = if ($Trigger -eq 'Startup') { 'PT0S' } else { 'PT15M' }
-  $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$LauncherPath`""
+  $arguments = ("-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$LauncherPath`" " + $ExtraArguments).TrimEnd()
   return @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -175,6 +176,15 @@ function Get-T3FolderAclPlan {
     [pscustomobject]@{ Name = 'state'; Path = (Join-Path $PolicyDir 'state'); Grants = @() }
     [pscustomobject]@{ Name = 'service'; Path = (Join-Path $PolicyDir 'service'); Grants = @((& $g 'agent' $read), (& $g 'bridge' $read)) }
     [pscustomobject]@{ Name = 'git-hooks'; Path = (Join-Path $PolicyDir 'git-hooks'); Grants = @((& $g 'agent' $read)) }
+    [pscustomobject]@{ Name = 'git-config'; Path = (Join-Path $PolicyDir 'git-config'); Grants = @((& $g 'agent' $read)) }
+    # The T3 launcher (t3agent) publishes the server's PID here; the bridge reads it to check
+    # that the loopback listener it sends the token to is that process.
+    [pscustomobject]@{ Name = 'run'; Path = (Join-Path $PolicyDir 'run'); Grants = @((& $g 'agent' 'Modify, Synchronize'), (& $g 'bridge' $read)) }
+    # The self-check's probe task (t3agent) leaves its result here: create only, like the drop.
+    [pscustomobject]@{ Name = 'probe'; Path = (Join-Path $PolicyDir 'probe'); Grants = @(
+        (& $g 'agent' 'CreateFiles, Synchronize' 'None'),
+        (& $g 'agent' 'Write, ReadPermissions, Synchronize' 'ObjectInherit' 'InheritOnly'),
+        (& $g 'OwnerRights' 'Synchronize' 'ObjectInherit' 'None')) }
     [pscustomobject]@{ Name = 't3-home'; Path = (Join-Path $PolicyDir 't3-home'); Grants = @((& $g 'agent' 'Modify, Synchronize')) }
     [pscustomobject]@{ Name = 'claude-home'; Path = (Join-Path $PolicyDir $ClaudeHomeName); Grants = @(
         (& $g 'agent' 'ReadAndExecute, CreateDirectories, Synchronize' 'None'),
@@ -295,11 +305,14 @@ function Test-T3Verified {
 "@
 }
 
+$script:PinModulesText = '$env:PSModulePath = "$PSHOME\Modules;$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules"'
+
 function Get-UnsetText([string[]] $MustBeUnset) {
-  $lines = foreach ($name in $MustBeUnset) {
+  # Every generated script pins its module path first (nothing user-writable shadows a cmdlet).
+  $lines = @($script:PinModulesText) + @(foreach ($name in $MustBeUnset) {
     if ($name -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') { throw "Refusing variable name '$name'." }
     "Remove-Item -LiteralPath 'Env:$name' -ErrorAction SilentlyContinue"
-  }
+  })
   return ($lines -join "`n")
 }
 
@@ -316,7 +329,8 @@ function Get-T3LauncherText {
     [AllowEmptyCollection()][string[]] $MustBeUnset = @(),
     [Parameter(Mandatory)][string] $MarkerPath,
     [Parameter(Mandatory)][string[]] $RequiredFiles,
-    [string] $SettingsSeedPath
+    [string] $SettingsSeedPath,
+    [Parameter(Mandatory)][string] $ServerPidFile
   )
   $q = $script:LauncherQuote
   $set = foreach ($name in $Environment.Keys) {
@@ -340,10 +354,16 @@ $(Get-UnsetText $MustBeUnset)
 $($set -join "`n")
 `$env:T3CODE_HOME = $(& $q $T3Home)
 $seed
+`$pidFile = $(& $q $ServerPidFile)
 while (`$true) {
   `$refusal = Test-T3Verified
   if (`$refusal) { Write-Warning "T3 not started: `$refusal"; Start-Sleep -Seconds 60; continue }
-  & $(& $q $T3Exe) serve
+  if (Test-Path -LiteralPath `$pidFile) { Remove-Item -LiteralPath `$pidFile -Force }
+  `$server = Start-Process -FilePath $(& $q $T3Exe) -ArgumentList 'serve' -NoNewWindow -PassThru
+  # The bridge sends the token only to a loopback listener owned by this PID.
+  [IO.File]::WriteAllText(`$pidFile, ([ordered]@{ pid = `$server.Id; startedUtc = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json -Compress))
+  `$server.WaitForExit()
+  Remove-Item -LiteralPath `$pidFile -Force -ErrorAction SilentlyContinue
   Start-Sleep -Seconds 10
 }
 "@
@@ -358,20 +378,28 @@ function Get-BridgeLauncherText {
     [Parameter(Mandatory)][string] $T3Url,
     [AllowEmptyCollection()][string[]] $MustBeUnset = @(),
     [Parameter(Mandatory)][string] $MarkerPath,
-    [Parameter(Mandatory)][string[]] $RequiredFiles
+    [Parameter(Mandatory)][string[]] $RequiredFiles,
+    [Parameter(Mandatory)][string] $ServerPidFile,
+    [Parameter(Mandatory)][string] $AgentSid,
+    [Parameter(Mandatory)][int] $T3Port
   )
   $q = $script:LauncherQuote
   return @"
 # Generated by install-policy.ps1. Runs as the t3bridge account under Task Scheduler.
 `$ErrorActionPreference = 'Stop'
 $(Get-MarkerCheckText -MarkerPath $MarkerPath -RequiredFiles $RequiredFiles)
+$(Get-ListenerCheckText -ServerPidFile $ServerPidFile -AgentSid $AgentSid -T3Port $T3Port)
 $(Get-UnsetText $MustBeUnset)
 `$env:T3_BRIDGE_T3_URL = $(& $q $T3Url)
 `$env:T3_BRIDGE_TOKEN_FILE = $(& $q $TokenPath)
 `$env:T3_BRIDGE_TAILOR_KEY_FILE = $(& $q $KeyPath)
+# The bridge repeats this check before every connection (policy README, bridge contract).
+`$env:T3_BRIDGE_SERVER_PID_FILE = $(& $q $ServerPidFile)
+`$env:T3_BRIDGE_SERVER_OWNER_SID = $(& $q $AgentSid)
 while (`$true) {
   `$refusal = Test-T3Verified
-  if (`$refusal) { Write-Warning "Bridge not started: `$refusal"; Start-Sleep -Seconds 60; continue }
+  if (-not `$refusal) { `$refusal = Test-T3ServerListener }
+  if (`$refusal) { Write-Warning "Bridge not started: `$refusal"; Start-Sleep -Seconds 30; continue }
   & $(& $q $BridgeExe)
   Start-Sleep -Seconds 10
 }
@@ -399,6 +427,7 @@ function Get-TokenIssuerText {
   return @"
 # Generated by install-policy.ps1. Runs as the t3agent account under Task Scheduler.
 # Issues the connector token; never prints it.
+param([switch] `$RevokeAllPrevious)
 `$ErrorActionPreference = 'Stop'
 $(Get-MarkerCheckText -MarkerPath $MarkerPath -RequiredFiles $RequiredFiles)
 $(Get-UnsetText $MustBeUnset)
@@ -411,16 +440,25 @@ if (`$refusal) { Write-Warning "Token not issued: `$refusal"; exit 1 }
 try {
   `$stream = [IO.FileStream]::new(`$drop, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
 } catch [IO.IOException] { Write-Warning 'The previous token has not been moved yet; nothing issued.'; exit 0 }
+`$newSession = `$null
 try {
-  `$issued = (& `$t3 auth session issue --base-dir `$env:T3CODE_HOME --scope tailor:connector --label connector --ttl $Ttl --json) | ConvertFrom-Json
-  if (`$LASTEXITCODE -ne 0 -or -not `$issued.token) { throw 'Issuing the connector token failed (the mover discards the empty drop file).' }
-  `$bytes = [Text.UTF8Encoding]::new(`$false).GetBytes([string]`$issued.token)
-  `$issued = `$null
-  try { `$stream.Write(`$bytes, 0, `$bytes.Length) } finally { [Array]::Clear(`$bytes, 0, `$bytes.Length) }
+  # One retry: a busy database or a slow first start should not cost a day's rotation.
+  for (`$attempt = 1; `$attempt -le 2 -and -not `$newSession; `$attempt++) {
+    `$issued = (& `$t3 auth session issue --base-dir `$env:T3CODE_HOME --scope tailor:connector --label connector --ttl $Ttl --json) | ConvertFrom-Json
+    if (`$LASTEXITCODE -ne 0 -or -not `$issued.token) { `$issued = `$null; if (`$attempt -lt 2) { Start-Sleep -Seconds 20 }; continue }
+    `$bytes = [Text.UTF8Encoding]::new(`$false).GetBytes([string]`$issued.token)
+    `$newSession = [string]`$issued.sessionId
+    `$issued = `$null
+    try { `$stream.Write(`$bytes, 0, `$bytes.Length) } finally { [Array]::Clear(`$bytes, 0, `$bytes.Length) }
+  }
+  if (-not `$newSession) { throw 'Issuing the connector token failed twice (the mover discards the empty drop file).' }
 } finally { `$stream.Dispose() }
 `$sessions = @((& `$t3 auth session list --base-dir `$env:T3CODE_HOME --json) | ConvertFrom-Json |
-  Where-Object { @(`$_.scopes) -contains 'tailor:connector' } | Sort-Object { [DateTime]`$_.issuedAt } -Descending)
-foreach (`$old in (`$sessions | Select-Object -Skip 2)) {
+  Where-Object { @(`$_.scopes) -contains 'tailor:connector' -and `$_.sessionId -ne `$newSession } | Sort-Object { [DateTime]`$_.issuedAt } -Descending)
+# Daily: keep the newest previous token, which the bridge still holds until the mover runs.
+# -RevokeAllPrevious (install -RotateConnectorToken): revoke every previous connector session.
+`$keep = if (`$RevokeAllPrevious) { 0 } else { 1 }
+foreach (`$old in (`$sessions | Select-Object -Skip `$keep)) {
   & `$t3 auth session revoke --base-dir `$env:T3CODE_HOME `$old.sessionId | Out-Null
 }
 "@
@@ -444,30 +482,37 @@ function Get-TokenMoverText {
   return @"
 # Generated by install-policy.ps1. Runs as SYSTEM under Task Scheduler.
 `$ErrorActionPreference = 'Stop'
+$($script:PinModulesText)
 `$drop = $(& $q $DropPath)
+`$dropDir = Split-Path -Parent `$drop
 `$token = $(& $q $TokenPath)
+# Removing an entry (a link is removed as a link) is safe: the folder is admin-controlled.
+function Remove-DropEntry([IO.FileSystemInfo] `$entry) {
+  if (`$entry.PSIsContainer -and -not (`$entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Remove-Item -LiteralPath `$entry.FullName -Recurse -Force }
+  elseif (`$entry.PSIsContainer) { [IO.Directory]::Delete(`$entry.FullName, `$false) }
+  else { [IO.File]::Delete(`$entry.FullName) }
+}
+# Sweep: anything but the token file is deleted on every run.
+foreach (`$entry in @(Get-ChildItem -LiteralPath `$dropDir -Force | Where-Object { `$_.FullName -ne `$drop })) { Remove-DropEntry `$entry }
 if (-not (Test-Path -LiteralPath `$drop)) { exit 0 }
 `$item = Get-Item -LiteralPath `$drop -Force
 `$reject = `$null
 if (`$item.Attributes -band [IO.FileAttributes]::ReparsePoint) { `$reject = 'reparse point' }
 elseif (`$item.PSIsContainer) { `$reject = 'not a file' }
 elseif ((Get-Acl -LiteralPath `$drop).GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $(& $q $AgentSid)) { `$reject = 'not owned by the agent account' }
-elseif (`$item.Length -lt 16 -or `$item.Length -gt 4096) { `$reject = 'unexpected size' }
 elseif (@(& "`$env:SystemRoot\System32\fsutil.exe" hardlink list `$drop).Count -ne 1) { `$reject = 'has other hard links' }
-if (`$reject) {
-  Write-Warning "Connector token drop rejected: `$reject"
-  # Removing the entry (a link is removed as a link) is safe: the folder is admin-controlled.
-  if (`$item.PSIsContainer -and -not (`$item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { [IO.Directory]::Delete(`$drop, `$false) } else { [IO.File]::Delete(`$drop) }
-  exit 1
-}
+if (`$reject) { Write-Warning "Connector token drop rejected: `$reject"; Remove-DropEntry `$item; exit 1 }
 try {
   `$in = [IO.FileStream]::new(`$drop, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
 } catch { exit 0 }   # still being written; the next run takes it
+# Bounded read from the open handle: at most 4097 bytes, never a size read from the path.
+`$bytes = [byte[]]::new(4097); `$read = 0
 try {
-  `$bytes = [byte[]]::new(`$in.Length); `$read = 0
   while (`$read -lt `$bytes.Length) { `$n = `$in.Read(`$bytes, `$read, `$bytes.Length - `$read); if (`$n -le 0) { break }; `$read += `$n }
 } finally { `$in.Dispose() }
 try {
+  if (`$read -lt 16 -or `$read -gt 4096) { [IO.File]::Delete(`$drop); throw 'The drop file has an unexpected size; discarded.' }
+  `$bytes = [byte[]](`$bytes[0..(`$read - 1)])
   foreach (`$b in `$bytes) { if (`$b -lt 0x21 -or `$b -gt 0x7e) { [IO.File]::Delete(`$drop); throw 'The drop file is not one printable token; discarded.' } }
   `$security = [Security.AccessControl.FileSecurity]::new()
   `$security.SetAccessRuleProtection(`$true, `$false)
@@ -533,7 +578,7 @@ function Get-EmergencyRevokePlan {
   )
   $step = { param($action, $target, $detail) [pscustomobject]@{ Action = $action; Target = $target; Detail = $detail } }
   $plan = @(& $step 'RemoveMarker' $MarkerPath 'remove the verified marker: no launcher starts until install verifies again')
-  foreach ($key in 'Server', 'Bridge', 'Issuer', 'Mover') {
+  foreach ($key in @('Server', 'Bridge', 'Issuer', 'Mover', 'RotateToken', 'Probe') | Where-Object { $Tasks.Contains($_) }) {
     $plan += & $step 'DisableTask' $Tasks[$key] 'disable (install re-enables it)'
     $plan += & $step 'StopTask' $Tasks[$key] 'stop if running'
   }
@@ -575,16 +620,218 @@ function Get-LastRevokeTime {
   return ($times | Sort-Object -Descending | Select-Object -First 1)
 }
 
+
+# ---------- listener check (bridge) ----------
+
+<#
+  The bridge's server check, as launcher code: the token goes only to a loopback listener on the
+  T3 port that is owned by the PID the T3 launcher (t3agent) published in run\t3-server.json.
+  An account that could bind the port while T3 is down (the operator's lanes) cannot write
+  that file, and a non-admin account cannot read another account's process image or owner,
+  so the published PID is what ties the listener to t3agent.
+#>
+function Get-ListenerCheckText {
+  param([Parameter(Mandatory)][string] $ServerPidFile, [Parameter(Mandatory)][string] $AgentSid, [Parameter(Mandatory)][int] $T3Port)
+  $q = $script:LauncherQuote
+  return @"
+function Test-T3ServerListener {
+  `$file = $(& $q $ServerPidFile)
+  if (-not (Test-Path -LiteralPath `$file -PathType Leaf)) { return 'T3 has not published its server PID' }
+  if ((Get-Item -LiteralPath `$file -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { return 'the server PID file is a link' }
+  `$owner = (Get-Acl -LiteralPath `$file).GetOwner([Security.Principal.SecurityIdentifier]).Value
+  if (`$owner -ne $(& $q $AgentSid)) { return "the server PID file is owned by `$owner" }
+  `$published = [int]((Get-Content -LiteralPath `$file -Raw | ConvertFrom-Json).pid)
+  `$listeners = @(Get-NetTCPConnection -State Listen -LocalPort $T3Port -ErrorAction SilentlyContinue | ForEach-Object OwningProcess | Select-Object -Unique)
+  if (`$listeners.Count -eq 0) { return 'nothing listens on the T3 port' }
+  if (`$listeners.Count -ne 1 -or `$listeners[0] -ne `$published) { return "the T3 port is held by PID(s) `$(`$listeners -join ', '), not the published T3 server `$published" }
+  return `$null
+}
+"@
+}
+
+<# Pure form of the listener rule, for tests and the README. #>
+function Test-ListenerOwnership {
+  param([AllowEmptyCollection()][int[]] $ListenerPids = @(), [AllowNull()][object] $PublishedPid)
+  $unique = @($ListenerPids | Select-Object -Unique)
+  if ($null -eq $PublishedPid) { return 'T3 has not published its server PID' }
+  if ($unique.Count -eq 0) { return 'nothing listens on the T3 port' }
+  if ($unique.Count -ne 1 -or $unique[0] -ne [int]$PublishedPid) { return "the T3 port is held by PID(s) $($unique -join ', '), not the published T3 server $PublishedPid" }
+  return $null
+}
+
+# ---------- self-check helpers (pure) ----------
+
+<# [Privilege Rights] of a secedit export as right -> sorted member list. #>
+function ConvertFrom-UserRightsInf {
+  param([AllowNull()][string] $InfText)
+  $rights = [ordered]@{}
+  if (-not $InfText) { return $rights }
+  $inSection = $false
+  foreach ($line in ($InfText -split "`r?`n")) {
+    $trimmed = $line.Trim()
+    if ($trimmed.StartsWith('[')) { $inSection = ($trimmed -eq '[Privilege Rights]'); continue }
+    if ($inSection -and $trimmed -match '^(\w+)\s*=\s*(.*)$') {
+      $rights[$Matches[1]] = @($Matches[2].Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Sort-Object)
+    }
+  }
+  return $rights
+}
+
+<#
+  Differences between two user-rights exports. Allowed: the given SIDs added to the four
+  service-account rights. Anything else (a removal, another right, another SID) is reported.
+  With no allowed SIDs it checks that two exports are the same (uninstall).
+#>
+function Compare-UserRightsSnapshot {
+  param([AllowNull()][string] $BeforeText, [AllowNull()][string] $AfterText, [string[]] $AllowedSids = @())
+  $ours = @('SeBatchLogonRight', 'SeDenyInteractiveLogonRight', 'SeDenyRemoteInteractiveLogonRight', 'SeDenyNetworkLogonRight')
+  $before = ConvertFrom-UserRightsInf $BeforeText
+  $after = ConvertFrom-UserRightsInf $AfterText
+  $issues = [System.Collections.Generic.List[string]]::new()
+  foreach ($right in (@($before.Keys) + @($after.Keys) | Select-Object -Unique)) {
+    $b = @(if ($before.Contains($right)) { $before[$right] }); $a = @(if ($after.Contains($right)) { $after[$right] })
+    foreach ($m in $a) {
+      if ($b -notcontains $m) {
+        $allowed = $ours -contains $right -and $AllowedSids -contains $m.TrimStart('*')
+        if (-not $allowed) { $issues.Add("$right gained $m") }
+      }
+    }
+    foreach ($m in $b) { if ($a -notcontains $m) { $issues.Add("$right lost $m") } }
+  }
+  return $issues.ToArray()
+}
+
+<#
+  Differences between the pre-install snapshot and the machine now (uninstall). Each side is
+  an object with: variables (T3CODE_* name -> value), tasks (task paths under \T3CodePolicy\),
+  taskFolder (bool), firewallRules (names in the rule group), managedSettings (canonical text
+  or $null), rights (secedit export text).
+#>
+function Compare-PreInstallSnapshot {
+  param([Parameter(Mandatory)] $Before, [Parameter(Mandatory)] $After)
+  $issues = [System.Collections.Generic.List[string]]::new()
+  $get = { param($o, $n) if ($o -is [System.Collections.IDictionary]) { $o[$n] } else { $o.PSObject.Properties[$n]?.Value } }
+  $bv = & $get $Before 'variables'; $av = & $get $After 'variables'
+  $names = @(@(if ($bv) { if ($bv -is [System.Collections.IDictionary]) { $bv.Keys } else { $bv.PSObject.Properties.Name } }) +
+      @(if ($av) { if ($av -is [System.Collections.IDictionary]) { $av.Keys } else { $av.PSObject.Properties.Name } }) | Select-Object -Unique)
+  foreach ($n in $names) {
+    $x = if ($bv) { & $get $bv $n }; $y = if ($av) { & $get $av $n }
+    if ($x -ne $y) { $issues.Add("machine variable $n was '$x', now '$y'") }
+  }
+  foreach ($t in @(& $get $After 'tasks')) { if ($t -and @(& $get $Before 'tasks') -notcontains $t) { $issues.Add("task $t still registered") } }
+  if ((& $get $After 'taskFolder') -and -not (& $get $Before 'taskFolder')) { $issues.Add('task folder \T3CodePolicy still exists') }
+  foreach ($r in @(& $get $After 'firewallRules')) { if ($r -and @(& $get $Before 'firewallRules') -notcontains $r) { $issues.Add("firewall rule $r still present") } }
+  if ([string](& $get $Before 'managedSettings') -ne [string](& $get $After 'managedSettings')) { $issues.Add('machine managed-settings.json differs from before the install') }
+  foreach ($d in (Compare-UserRightsSnapshot -BeforeText (& $get $Before 'rights') -AfterText (& $get $After 'rights'))) { $issues.Add("user rights: $d") }
+  return $issues.ToArray()
+}
+
+<#
+  A scheduled task's security descriptor (SDDL): only Administrators and SYSTEM may change,
+  delete, start or stop it. Read access for others is allowed.
+#>
+function Get-TaskSecurityIssues {
+  param([Parameter(Mandatory)][string] $Sddl)
+  # GENERIC_ALL|GENERIC_WRITE|GENERIC_EXECUTE, FILE_WRITE_DATA|APPEND|WRITE_EA|EXECUTE|WRITE_ATTRIBUTES, DELETE, WRITE_DAC, WRITE_OWNER
+  $mask = 0x10000000 -bor 0x40000000 -bor 0x20000000 -bor 0x2 -bor 0x4 -bor 0x10 -bor 0x20 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000
+  $sd = [Security.AccessControl.RawSecurityDescriptor]::new($Sddl)
+  $issues = [System.Collections.Generic.List[string]]::new()
+  if ($null -eq $sd.DiscretionaryAcl) { return @('the task has no DACL: everyone has full access') }
+  foreach ($ace in $sd.DiscretionaryAcl) {
+    if ($ace.AceType -ne [Security.AccessControl.AceType]::AccessAllowed) { continue }
+    $sid = $ace.SecurityIdentifier.Value
+    if (@('S-1-5-32-544', 'S-1-5-18') -contains $sid) { continue }
+    if (([int64]$ace.AccessMask -band $mask) -ne 0) { $issues.Add("$sid may change, start or stop the task (mask 0x$('{0:x}' -f $ace.AccessMask))") }
+  }
+  return $issues.ToArray()
+}
+
+<#
+  The probe the self-check runs once as t3agent (on-demand task 'T3 self-check probe'): the
+  account's privileges, groups and integrity level, and live access tests. It writes one JSON
+  result into probe\ (create only) and never reads a secret's content: a read test opens the
+  file and closes it.
+#>
+function Get-AgentProbeText {
+  param(
+    [Parameter(Mandatory)][string] $ResultPath,
+    [Parameter(Mandatory)][System.Collections.IDictionary] $Tests   # name -> @{ Path; Mode = 'Read'|'WriteFile'|'CreateIn' }
+  )
+  $q = $script:LauncherQuote
+  $lines = foreach ($name in $Tests.Keys) {
+    if ($name -notmatch '^[A-Za-z0-9-]+$') { throw "Refusing probe test name '$name'." }
+    $t = $Tests[$name]
+    if ($t.Mode -notin 'Read', 'WriteFile', 'CreateIn') { throw "Unknown probe mode $($t.Mode)." }
+    "`$tests[$(& $q $name)] = Test-Access $(& $q $t.Path) $(& $q $t.Mode)"
+  }
+  return @"
+# Generated by install-policy.ps1. Runs as the t3agent account, on demand, for verify-install.ps1.
+`$ErrorActionPreference = 'Stop'
+$($script:PinModulesText)
+function Test-Access([string] `$path, [string] `$mode) {
+  try {
+    switch (`$mode) {
+      'Read' { [IO.File]::Open(`$path, 'Open', 'Read', 'ReadWrite').Dispose() }
+      'WriteFile' { [IO.File]::Open(`$path, 'Open', 'Write', 'ReadWrite').Dispose() }
+      'CreateIn' { `$f = Join-Path `$path ('.t3probe-' + [guid]::NewGuid().ToString('N')); [IO.File]::Open(`$f, 'CreateNew', 'Write').Dispose(); Remove-Item -LiteralPath `$f -Force -ErrorAction SilentlyContinue }
+    }
+    return 'allowed'
+  } catch [UnauthorizedAccessException] { return 'denied' } catch { return "error: `$(`$_.Exception.GetType().Name)" }
+}
+`$tests = [ordered]@{}
+$($lines -join "`n")
+`$privileges = @(& "`$env:SystemRoot\System32\whoami.exe" /priv /fo csv | ConvertFrom-Csv | ForEach-Object { `$_.'Privilege Name' })
+`$groups = @(& "`$env:SystemRoot\System32\whoami.exe" /groups /fo csv | ConvertFrom-Csv | ForEach-Object { `$_.SID })
+`$result = [ordered]@{ user = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; privileges = `$privileges; groups = `$groups; tests = `$tests; at = [DateTime]::UtcNow.ToString('o') }
+`$bytes = [Text.UTF8Encoding]::new(`$false).GetBytes((`$result | ConvertTo-Json -Depth 4))
+`$stream = [IO.FileStream]::new($(& $q $ResultPath), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+try { `$stream.Write(`$bytes, 0, `$bytes.Length) } finally { `$stream.Dispose() }
+"@
+}
+
+<#
+  Judges a probe result. Privileges: only those a standard batch logon gets. Groups: none of the
+  privileged builtin groups, not High or System integrity. Tests: as expected.
+#>
+$script:StandardPrivileges = @('SeChangeNotifyPrivilege', 'SeIncreaseWorkingSetPrivilege', 'SeTimeZonePrivilege', 'SeShutdownPrivilege', 'SeUndockPrivilege')
+$script:PrivilegedGroupSids = @('S-1-5-32-544', 'S-1-5-32-547', 'S-1-5-32-548', 'S-1-5-32-549', 'S-1-5-32-550', 'S-1-5-32-551', 'S-1-5-32-552',
+  'S-1-5-32-555', 'S-1-5-32-556', 'S-1-5-32-558', 'S-1-5-32-559', 'S-1-5-32-562', 'S-1-5-32-568', 'S-1-5-32-569', 'S-1-5-32-573',
+  'S-1-5-32-578', 'S-1-5-32-579', 'S-1-5-32-580', 'S-1-5-32-583', 'S-1-16-12288', 'S-1-16-16384')
+function Test-AgentProbeResult {
+  param([Parameter(Mandatory)] $Result, [Parameter(Mandatory)][System.Collections.IDictionary] $Expected, [Parameter(Mandatory)][string] $AgentSid)
+  $issues = [System.Collections.Generic.List[string]]::new()
+  if ([string]$Result.user -ne $AgentSid) { $issues.Add("the probe ran as $($Result.user), not the agent account") }
+  foreach ($p in @($Result.privileges)) { if ($script:StandardPrivileges -notcontains $p) { $issues.Add("extra privilege $p") } }
+  foreach ($g in @($Result.groups)) { if ($script:PrivilegedGroupSids -contains $g) { $issues.Add("privileged group or integrity $g") } }
+  foreach ($name in $Expected.Keys) {
+    $got = if ($Result.tests -is [System.Collections.IDictionary]) { $Result.tests[$name] } else { $Result.tests.PSObject.Properties[$name]?.Value }
+    if ($got -ne $Expected[$name]) { $issues.Add("$name : expected $($Expected[$name]), got $got") }
+  }
+  return $issues.ToArray()
+}
+
+<# A minimal git version check: 'git version 2.51.2.windows.1' against '2.50.1'. #>
+function Test-GitVersionAtLeast {
+  param([Parameter(Mandatory)][string] $VersionText, [Parameter(Mandatory)][string] $Minimum)
+  if ($VersionText -notmatch '(\d+)\.(\d+)\.(\d+)') { return $false }
+  $have = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
+  return $have -ge [version]$Minimum
+}
+
 # ---------- machine changes (elevated, used by install-policy.ps1) ----------
 
-<# The local groups an account is in, as objects with Name and Sid. #>
+<#
+  The local groups an account is in, as objects with Name and Sid, read by SID through ADSI
+  (WinNT provider; Get-LocalGroupMember fails on orphaned members and compares names). Any
+  error throws: callers fail closed.
+#>
 function Get-AccountGroups {
   param([Parameter(Mandatory)][string] $Name)
-  $groups = foreach ($group in Get-LocalGroup) {
-    $members = @(Get-LocalGroupMember -Group $group -ErrorAction SilentlyContinue)
-    if ($members | Where-Object { $_.Name -match "\\$([regex]::Escape($Name))$" -and $_.PrincipalSource -eq 'Local' }) {
-      [pscustomobject]@{ Name = $group.Name; Sid = $group.SID.Value }
-    }
+  $user = [ADSI]"WinNT://$env:COMPUTERNAME/$Name,user"
+  $groups = foreach ($group in @($user.Groups())) {
+    $sidBytes = $group.GetType().InvokeMember('objectSid', 'GetProperty', $null, $group, $null)
+    $groupName = $group.GetType().InvokeMember('Name', 'GetProperty', $null, $group, $null)
+    [pscustomobject]@{ Name = [string]$groupName; Sid = ([Security.Principal.SecurityIdentifier]::new([byte[]]$sidBytes, 0)).Value }
   }
   return , @($groups)
 }
@@ -595,8 +842,16 @@ function Get-AccountGroups {
 #>
 function Set-ServiceAccount {
   [CmdletBinding(SupportsShouldProcess)]
-  param([Parameter(Mandatory)][string] $Name, [Parameter(Mandatory)][string] $Description)
+  param(
+    [Parameter(Mandatory)][string] $Name,
+    [Parameter(Mandatory)][string] $Description,
+    # The SID recorded when this installer created the account; $null if it never did.
+    [AllowNull()][string] $CreatedSid
+  )
   $existing = Get-LocalUser -Name $Name -ErrorAction SilentlyContinue
+  if ($null -ne $existing -and $existing.SID.Value -ne $CreatedSid) {
+    throw "Refusing: a local account named $Name already exists and was not created by this installer. Pick another name with -AgentAccount/-BridgeAccount; this installer never resets or deletes an account it did not create."
+  }
   if ($null -ne $existing) {
     $bad = Get-DisallowedGroups -Groups (Get-AccountGroups -Name $Name)
     if ($bad.Count -gt 0) {
@@ -647,6 +902,16 @@ function Invoke-SeceditUserRights {
   }
 }
 
+<# Overwrites a managed string's characters in place (pinned), so the copy does not linger. #>
+function Clear-ManagedString([string] $text) {
+  if ([string]::IsNullOrEmpty($text)) { return }
+  $handle = [Runtime.InteropServices.GCHandle]::Alloc($text, [Runtime.InteropServices.GCHandleType]::Pinned)
+  try {
+    $address = $handle.AddrOfPinnedObject()
+    for ($i = 0; $i -lt $text.Length; $i++) { [Runtime.InteropServices.Marshal]::WriteInt16($address, $i * 2, 0) }
+  } finally { $handle.Free() }
+}
+
 <#
   Registers a task through the Task Scheduler COM API. The password goes from the SecureString
   to a BSTR to the COM call and the BSTR is zeroed; it is never a cmdlet parameter, so module
@@ -674,11 +939,13 @@ function Register-ServiceTask {
     return
   }
   $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
+  $plain = $null
   try {
-    [void]$folder.RegisterTaskDefinition($TaskName, $definition, 6, ".\$Account",
-      [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr), 1)   # TASK_LOGON_PASSWORD
+    $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    [void]$folder.RegisterTaskDefinition($TaskName, $definition, 6, ".\$Account", $plain, 1)   # TASK_LOGON_PASSWORD
   } finally {
     [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    if ($null -ne $plain) { Clear-ManagedString $plain; $plain = $null }
   }
 }
 
@@ -718,5 +985,8 @@ Export-ModuleMember -Function New-ServiceAccountPasswordChars, Get-ServiceAccoun
   Get-ServiceTaskXml, Get-T3FolderAclPlan, Format-T3AclPlanEntry, Compare-T3Acl, Get-DisallowedGroups,
   Get-MarkerCheckText, Get-T3LauncherText, Get-BridgeLauncherText, Get-TokenIssuerText, Get-TokenMoverText,
   Get-KeyRotationText, Get-EmergencyRevokePlan, Test-SigningKeyFresh, Get-LastRevokeTime,
+  Get-ListenerCheckText, Test-ListenerOwnership, ConvertFrom-UserRightsInf, Compare-UserRightsSnapshot,
+  Compare-PreInstallSnapshot, Get-TaskSecurityIssues, Get-AgentProbeText, Test-AgentProbeResult,
+  Test-GitVersionAtLeast, Clear-ManagedString,
   Get-AccountGroups, Set-ServiceAccount, Invoke-SeceditUserRights, Register-ServiceTask, Remove-ServiceTask,
   Remove-ServiceAccount

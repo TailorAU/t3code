@@ -64,7 +64,7 @@
   'script=<hex>,verify=<hex>,template=<hex>,module=<hex>,accounts=<hex>', from the reviewed commit.
 
 .EXAMPLE
-  & "$env:ProgramData\T3CodePolicy\installer\install-policy.ps1" -ExpectedSha256 $reviewed `
+  pwsh -NoProfile -File "$env:ProgramData\T3CodePolicy\installer\install-policy.ps1" -ExpectedSha256 $reviewed `
     -T3Exe 'C:\Program Files\T3Code\t3.exe' -ClaudeExe 'C:\Program Files\T3Code\claude\claude.exe' -WhatIf
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -81,6 +81,13 @@ param(
   # The T3 bridge executable. Without it the bridge account and the token are still created,
   # but no bridge task is registered.
   [string] $BridgeExe,
+  # Required with -BridgeExe: the operator confirms the bridge build checks, before every
+  # connection, that the loopback listener is the T3 server t3agent started (README, "Bridge
+  # contract"). The launcher checks it before starting the bridge as well.
+  [switch] $BridgeChecksServer,
+  # The git.exe the self-check uses (admin-only folder; its version must be at least
+  # $MinimumGitVersion). Defaults to the git on PATH.
+  [string] $GitExe,
   # tailor.au API host names the bridge may reach (no default; for example api.example.com).
   [string[]] $TailorApiHosts = @(),
   # More project roots for t3agent besides %ProgramData%\T3CodePolicy\workspaces. Each is
@@ -110,6 +117,17 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+# Modules only from PowerShell's own folder and System32, imported by full path: nothing on a
+# user-writable module path can shadow a cmdlet this script runs elevated.
+$env:PSModulePath = "$PSHOME\Modules;$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules"
+foreach ($module in 'Microsoft.PowerShell.LocalAccounts', 'ScheduledTasks', 'NetSecurity', 'NetTCPIP') {
+  $manifest = Get-ChildItem -LiteralPath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules\$module" -Filter "$module.psd1" -Recurse -Depth 1 -File |
+    Select-Object -First 1
+  if ($null -eq $manifest) { throw "Windows module $module not found in System32." }
+  Import-Module $manifest.FullName -ErrorAction Stop
+}
+$MinimumGitVersion = '2.50.1'
+
 $ProgramDataFolder = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
 $PolicyDir = Join-Path $ProgramDataFolder 'T3CodePolicy'
 $InstallerDir = Join-Path $PolicyDir 'installer'
@@ -121,6 +139,11 @@ $ConnectorDir = Join-Path $PolicyDir 'connector'
 $DropDir = Join-Path $PolicyDir 'connector-drop'
 $BridgeDir = Join-Path $PolicyDir 'bridge'
 $HooksDir = Join-Path $PolicyDir 'git-hooks'
+$GitConfigDir = Join-Path $PolicyDir 'git-config'
+$GitGlobalConfig = Join-Path $GitConfigDir 'gitconfig'
+$RunDir = Join-Path $PolicyDir 'run'
+$ServerPidFile = Join-Path $RunDir 't3-server.json'
+$ProbeDir = Join-Path $PolicyDir 'probe'
 $DefaultWorkspaces = Join-Path $PolicyDir 'workspaces'
 $TokenPath = Join-Path $ConnectorDir 'token'
 $DropPath = Join-Path $DropDir 'token'
@@ -129,7 +152,9 @@ $InstalledPath = Join-Path $PolicyDir 't3-policy.json'
 $UndoPath = Join-Path $StateDir 'undo.json'
 $BaselinePath = Join-Path $StateDir 'managed-settings.baseline.json'
 $MarkerPath = Join-Path $ServiceDir 'verified.json'
-$Tasks = [ordered]@{ Server = 'T3 server'; Bridge = 'T3 bridge'; Issuer = 'T3 token issuer'; Mover = 'T3 token mover'; Rotate = 'T3 key rotation' }
+$Tasks = [ordered]@{ Server = 'T3 server'; Bridge = 'T3 bridge'; Issuer = 'T3 token issuer'; Mover = 'T3 token mover'; Rotate = 'T3 key rotation'
+  RotateToken = 'T3 token rotate now'; Probe = 'T3 self-check probe' }
+$PreInstallPath = Join-Path $StateDir 'pre-install.json'
 $RevokeLogPath = Join-Path $StateDir 'revoke-log.json'
 $RotateScript = Join-Path $ServiceDir 'rotate-keys.ps1'
 $InstallerFiles = [ordered]@{
@@ -604,6 +629,38 @@ function Stop-AccountProcesses([string] $name) {
   return $count
 }
 
+# The parts of the machine an install changes, for the pre-install snapshot and the uninstall diff.
+function Get-MachineSnapshot {
+  $variables = [ordered]@{}
+  foreach ($entry in [Environment]::GetEnvironmentVariables('Machine').GetEnumerator()) {
+    if ($entry.Key -match '^T3CODE_') { $variables[$entry.Key] = [string]$entry.Value }
+  }
+  $folderExists = $true
+  try { $svc = New-Object -ComObject 'Schedule.Service'; $svc.Connect(); [void]$svc.GetFolder('\T3CodePolicy') } catch { $folderExists = $false }
+  $managed = $null
+  if (Test-Path -LiteralPath $MachineManagedSettingsPath) {
+    $managed = (ConvertFrom-ManagedSettingsText ([IO.File]::ReadAllText($MachineManagedSettingsPath))) | ConvertTo-Json -Depth 100 -Compress
+  }
+  $rights = $null
+  $work = Join-Path ([IO.Path]::GetTempPath()) ('t3policy-snapshot-' + [guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory -Path $work | Out-Null
+  try {
+    & "$env:SystemRoot\System32\secedit.exe" /export /cfg (Join-Path $work 'rights.inf') /areas USER_RIGHTS /quiet | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "secedit /export failed ($LASTEXITCODE)." }
+    $rights = [IO.File]::ReadAllText((Join-Path $work 'rights.inf'))
+  } finally { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+  return [ordered]@{
+    at = [DateTime]::UtcNow.ToString('o')
+    variables = $variables
+    tasks = @(Get-ScheduledTask -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue | ForEach-Object { "$($_.TaskPath)$($_.TaskName)" })
+    taskFolder = $folderExists
+    firewallRules = @(Get-NetFirewallRule -Group $RuleGroup -ErrorAction SilentlyContinue | ForEach-Object Name)
+    managedSettings = $managed
+    managedSettingsDirExisted = (Test-Path -LiteralPath (Split-Path -Parent $MachineManagedSettingsPath))
+    rights = $rights
+  }
+}
+
 # ---------- emergency revoke ----------
 if ($EmergencyRevoke) {
   Write-Host 'EMERGENCY REVOKE'
@@ -677,9 +734,11 @@ if ($EmergencyRevoke) {
 # ---------- uninstall ----------
 if ($Uninstall) {
   $undo = Read-UndoRecord
+  $preInstall = $null
+  if (Test-Path -LiteralPath $PreInstallPath) { [void](Assert-NotReparse $PreInstallPath); $preInstall = Get-Content -LiteralPath $PreInstallPath -Raw | ConvertFrom-Json }
   # First make every issued token and session invalid (t3agent rotates the keys), then the T3
   # home, keys included, is deleted below.
-  foreach ($key in 'Server', 'Bridge', 'Issuer', 'Mover') {
+  foreach ($key in 'Server', 'Bridge', 'Issuer', 'Mover', 'RotateToken', 'Probe') {
     if ((Get-ScheduledTask -TaskName $Tasks[$key] -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue) -and $PSCmdlet.ShouldProcess($Tasks[$key], 'Stop')) {
       Stop-ScheduledTask -TaskName $Tasks[$key] -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue
     }
@@ -693,8 +752,16 @@ if ($Uninstall) {
   foreach ($task in $Tasks.Values) { Remove-ServiceTask -TaskName $task -WhatIf:$WhatIfPreference }
   $removedSids = @()
   foreach ($name in $AgentAccount, $BridgeAccount) {
+    # Only an account this installer created (its SID recorded) is ever removed.
+    $recorded = if ($undo.Contains('createdAccounts') -and $undo.createdAccounts.Contains($name)) { [string]$undo.createdAccounts[$name] } else { $null }
+    $user = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
+    if ($null -eq $user) { continue }
+    if ($user.SID.Value -ne $recorded) { Write-Warning "Not removing $name : this installer did not create it."; continue }
     $sid = Remove-ServiceAccount -Name $name -WhatIf:$WhatIfPreference
     if ($sid) { $removedSids += $sid }
+  }
+  if ($PSCmdlet.ShouldProcess('\T3CodePolicy', 'Remove the task folder if empty')) {
+    try { $svc = New-Object -ComObject 'Schedule.Service'; $svc.Connect(); $svc.GetFolder('\').DeleteFolder('T3CodePolicy', 0) } catch { }
   }
   $previousRules = @(Get-NetFirewallRule -Group $RuleGroup -ErrorAction SilentlyContinue)
   if ($previousRules.Count -gt 0 -and $PSCmdlet.ShouldProcess($RuleGroup, "Remove $($previousRules.Count) firewall rule(s)")) { $previousRules | Remove-NetFirewallRule }
@@ -709,7 +776,14 @@ if ($Uninstall) {
     elseif ($null -ne $previousInstalled -and $previousInstalled.PSObject.Properties['machineManagedSettings']) { $previousInstalled.machineManagedSettings }
     else { $null }
   Undo-MachineManagedSettings $managedRecord
-  foreach ($dir in $ServiceDir, $ConnectorDir, $DropDir, $BridgeDir, $HooksDir, $T3Home, $ClaudeConfigDir) { Remove-TreeNoFollow $dir }
+  # Backups (managed-settings.json.t3bak-*) are kept on purpose: delete them once satisfied.
+  $managedDir = Split-Path -Parent $MachineManagedSettingsPath
+  if ($undo.Contains('createdManagedSettingsDir') -and $undo.createdManagedSettingsDir -and (Test-Path -LiteralPath $managedDir) -and
+      @(Get-ChildItem -LiteralPath $managedDir -Force | Where-Object { $_.Name -notlike '*.t3bak-*' }).Count -eq 0 -and
+      @(Get-ChildItem -LiteralPath $managedDir -Force).Count -eq 0 -and $PSCmdlet.ShouldProcess($managedDir, 'Remove the folder this installer created (empty)')) {
+    [IO.Directory]::Delete($managedDir, $false)
+  }
+  foreach ($dir in $ServiceDir, $ConnectorDir, $DropDir, $BridgeDir, $HooksDir, $GitConfigDir, $RunDir, $ProbeDir, $T3Home, $ClaudeConfigDir) { Remove-TreeNoFollow $dir }
   foreach ($file in $InstalledPath) { if ((Test-Path -LiteralPath $file) -and $PSCmdlet.ShouldProcess($file, 'Remove')) { [IO.File]::Delete($file) } }
   # Workspaces hold the operator's code: they are kept, minus the removed accounts' entries.
   $workspaceRoots = @($DefaultWorkspaces)
@@ -732,7 +806,15 @@ if ($Uninstall) {
       Write-Host "  kept: $(($left | ForEach-Object Name) -join ', ') (workspaces hold code; delete them yourself when done)"
     }
   }
-  Write-Host 'Uninstalled. With the policy removed, a Windows server refuses to run Claude until it is installed again.'
+  Write-Host ''
+  if ($null -eq $preInstall) {
+    Write-Warning 'No pre-install snapshot was recorded: the machine cannot be compared with its state before the install.'
+  } elseif (-not $WhatIfPreference) {
+    $diff = Compare-PreInstallSnapshot -Before $preInstall -After (Get-MachineSnapshot)
+    if ($diff.Count -eq 0) { Write-Host "Compared with before the install ($($preInstall.at)): managed settings, user rights, tasks, firewall rules and T3CODE_* variables are the same." }
+    else { Write-Warning 'Differences from before the install:'; $diff | ForEach-Object { Write-Host "  - $_" } }
+  }
+  Write-Host 'Uninstalled. Managed-settings backups (*.t3bak-*) are kept. With the policy removed, a Windows server refuses to run Claude until it is installed again.'
   return
 }
 
@@ -740,8 +822,32 @@ if ($Uninstall) {
 $T3Exe = Resolve-Executable 'T3Exe' $T3Exe
 $ClaudeExe = Resolve-Executable 'ClaudeExe' $ClaudeExe
 if ($BridgeExe) {
+  if (-not $BridgeChecksServer) {
+    throw '-BridgeExe needs -BridgeChecksServer: the bridge must check the T3 listener before every connection (README, "Bridge contract"). Nothing was changed.'
+  }
   $BridgeExe = Resolve-Executable 'BridgeExe' $BridgeExe
   if ($TailorApiHosts.Count -eq 0) { throw '-BridgeExe needs -TailorApiHosts (the tailor.au API host names it may reach).' }
+}
+if (-not $GitExe) {
+  $found = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($null -eq $found) { throw 'git not found: pass -GitExe with the full path of git.exe.' }
+  $GitExe = $found.Source
+}
+$GitExe = Resolve-Executable 'GitExe' $GitExe
+$gitVersion = (& $GitExe --version)
+if (-not (Test-GitVersionAtLeast -VersionText $gitVersion -Minimum $MinimumGitVersion)) {
+  throw "$gitVersion is older than $MinimumGitVersion (security fixes). Update git and re-run."
+}
+# Settings in the machine tier that loosen T3's lock for every session, or a Claude policy in
+# the registry, would win over T3's own lock: refuse until an administrator removes them.
+if (-not $SkipMachineManagedSettings -and (Test-Path -LiteralPath $MachineManagedSettingsPath)) {
+  $looseners = Get-ManagedSettingsLooseners ([IO.File]::ReadAllText($MachineManagedSettingsPath))
+  if ($looseners.Count -gt 0) {
+    throw "$MachineManagedSettingsPath sets $($looseners -join ', '), which loosen the lock for every Claude session including T3's. Remove them deliberately and re-run. Nothing was changed."
+  }
+}
+if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Policies\ClaudeCode') {
+  throw 'HKLM\SOFTWARE\Policies\ClaudeCode exists: a registry Claude policy would apply alongside T3''s. Remove it deliberately and re-run. Nothing was changed.'
 }
 $pwshCandidate = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)) 'PowerShell\7\pwsh.exe'
 if (-not (Test-Path -LiteralPath $pwshCandidate)) {
@@ -760,6 +866,10 @@ foreach ($root in $WorkspaceRoots) {
   $parent = Split-Path -Parent $full
   if (-not (Test-Path -LiteralPath $parent)) { throw "The parent of $full does not exist." }
   Assert-AdminControlled $parent -SkipParent   # nobody else can swap the folder under us
+  # An existing non-empty folder keeps its children's old ACLs (the operator's, Users'): refuse.
+  if ((Test-Path -LiteralPath $full) -and @(Get-ChildItem -LiteralPath $full -Force).Count -gt 0) {
+    throw "-WorkspaceRoots $full exists and is not empty. Give a new or empty folder; copy code in afterwards (README, Getting code in and out). Nothing was changed."
+  }
   $extraRoots += $full
 }
 if (-not $AllowedHosts) { $AllowedHosts = @($policy.egress.allowedHosts) }
@@ -808,9 +918,37 @@ foreach ($task in $Tasks.Values) {
 if ((Test-Path -LiteralPath $MarkerPath) -and $PSCmdlet.ShouldProcess($MarkerPath, 'Remove the verified marker (verification runs again at the end)')) { [IO.File]::Delete($MarkerPath) }
 
 # ---------- 1. accounts ----------
-Write-Host '1. Service accounts (random passwords, never stored; refused if in any group but Users)'
-$agentPassword = Set-ServiceAccount -Name $AgentAccount -Description 'Runs T3 Code and its Claude (T3CodePolicy).' -WhatIf:$WhatIfPreference
-$bridgePassword = Set-ServiceAccount -Name $BridgeAccount -Description 'Runs the T3 bridge; reads the connector token (T3CodePolicy).' -WhatIf:$WhatIfPreference
+# The policy and state folders first, so the undo record and the pre-install snapshot exist
+# before anything else changes (the accounts' grants are added in step 2).
+foreach ($entry in $aclPlan | Where-Object { $_.Name -in 'policy', 'state' }) { Ensure-PlannedDirectory $entry -CheckTree:($entry.Name -eq 'state') }
+$undo = Read-UndoRecord
+if (-not $undo.Contains('createdAccounts')) { $undo['createdAccounts'] = [ordered]@{} }
+if (-not (Test-Path -LiteralPath $PreInstallPath) -and -not $WhatIfPreference) {
+  # First install only: the machine as it was, for the self-check and the uninstall diff.
+  Write-ProtectedFile $PreInstallPath (Get-Utf8Bytes (((Get-MachineSnapshot) | ConvertTo-Json -Depth 6) + "`n"))
+}
+if (-not $undo.Contains('createdManagedSettingsDir')) {
+  $undo['createdManagedSettingsDir'] = -not (Test-Path -LiteralPath (Split-Path -Parent $MachineManagedSettingsPath))
+  Save-UndoRecord $undo
+}
+Write-Host '1. Service accounts (created by this installer only; random passwords, never stored; refused if in any group but Users)'
+function Set-OurAccount([string] $name, [string] $description) {
+  $existing = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
+  $recorded = if ($undo.createdAccounts.Contains($name)) { [string]$undo.createdAccounts[$name] } else { $null }
+  if ($null -eq $existing) {
+    # Record the intent before creating, so an interrupted run still knows the account is ours.
+    $undo.createdAccounts[$name] = 'pending'; Save-UndoRecord $undo
+    $recorded = 'pending'
+  } elseif ($recorded -eq 'pending') {
+    $recorded = $existing.SID.Value
+  }
+  $password = Set-ServiceAccount -Name $name -Description $description -CreatedSid $(if ($null -eq $existing) { $null } else { $recorded }) -WhatIf:$WhatIfPreference
+  $now = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
+  if ($null -ne $now) { $undo.createdAccounts[$name] = $now.SID.Value; Save-UndoRecord $undo }
+  return $password
+}
+$agentPassword = Set-OurAccount $AgentAccount 'Runs T3 Code and its Claude (T3CodePolicy).'
+$bridgePassword = Set-OurAccount $BridgeAccount 'Runs the T3 bridge; reads the connector token (T3CodePolicy).'
 function Get-AccountSid([string] $name) {
   $user = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
   if ($null -eq $user) { return $null }   # only in a preview, before the account exists
@@ -827,20 +965,20 @@ foreach ($pair in @(@{ Name = $AgentAccount; Sid = $SidMap.agent }, @{ Name = $B
 Write-Host "2. Folders (ACL at creation; existing ones reset by handle)"
 $planByName = @{}
 foreach ($entry in $aclPlan) { $planByName[$entry.Name] = $entry }
-$undo = $null
 foreach ($entry in $aclPlan) {
   # Admin code works inside these folders, so nothing may be planted in them. The T3 home,
   # the Claude home's subfolders and the workspaces are t3agent's: admin code never goes in.
-  $checkTree = @('policy', 't3-home', 'claude-home', 'workspaces', 'connector-drop') -notcontains $entry.Name -and $entry.Name -notlike 'workspace-*'
+  $checkTree = @('policy', 't3-home', 'claude-home', 'workspaces', 'connector-drop', 'probe', 'run') -notcontains $entry.Name -and $entry.Name -notlike 'workspace-*'
   $existed = Test-Path -LiteralPath $entry.Path
-  Ensure-PlannedDirectory $entry -CheckTree:$checkTree
-  if ($entry.Name -eq 'state' -and $null -eq $undo) { $undo = Read-UndoRecord }
-  if ($entry.Name -like 'workspace-*' -and -not $existed -and $null -ne $undo -and @($undo.createdWorkspaceRoots) -notcontains $entry.Path) {
+  # Recorded before it is created, so an interrupted run still knows the root is ours.
+  if ($entry.Name -like 'workspace-*' -and -not $existed -and @($undo.createdWorkspaceRoots) -notcontains $entry.Path) {
     $undo.createdWorkspaceRoots = @($undo.createdWorkspaceRoots) + $entry.Path
     Save-UndoRecord $undo
   }
+  Ensure-PlannedDirectory $entry -CheckTree:$checkTree
 }
-if ($null -eq $undo) { $undo = Read-UndoRecord }
+# The empty global git config every T3 git call uses (GIT_CONFIG_GLOBAL, gitHardening.ts).
+Write-ProtectedFile $GitGlobalConfig ([byte[]]@()) (New-FileEntry @{ agent = 'ReadAndExecute, Synchronize' })
 if ((Test-Path -LiteralPath $HooksDir) -and @(Get-ChildItem -LiteralPath $HooksDir -Force).Count -gt 0) {
   throw "$HooksDir must be empty: it is the hooks path for every git command T3 runs. Empty it and re-run."
 }
@@ -880,6 +1018,12 @@ $installed = [ordered]@{
   claudeHomeName = $ClaudeHomeName
   workspaceRoots = @($DefaultWorkspaces) + $extraRoots
   gitHooksDir = $HooksDir
+  gitGlobalConfig = $GitGlobalConfig
+  gitExe = $GitExe
+  gitExeSha256 = Get-FileSha256 $GitExe
+  minimumGitVersion = $MinimumGitVersion
+  serverPidFile = $ServerPidFile
+  t3Port = $T3Port
   instanceEnvironmentAllowlist = @($policy.claudeInstance.environmentAllowlist)
   installerSha256 = $hashText
   ruleGroup = $RuleGroup
@@ -909,14 +1053,30 @@ $bridgeLauncher = Join-Path $ServiceDir 'start-bridge.ps1'
 $agentId = if ($SidMap.agent) { $SidMap.agent } else { 'S-1-0-0' }
 $bridgeId = if ($SidMap.bridge) { $SidMap.bridge } else { 'S-1-0-0' }
 Write-ProtectedFile $t3Launcher (Get-Utf8Bytes (Get-T3LauncherText -T3Exe $T3Exe -T3Home $T3Home -Environment $serverVariables -MustBeUnset $mustBeUnset `
-      -MarkerPath $MarkerPath -RequiredFiles @($T3Exe, $ClaudeExe, $InstalledPath, $t3Launcher, $seedPath) -SettingsSeedPath $seedPath)) $readAgent
+      -MarkerPath $MarkerPath -RequiredFiles @($T3Exe, $ClaudeExe, $InstalledPath, $t3Launcher, $seedPath) -SettingsSeedPath $seedPath -ServerPidFile $ServerPidFile)) $readAgent
 Write-ProtectedFile $issuer (Get-Utf8Bytes (Get-TokenIssuerText -T3Exe $T3Exe -T3Home $T3Home -DropPath $DropPath -Ttl "$($ConnectorTokenDays)d" `
       -MustBeUnset $mustBeUnset -MarkerPath $MarkerPath -RequiredFiles @($T3Exe, $InstalledPath, $issuer))) $readAgent
 Write-ProtectedFile $RotateScript (Get-Utf8Bytes (Get-KeyRotationText -T3Exe $T3Exe -T3Home $T3Home -PolicyPath $InstalledPath -MustBeUnset $mustBeUnset)) $readAgent
+$probe = Join-Path $ServiceDir 'probe-agent.ps1'
+$probeResult = Join-Path $ProbeDir 'result.json'
+$probeTests = [ordered]@{
+  'read-token' = @{ Path = $TokenPath; Mode = 'Read' }
+  'read-marker' = @{ Path = $MarkerPath; Mode = 'Read' }
+  'read-policy' = @{ Path = $InstalledPath; Mode = 'Read' }
+  'write-policy' = @{ Path = $InstalledPath; Mode = 'WriteFile' }
+  'create-in-service' = @{ Path = $ServiceDir; Mode = 'CreateIn' }
+  'create-in-claude-home-root' = @{ Path = $ClaudeConfigDir; Mode = 'CreateIn' }
+  'create-in-git-hooks' = @{ Path = $HooksDir; Mode = 'CreateIn' }
+  'write-git-config' = @{ Path = $GitGlobalConfig; Mode = 'WriteFile' }
+  'create-in-connector' = @{ Path = $ConnectorDir; Mode = 'CreateIn' }
+  'create-in-installer' = @{ Path = $InstallerDir; Mode = 'CreateIn' }
+}
+Write-ProtectedFile $probe (Get-Utf8Bytes (Get-AgentProbeText -ResultPath $probeResult -Tests $probeTests)) $readAgent
 Write-ProtectedFile $mover (Get-Utf8Bytes (Get-TokenMoverText -DropPath $DropPath -TokenPath $TokenPath -AgentSid $agentId -BridgeSid $bridgeId)) (New-FileEntry @{})
 if ($BridgeExe) {
   Write-ProtectedFile $bridgeLauncher (Get-Utf8Bytes (Get-BridgeLauncherText -BridgeExe $BridgeExe -TokenPath $TokenPath -KeyPath $BridgeKeyPath `
-        -T3Url "http://127.0.0.1:$T3Port" -MustBeUnset $mustBeUnset -MarkerPath $MarkerPath -RequiredFiles @($BridgeExe, $bridgeLauncher))) (New-FileEntry @{ bridge = 'ReadAndExecute, Synchronize' })
+        -T3Url "http://127.0.0.1:$T3Port" -MustBeUnset $mustBeUnset -MarkerPath $MarkerPath -RequiredFiles @($BridgeExe, $bridgeLauncher) `
+        -ServerPidFile $ServerPidFile -AgentSid $agentId -T3Port $T3Port)) (New-FileEntry @{ bridge = 'ReadAndExecute, Synchronize' })
 }
 
 # ---------- 6. tasks ----------
@@ -927,6 +1087,10 @@ Register-ServiceTask -TaskName $Tasks.Issuer -Account $AgentAccount -Password $a
   -Xml (Get-ServiceTaskXml -Description 'Issues the connector token into the drop folder (T3CodePolicy).' -Account $AgentAccount -PwshPath $PwshPath -LauncherPath $issuer -Trigger Daily)
 Register-ServiceTask -TaskName $Tasks.Rotate -Account $AgentAccount -Password $agentPassword -WhatIf:$WhatIfPreference `
   -Xml (Get-ServiceTaskXml -Description 'Rotates the T3 signing keys on demand (emergency revoke, uninstall) (T3CodePolicy).' -Account $AgentAccount -PwshPath $PwshPath -LauncherPath $RotateScript -Trigger OnDemand)
+Register-ServiceTask -TaskName $Tasks.RotateToken -Account $AgentAccount -Password $agentPassword -WhatIf:$WhatIfPreference `
+  -Xml (Get-ServiceTaskXml -Description 'Issues a connector token now and revokes every previous one (T3CodePolicy).' -Account $AgentAccount -PwshPath $PwshPath -LauncherPath $issuer -Trigger OnDemand -ExtraArguments '-RevokeAllPrevious')
+Register-ServiceTask -TaskName $Tasks.Probe -Account $AgentAccount -Password $agentPassword -WhatIf:$WhatIfPreference `
+  -Xml (Get-ServiceTaskXml -Description 'Runs the self-check probe as the agent account (T3CodePolicy).' -Account $AgentAccount -PwshPath $PwshPath -LauncherPath $probe -Trigger OnDemand)
 Register-ServiceTask -TaskName $Tasks.Mover -System -WhatIf:$WhatIfPreference `
   -Xml (Get-ServiceTaskXml -Description 'Moves the connector token from the drop folder (T3CodePolicy).' -System -PwshPath $PwshPath -LauncherPath $mover -Trigger Every10Minutes)
 if ($BridgeExe) {
@@ -966,14 +1130,16 @@ if (-not $passed) {
 foreach ($task in @($Tasks.Server) + $(if ($BridgeExe) { @($Tasks.Bridge) } else { @() }) + @($Tasks.Mover)) {
   if ($PSCmdlet.ShouldProcess("\T3CodePolicy\$task", 'Start now')) { Start-ScheduledTask -TaskName $task -TaskPath '\T3CodePolicy\' }
 }
-if (((-not (Test-Path -LiteralPath $TokenPath)) -or $RotateConnectorToken) -and $PSCmdlet.ShouldProcess("\T3CodePolicy\$($Tasks.Issuer)", 'Issue a connector token now (moved into connector\ within ten minutes)')) {
+if ($RotateConnectorToken -and $PSCmdlet.ShouldProcess("\T3CodePolicy\$($Tasks.RotateToken)", 'Issue a connector token now and revoke every previous connector session')) {
+  Start-ScheduledTask -TaskName $Tasks.RotateToken -TaskPath '\T3CodePolicy\'
+} elseif ((-not (Test-Path -LiteralPath $TokenPath)) -and $PSCmdlet.ShouldProcess("\T3CodePolicy\$($Tasks.Issuer)", 'Issue a connector token now (moved into connector\ within ten minutes)')) {
   Start-ScheduledTask -TaskName $Tasks.Issuer -TaskPath '\T3CodePolicy\'
 }
 
 Write-Host ''
 Write-Host 'Done. Next steps (not done by this script):'
 Write-Host '  - Work through the manual checks verify-install.ps1 printed.'
-Write-Host "  - If anything looks wrong: & `"$InstallerDir\install-policy.ps1`" -EmergencyRevoke"
+Write-Host "  - If anything looks wrong: pwsh -NoProfile -File `"$InstallerDir\install-policy.ps1`" -EmergencyRevoke"
 Write-Host '  - Enter the model credential on the Claude provider instance as a sensitive value (provider-config.md).'
 Write-Host "  - As an administrator, put the bridge's tailor.au key in $BridgeKeyPath (the folder ACL keeps it $BridgeAccount-only)."
 Write-Host '  - Run the live egress capture (SECURITY-REVIEW.md, T3-01).'

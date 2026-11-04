@@ -117,6 +117,12 @@ Assert-True (-not (Test-ManagedSettingsUnchanged -CurrentText ($noMerge | Conver
 $fresh = Get-ManagedSettingsMerge -ExistingText $null -Entries $ours
 Assert-True (Test-ManagedSettingsUnchanged -CurrentText $fresh.Text -BackupText $null -Added $fresh.Added -Created $fresh.Created).Ok 'verify passes on a file the installer created'
 
+# Machine-tier settings that loosen the lock are found.
+Assert-True (@(Get-ManagedSettingsLooseners $null).Count -eq 0) 'no file: nothing to report'
+Assert-True (@(Get-ManagedSettingsLooseners '{ "permissions": { "deny": ["Bash"] }, "model": "x" }').Count -eq 0) 'deny rules and other keys are fine'
+$loose = @(Get-ManagedSettingsLooseners '{ "permissions": { "allow": ["Bash"], "ask": ["Edit"], "defaultMode": "acceptEdits" }, "env": { "A": "1" }, "defaultMode": "x", "hooks": {} }')
+foreach ($k in 'permissions.allow', 'permissions.ask', 'permissions.defaultMode', 'env', 'defaultMode', 'hooks') { Assert-True ($loose -contains $k) "$k is reported" }
+
 if ($failures.Count -gt 0) {
   $failures | ForEach-Object { Write-Host "FAIL: $_" }
   exit 1

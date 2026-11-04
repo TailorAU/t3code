@@ -210,3 +210,12 @@ export function tailorPathRules(
     worktreesRoot,
   };
 }
+
+/** The path rules only when the machine policy is installed (used where every command passes). */
+export function tailorPathRulesIfInstalled(
+  platform: string,
+  worktreesRoot: string,
+): ReturnType<typeof tailorPathRules> | undefined {
+  const rules = tailorPathRules(platform, worktreesRoot);
+  return rules.workspaceRoots === undefined ? undefined : rules;
+}

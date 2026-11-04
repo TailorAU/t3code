@@ -50,7 +50,15 @@ describe("Tailor Claude query lock", () => {
     const managed = (locked.managedSettings as { permissions: { deny: string[] } }).permissions.deny;
     for (const rule of managed) assert.include(flag, rule);
     assert.include(flag, "Read(./secret)");
-    for (const rule of ["Edit(**/.git/hooks/**)", "Write(**/.git/config)", "Edit(**/.githooks/**)"]) {
+    for (const rule of [
+      "Edit(**/.git/**)",
+      "Write(**/.git/**)",
+      "Edit(~/.gitconfig)",
+      "Write(~/.config/git/**)",
+      "Edit(**/.gitattributes)",
+      "Write(**/.gitmodules)",
+      "Edit(**/.githooks/**)",
+    ]) {
       assert.include(flag, rule);
     }
   });

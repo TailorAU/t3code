@@ -954,7 +954,11 @@ function Get-PinnedUpdatePlan {
     [Parameter(Mandatory)][ValidateSet('Claude', 'Git', 'Node', 'T3')][string] $Kind,
     [AllowNull()][string] $InstalledPath,
     [Parameter(Mandatory)][string] $FromPath,
-    [Parameter(Mandatory)][string] $BackupDir
+    [Parameter(Mandatory)][string] $BackupDir,
+    # The SHA-256 the operator expects the new binary to have (required except for a rollback
+    # from the backup folder, whose hash is in state\pinned-updates.json).
+    [switch] $HasExpectedSha256,
+    [string[]] $Accounts = @('t3agent', 't3bridge')
   )
   $refuse = { param($why) [pscustomobject]@{ Refused = $why; Steps = @() } }
   if (-not $InstalledPath) { return & $refuse "No pinned $Kind is recorded in t3-policy.json; install with it first." }
@@ -964,12 +968,26 @@ function Get-PinnedUpdatePlan {
     return & $refuse "Git is a whole install: upgrade the pinned Git in place ($InstalledPath) with its own installer, then run -UpdatePinned Git -From $InstalledPath. To move Git, re-run the install with -GitExe."
   }
   if ($Kind -ne 'Git' -and $same) { return & $refuse "-From is the pinned $Kind itself; give the new binary." }
-  $fromBackup = $FromPath.StartsWith($BackupDir, [StringComparison]::OrdinalIgnoreCase)
-  $step = { param($action, $detail) [pscustomobject]@{ Action = $action; Detail = $detail } }
+  # Inside the backup folder itself: the prefix ends with a separator, so a sibling such as
+  # 'pinned-backup-x\' never counts.
+  $prefix = [IO.Path]::GetFullPath($BackupDir).TrimEnd('\') + '\'
+  $fromBackup = [IO.Path]::GetFullPath($FromPath).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+  if ($Kind -ne 'Git' -and -not $HasExpectedSha256 -and -not $fromBackup) {
+    return & $refuse "-ExpectedSha256 is required for a new $Kind binary (only a rollback from $prefix may omit it)."
+  }
+  $step = { param($action, $detail) [pscustomobject]@{ Action = $action; Detail = $detail; Target = $null } }
   $steps = @(
-    (& $step 'StopTasks' 'stop every T3 task'),
+    (& $step 'StopTasks' 'stop every T3 task'))
+  # Stop-ScheduledTask leaves the launcher's t3.exe and claude.exe children running: stop
+  # every process of the service accounts, until none is left, before anything is swapped.
+  foreach ($account in $Accounts) {
+    $kill = & $step 'KillProcesses' "stop every process running as $account, until none is left"
+    $kill.Target = $account
+    $steps += $kill
+  }
+  $steps += @(
     (& $step 'RemoveMarker' 'remove the verified marker: nothing starts until verification passes'),
-    (& $step 'CheckSource' 'the source is a plain file (no link), its SHA-256 matches -ExpectedSha256 if given; Git: admin-owned folder and version'))
+    (& $step 'CheckSource' 'the source is a plain file (no link) with the expected SHA-256; Git: the whole install admin-owned, no links, then its version'))
   if ($Kind -ne 'Git') {
     $steps += & $step 'BackupCurrent' "move the current $Kind into $BackupDir (kept for a rollback)"
     $steps += & $step 'WriteNew' 'write the new binary next to the pinned path (CreateNew, protected DACL: Administrators/SYSTEM full, Users read and execute), then move it into place'
@@ -1325,6 +1343,63 @@ function Remove-ServiceTask {
   }
 }
 
+<#
+  Runs $Body with the registry root of the account's HKCU: its loaded hive, or its NTUSER.DAT
+  loaded for the call and unloaded after. $null when the account has no profile yet.
+#>
+function Invoke-WithUserHive {
+  param([Parameter(Mandatory)][string] $Sid, [Parameter(Mandatory)][scriptblock] $Body)
+  if (Test-Path -LiteralPath "Registry::HKEY_USERS\$Sid") { return & $Body "Registry::HKEY_USERS\$Sid" }
+  $profile = Get-CimInstance Win32_UserProfile -Filter "SID='$Sid'" -ErrorAction SilentlyContinue
+  $hive = if ($profile) { Join-Path $profile.LocalPath 'NTUSER.DAT' } else { $null }
+  if (-not $hive -or -not (Test-Path -LiteralPath $hive)) { return & $Body $null }
+  $mount = 'T3Policy_' + [guid]::NewGuid().ToString('N')
+  & "$env:SystemRoot\System32\reg.exe" load "HKU\$mount" $hive | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "Could not load the hive of $Sid ($LASTEXITCODE)." }
+  try { return & $Body "Registry::HKEY_USERS\$mount" }
+  finally {
+    [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+    & "$env:SystemRoot\System32\reg.exe" unload "HKU\$mount" | Out-Null
+  }
+}
+
+<#
+  The account's HKCU\Software\Policies: owned by Administrators, protected, Administrators and
+  SYSTEM full, the account read only, so it cannot create a Claude policy for itself.
+#>
+function Set-UserPoliciesKeyAcl {
+  [CmdletBinding(SupportsShouldProcess)]
+  param([Parameter(Mandatory)][string] $Root, [Parameter(Mandatory)][string] $AccountSid)
+  $key = "$Root\Software\Policies"
+  if (-not $PSCmdlet.ShouldProcess($key, 'Admin-only ACL (the account reads only)')) { return }
+  if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force | Out-Null }
+  $security = [Security.AccessControl.RegistrySecurity]::new()
+  $security.SetAccessRuleProtection($true, $false)
+  $security.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'))
+  foreach ($g in @(@('S-1-5-32-544', 'FullControl'), @('S-1-5-18', 'FullControl'), @($AccountSid, 'ReadKey'))) {
+    $security.AddAccessRule([Security.AccessControl.RegistryAccessRule]::new([Security.Principal.SecurityIdentifier]::new($g[0]),
+        [Security.AccessControl.RegistryRights]$g[1], 'ContainerInherit', 'None', 'Allow'))
+  }
+  Set-Acl -LiteralPath $key -AclObject $security
+}
+
+function Get-UserPoliciesKeyIssues {
+  param([Parameter(Mandatory)][string] $Root, [Parameter(Mandatory)][string] $AccountSid)
+  $key = "$Root\Software\Policies"
+  if (-not (Test-Path -LiteralPath $key)) { return @("$key is missing") }
+  $acl = Get-Acl -LiteralPath $key
+  $issues = [System.Collections.Generic.List[string]]::new()
+  if (-not $acl.AreAccessRulesProtected) { $issues.Add('inheritance is on') }
+  if (@('S-1-5-32-544', 'S-1-5-18') -notcontains $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value) { $issues.Add('not owned by an administrator principal') }
+  $write = [int64][Security.AccessControl.RegistryRights]'SetValue, CreateSubKey, CreateLink, Delete, ChangePermissions, TakeOwnership'
+  foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+    if ($rule.AccessControlType -ne 'Allow' -or @('S-1-5-32-544', 'S-1-5-18') -contains $rule.IdentityReference.Value) { continue }
+    if ($rule.IdentityReference.Value -ne $AccountSid) { $issues.Add("$($rule.IdentityReference.Value) has access"); continue }
+    if (([int64]$rule.RegistryRights -band $write) -ne 0) { $issues.Add('the account can write it') }
+  }
+  return $issues.ToArray()
+}
+
 <# Stops every process running as the account, then removes its rights, the account and its profile. #>
 function Remove-ServiceAccount {
   [CmdletBinding(SupportsShouldProcess)]
@@ -1355,5 +1430,6 @@ Export-ModuleMember -Function New-ServiceAccountPasswordChars, Get-ServiceAccoun
   Get-BridgePipeShimText, Get-PipeProbeText, Get-PinnedUpdatePlan, ConvertFrom-UserRightsInf, Compare-UserRightsSnapshot,
   Compare-PreInstallSnapshot, Get-TaskSecurityIssues, Get-AgentProbeText, Test-AgentProbeResult,
   Test-GitVersionAtLeast, Clear-ManagedString,
+  Invoke-WithUserHive, Set-UserPoliciesKeyAcl, Get-UserPoliciesKeyIssues,
   Get-AccountGroups, Set-ServiceAccount, Invoke-SeceditUserRights, Register-ServiceTask, Remove-ServiceTask,
   Remove-ServiceAccount

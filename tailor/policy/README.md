@@ -53,7 +53,10 @@ allowlist (`ManagedSettingsMerge.psm1`): `permissions.deny`, `permissions.disabl
 `$schema`, all of which can only restrict. Anything else makes the installer refuse and the
 self-check fail until an administrator removes it. The same allowlist applies to every
 `managed-settings.d\*.json` drop-in beside the file and to the `SOFTWARE\Policies\ClaudeCode`
-registry keys in HKLM, the administrator's HKCU and `t3agent`'s HKCU.
+registry keys in HKLM, the administrator's HKCU and `t3agent`'s HKCU (its hive is loaded for
+the check when it is not loaded). The installer also gives `t3agent`'s own
+`HKCU\Software\Policies` an admin-only ACL (the account may only read it), once its profile
+exists after T3's first start.
 
 Anthropic's organisation-wide remote (server-managed) settings are delivered to Claude Code
 sessions signed in with a Claude for Teams or Enterprise account. T3's Claude authenticates
@@ -88,6 +91,9 @@ put them in place first:
 - **`t3.exe`** built from this fork, in an admin-owned folder (for example
   `C:\Program Files\T3Code\t3.exe`).
 
+Every pinned folder's ancestors, up to the drive root, must not let a non-administrator delete,
+rename or re-permission entries in them, so nobody can swap the folder out.
+
 These are **pinned copies used only by T3. They never update themselves.** The operator's
 everyday Claude Code in their own user folder is untouched and keeps updating as normal for
 their other sessions. To update a pinned binary, deliberately:
@@ -96,14 +102,18 @@ their other sessions. To update a pinned binary, deliberately:
 pwsh -NoProfile -File "$env:ProgramData\T3CodePolicy\installer\install-policy.ps1" -UpdatePinned Claude -From 'D:\reviewed\claude.exe' -ExpectedSha256 <sha256 of the new file>
 ```
 
-`-UpdatePinned Claude|T3|Node` stops every task, removes the verified marker, checks the new
-file (plain file, the SHA-256 you give), keeps the current binary as a backup in
+`-UpdatePinned Claude|T3|Node` needs `-ExpectedSha256` (only a rollback from
+`state\pinned-backup\` may leave it out). It stops every task, then stops every process of
+`t3agent` and `t3bridge` until none is left (Stop-ScheduledTask alone leaves `t3.exe` and
+Claude running), removes the verified marker, checks the new file (plain file, that SHA-256), keeps the current binary as a backup in
 `state\pinned-backup\`, writes the new one into the pinned path (CreateNew with a protected
 ACL: Administrators/SYSTEM full, Users read and execute), records the new SHA-256 in
 `t3-policy.json` and the old and new hashes in `state\pinned-updates.json`, runs the
 self-check, and starts T3 only on a full PASS. On any failure T3 stays stopped and it prints
 the rollback command (`-UpdatePinned <kind> -From <backup>`). Git is a whole install, not one
-file: upgrade the pinned Git in place with its own installer, then run
+file: upgrade the pinned Git in place with its own installer (the whole Git folder, `mingw64\bin`
+included, must stay admin-owned with no links; it is checked before `git --version` runs
+elevated), then run
 `-UpdatePinned Git -From 'C:\Program Files\Git\cmd\git.exe'` to verify and record it; to move
 Git elsewhere, re-run the install with `-GitExe`.
 

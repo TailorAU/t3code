@@ -317,19 +317,33 @@ Assert-True ($secret.Trim([char]0).Length -eq 0) 'the managed string copy is zer
 
 # Pinned binaries: the deliberate update plan.
 $backupDir = 'C:\ProgramData\T3CodePolicy\state\pinned-backup'
-$claudePlan = Get-PinnedUpdatePlan -Kind Claude -InstalledPath 'C:\Program Files\T3Code\claude\claude.exe' -FromPath 'D:\downloads\claude.exe' -BackupDir $backupDir
+$claudePlan = Get-PinnedUpdatePlan -Kind Claude -InstalledPath 'C:\Program Files\T3Code\claude\claude.exe' -FromPath 'D:\downloads\claude.exe' -BackupDir $backupDir -HasExpectedSha256
 $order = @($claudePlan.Steps | ForEach-Object Action)
 Assert-True ($null -eq $claudePlan.Refused) 'a Claude update is planned'
-Assert-True (($order -join ',') -eq 'StopTasks,RemoveMarker,CheckSource,BackupCurrent,WriteNew,RecordHash,LogUpdate,Verify,StartOnPass') "the update runs in order ($($order -join ','))"
+Assert-True (($order -join ',') -eq 'StopTasks,KillProcesses,KillProcesses,RemoveMarker,CheckSource,BackupCurrent,WriteNew,RecordHash,LogUpdate,Verify,StartOnPass') "the update runs in order ($($order -join ','))"
+Assert-True ((@($claudePlan.Steps | Where-Object Action -eq 'KillProcesses' | ForEach-Object Target) -join ',') -eq 't3agent,t3bridge') 'both service accounts are stopped until none is left'
+Assert-True ($order.IndexOf('KillProcesses') -lt $order.IndexOf('WriteNew') -and $order.IndexOf('KillProcesses') -gt $order.IndexOf('StopTasks')) 'processes are stopped after the tasks and before the swap'
 Assert-True ($order.IndexOf('BackupCurrent') -lt $order.IndexOf('WriteNew') -and $order.IndexOf('Verify') -lt $order.IndexOf('StartOnPass')) 'backup before the swap; start only after verify'
+Assert-True ($null -ne (Get-PinnedUpdatePlan -Kind Claude -InstalledPath 'C:\Program Files\T3Code\claude\claude.exe' -FromPath 'D:\downloads\claude.exe' -BackupDir $backupDir).Refused) 'a new Claude without -ExpectedSha256 is refused'
+Assert-True ($null -ne (Get-PinnedUpdatePlan -Kind T3 -InstalledPath 'C:\Program Files\T3Code\t3.exe' -FromPath "$backupDir-x\t3.exe" -BackupDir $backupDir).Refused) 'a sibling folder like pinned-backup-x is not the backup folder'
+Assert-True ($null -eq (Get-PinnedUpdatePlan -Kind T3 -InstalledPath 'C:\Program Files\T3Code\t3.exe' -FromPath "$backupDir\T3-1\t3.exe" -BackupDir $backupDir).Refused) 'a rollback from the backup folder needs no -ExpectedSha256'
 $gitPlan = Get-PinnedUpdatePlan -Kind Git -InstalledPath 'C:\Program Files\Git\cmd\git.exe' -FromPath 'C:\Program Files\Git\cmd\git.exe' -BackupDir $backupDir
 Assert-True ($null -eq $gitPlan.Refused -and @($gitPlan.Steps | Where-Object { $_.Action -in 'BackupCurrent', 'WriteNew' }).Count -eq 0) 'a Git update records the in-place upgrade, no copy'
 Assert-True ($null -ne (Get-PinnedUpdatePlan -Kind Git -InstalledPath 'C:\Program Files\Git\cmd\git.exe' -FromPath 'D:\PortableGit\cmd\git.exe' -BackupDir $backupDir).Refused) 'moving Git is refused (re-run the install with -GitExe)'
-Assert-True ($null -ne (Get-PinnedUpdatePlan -Kind Claude -InstalledPath 'C:\Program Files\T3Code\claude\claude.exe' -FromPath 'C:\Program Files\T3Code\claude\claude.exe' -BackupDir $backupDir).Refused) 'updating Claude from itself is refused'
-Assert-True ($null -ne (Get-PinnedUpdatePlan -Kind Node -InstalledPath $null -FromPath 'D:\node.exe' -BackupDir $backupDir).Refused) 'updating a binary that was never pinned is refused'
-Assert-True ($null -ne (Get-PinnedUpdatePlan -Kind T3 -InstalledPath 'C:\Program Files\T3Code\t3.exe' -FromPath 't3.exe' -BackupDir $backupDir).Refused) 'a relative source is refused'
+Assert-True ($null -ne (Get-PinnedUpdatePlan -Kind Claude -InstalledPath 'C:\Program Files\T3Code\claude\claude.exe' -FromPath 'C:\Program Files\T3Code\claude\claude.exe' -BackupDir $backupDir -HasExpectedSha256).Refused) 'updating Claude from itself is refused'
+Assert-True ($null -ne (Get-PinnedUpdatePlan -Kind Node -InstalledPath $null -FromPath 'D:\node.exe' -BackupDir $backupDir -HasExpectedSha256).Refused) 'updating a binary that was never pinned is refused'
+Assert-True ($null -ne (Get-PinnedUpdatePlan -Kind T3 -InstalledPath 'C:\Program Files\T3Code\t3.exe' -FromPath 't3.exe' -BackupDir $backupDir -HasExpectedSha256).Refused) 'a relative source is refused'
 $rollbackPlan = Get-PinnedUpdatePlan -Kind T3 -InstalledPath 'C:\Program Files\T3Code\t3.exe' -FromPath "$backupDir\T3-20261105T000000Z\t3.exe" -BackupDir $backupDir
 Assert-True ($null -eq $rollbackPlan.Refused -and $rollbackPlan.FromBackup) 'a rollback from the backup folder is the same update'
+
+# The agent's HKCU\Software\Policies check: a key with an ordinary (inherited, user-owned) ACL fails.
+$testKeyRoot = 'HKCU:\Software\T3PolicyTest-' + [guid]::NewGuid().ToString('N')
+New-Item -Path "$testKeyRoot\Software\Policies" -Force | Out-Null
+try {
+  $keyIssues = @(Get-UserPoliciesKeyIssues -Root $testKeyRoot -AccountSid ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value))
+  Assert-True ($keyIssues.Count -gt 0) "an ordinary Policies key is reported ($($keyIssues -join '; '))"
+} finally { Remove-Item -LiteralPath $testKeyRoot -Recurse -Force }
+Assert-True (@(Get-UserPoliciesKeyIssues -Root 'HKCU:\Software\T3PolicyTest-missing' -AccountSid 'S-1-5-21-9-1001')[0] -match 'missing') 'a missing Policies key is reported'
 
 # Emergency revoke: the plan, in order, touching only the expected targets.
 $tasks = [ordered]@{ Server = 'T3 server'; Bridge = 'T3 bridge'; Issuer = 'T3 token issuer'; Mover = 'T3 token mover'; Rotate = 'T3 key rotation'; RotateToken = 'T3 token rotate now'; Probe = 'T3 self-check probe' }

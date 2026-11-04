@@ -97,6 +97,7 @@ export function tailorClaudeManagedSettings(
     "~/.bashrc",
     "~/.bash_profile",
     "~/.bash_login",
+    "~/.bash_logout",
     "~/.profile",
     "~/.inputrc",
     "~/Documents/PowerShell/**",

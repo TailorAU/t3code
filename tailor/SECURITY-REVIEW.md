@@ -96,6 +96,7 @@ Severity: Critical, High, Medium, Low, Info. Status: Fixed (in this PR), Mitigat
 | T3-78 | Delta review 3: rotation proof, libuv note, `.git` links, kill counting, bridge attestation, PATH, four-tuple, managed-tier allowlist, race coverage | Medium | Fixed (UNVERIFIED elevated where noted) |
 | T3-79 | Lows from review 4: policy drop-ins and registry, probe result forgery, `.cmd` launches, probe SQOS and busy, missing-account kill, shell profiles, pipe WRITE_DAC, stricter task results | Low | Fixed (UNVERIFIED elevated where noted) |
 | T3-80 | No deliberate update path for the pinned binaries | Medium | Fixed (`-UpdatePinned`; UNVERIFIED elevated) |
+| T3-81 | Final review: update kills processes, required hash, Git tree, ancestor chains, agent HKCU policies, shell gate | Medium | Fixed (UNVERIFIED elevated) |
 
 ## Findings
 
@@ -1050,6 +1051,26 @@ fails on a task whose last result is a failure.
 - The pipe check also refuses WRITE_DAC or WRITE_OWNER for t3bridge and SYSTEM.
 - Once a verified marker exists, the self-check accepts only success or running for the T3
   server task and only success for the probe tasks.
+
+### T3-81 Final review fixes (Medium, Fixed; UNVERIFIED elevated)
+
+- `-UpdatePinned` stops every process of both service accounts until none is left (failing
+  after ten rounds) before the swap; Stop-ScheduledTask alone left `t3.exe` and Claude running.
+- `-ExpectedSha256` is required for a new Claude, `t3.exe` or node, except for a rollback from
+  inside `state\pinned-backup\` (a separator-terminated prefix, so `pinned-backup-x\` does not
+  count).
+- Before running a new git elevated, the whole Git install (`mingw64\bin` included) must be
+  admin-owned with no non-admin write and no links.
+- The update's own verification runs with the marker removed and the tasks stopped, so the
+  stricter task-result rule applies from the next `verify-install.ps1` run.
+- The install and the update check every pinned folder's ancestor chain: no non-admin may
+  delete, rename or re-permission entries in them.
+- `t3agent`'s `HKCU\Software\Policies` gets an admin-only ACL; the self-check loads the hive
+  when it is not loaded instead of skipping it.
+- The shell gate allows only `shell: true`, and documents that only the program is validated:
+  callers must never put agent or user text into a shell command (batch files re-parse their
+  arguments, so escaping cannot make it safe).
+- Claude may not edit `~/.bash_logout`.
 
 ### T3-80 Updating pinned binaries (Medium, Fixed; UNVERIFIED elevated)
 

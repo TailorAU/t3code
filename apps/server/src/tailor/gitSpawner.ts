@@ -232,7 +232,14 @@ export function tailorCommand(
   const env = envOf(command);
   const windows = policy.platform === "win32";
   if (windows && command.options.shell) {
+    // Only `shell: true` (cmd.exe). A shell given by path or name is refused.
+    if (command.options.shell !== true) return { refused: "Only shell: true is allowed." };
     // resolveSpawnCommand resolves and quotes the program before a shell launch.
+    // NOTE: only the PROGRAM is validated here. The arguments after it are passed to cmd.exe
+    // as resolveSpawnCommand escaped them and are NOT checked: callers must never put agent or
+    // user text into a shell: true command. escapeWindowsShellArg caret-escapes cmd meta
+    // characters, but batch files re-parse their arguments ("BatBadBut", CVE-2024-24576
+    // class), so escaping cannot make untrusted text safe in a .cmd or .bat.
     const program = firstShellToken(command.command);
     if (!NodePath.win32.isAbsolute(program) || !policy.isFile(program)) {
       return { refused: `A shell command must start with an existing absolute program path (${program}).` };

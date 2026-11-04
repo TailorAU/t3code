@@ -365,6 +365,9 @@ describe("Tailor git hardening", () => {
       // With the policy installed the program's folder must be one of its admin-owned PATH folders.
       assert.isTrue("command" in TailorGitSpawner.tailorCommand(command, { ...base, serverPath: [folder] }));
       assert.isTrue("refused" in TailorGitSpawner.tailorCommand(command, { ...base, serverPath: ["C:\\Windows\\System32"] }));
+      // Only shell: true; a shell named by path is refused.
+      const named = ChildProcess.make(resolved.command, [], { shell: "C:\\Windows\\System32\\cmd.exe" });
+      assert.isTrue("refused" in TailorGitSpawner.tailorCommand(named, base));
     }),
   );
 });

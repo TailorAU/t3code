@@ -422,6 +422,45 @@ function Get-BytesSha256([byte[]] $bytes) {
 
 function Get-FileSha256([string] $path) { return Get-BytesSha256 ([IO.File]::ReadAllBytes($path)) }
 
+<#
+  Every ancestor of a pinned folder, up to the drive root: no non-administrator may delete,
+  rename or re-permission anything in it (DELETE_CHILD, DELETE, WRITE_DAC, WRITE_OWNER,
+  GENERIC_ALL), so nobody can swap the folder out. Creating new folders (as Users may at C:\)
+  does not let anyone replace an existing one, so it is allowed.
+#>
+function Assert-AdminAncestorChain([string] $folder) {
+  $swapMask = 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000
+  $current = Split-Path -Parent ([IO.Path]::GetFullPath($folder).TrimEnd('\'))
+  while ($current) {
+    [void](Assert-NotReparse $current)
+    $acl = Get-Acl -LiteralPath $current
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+      if ($rule.AccessControlType -ne $Allow -or $AdminOwners -contains $rule.IdentityReference) { continue }
+      if (($rule.PropagationFlags -band $PropagateInheritOnly) -ne 0) { continue }
+      # CREATOR OWNER applies only to what each user created themselves.
+      if ($rule.IdentityReference.Value -eq 'S-1-3-0') { continue }
+      if (([int64]$rule.FileSystemRights -band $swapMask) -ne 0) {
+        throw "Refusing: $($rule.IdentityReference) may delete or re-permission entries in $current, an ancestor of $folder."
+      }
+    }
+    $parent = Split-Path -Parent $current
+    if (-not $parent -or $parent -eq $current) { break }
+    $current = $parent
+  }
+}
+
+<# A whole install tree (Git): admin-owned, no non-admin write, no links anywhere in it. #>
+function Assert-AdminControlledTree([string] $root) {
+  Assert-AdminControlled $root -SkipParent
+  $stack = [System.Collections.Generic.Stack[string]]::new(); $stack.Push($root)
+  while ($stack.Count -gt 0) {
+    foreach ($child in Get-ChildItem -LiteralPath $stack.Pop() -Force) {
+      Assert-AdminControlled $child.FullName -SkipParent   # also refuses a reparse point
+      if ($child.PSIsContainer) { $stack.Push($child.FullName) }
+    }
+  }
+}
+
 function Resolve-Executable([string] $label, [string] $value) {
   if (-not $value) { throw "-$label is required." }
   if (-not [IO.Path]::IsPathRooted($value)) { throw "-$label must be a full path." }
@@ -429,7 +468,20 @@ function Resolve-Executable([string] $label, [string] $value) {
   if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "Not found: $full" }
   if ([IO.Path]::GetExtension($full) -ne '.exe') { throw "-$label must be an .exe: $full" }
   Assert-AdminControlled $full
+  Assert-AdminAncestorChain (Split-Path -Parent $full)
   return $full
+}
+
+# Stops the account's processes in rounds until none is found; fails after ten rounds.
+function Stop-AccountUntilNone([string] $name) {
+  $total = 0
+  for ($round = 1; $round -le 10; $round++) {
+    $pass = Stop-AccountProcesses $name
+    $total += $pass.Stopped
+    if ($pass.Found -eq 0) { return $total }
+    Start-Sleep -Milliseconds 500
+  }
+  throw "processes of $name remain after 10 rounds ($($pass.Found - $pass.Stopped) could not be stopped)"
 }
 
 # Claude permission-rule form of an absolute path (matches claudeDenyRules.ts).
@@ -705,7 +757,8 @@ if ($UpdatePinned) {
   $pathKey = $pinnedKeys[$UpdatePinned][0]; $hashKey = $pinnedKeys[$UpdatePinned][1]
   $pinned = if ($previousInstalled.PSObject.Properties[$pathKey]) { [string]$previousInstalled.$pathKey } else { $null }
   $backupRoot = Join-Path $StateDir 'pinned-backup'
-  $update = Get-PinnedUpdatePlan -Kind $UpdatePinned -InstalledPath $pinned -FromPath $From -BackupDir $backupRoot
+  $update = Get-PinnedUpdatePlan -Kind $UpdatePinned -InstalledPath $pinned -FromPath $From -BackupDir $backupRoot `
+    -HasExpectedSha256:($null -ne $fromSha256) -Accounts @($AgentAccount, $BridgeAccount)
   if ($update.Refused) { throw "$($update.Refused) Nothing was changed." }
   $oldHash = if ($previousInstalled.PSObject.Properties[$hashKey]) { [string]$previousInstalled.$hashKey } else { $null }
   $backupPath = Join-Path (Join-Path $backupRoot ("$UpdatePinned-" + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ'))) (Split-Path -Leaf $pinned)
@@ -720,6 +773,7 @@ if ($UpdatePinned) {
             if (Get-ScheduledTask -TaskName $task -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue) { Stop-ScheduledTask -TaskName $task -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue }
           }
         }
+        'KillProcesses' { Write-Host "    $(Stop-AccountUntilNone $step.Target) stopped; none left" }
         'RemoveMarker' { if (Test-Path -LiteralPath $MarkerPath) { [IO.File]::Delete($MarkerPath) } }
         'CheckSource' {
           $source = Get-Item -LiteralPath $From -Force
@@ -727,12 +781,17 @@ if ($UpdatePinned) {
           $newHash = Get-FileSha256 $From
           if ($fromSha256 -and $newHash -ne $fromSha256) { throw "$From has SHA-256 $newHash, not the expected $fromSha256." }
           if ($UpdatePinned -eq 'Git') {
-            Assert-AdminControlled $From
+            # The whole Git install (the parent of cmd\), mingw64\bin included, before running
+            # anything from it elevated.
+            $gitRoot = Split-Path -Parent (Split-Path -Parent $From)
+            Assert-AdminControlledTree $gitRoot
+            Assert-AdminAncestorChain $gitRoot
             $version = (& $From --version)
             if (-not (Test-GitVersionAtLeast -VersionText $version -Minimum $MinimumGitVersion)) { throw "$version is older than $MinimumGitVersion." }
           }
           [void](Assert-NotReparse $pinned)
           Assert-AdminControlled (Split-Path -Parent $pinned) -SkipParent
+          Assert-AdminAncestorChain (Split-Path -Parent $pinned)
         }
         'BackupCurrent' {
           Ensure-PlannedDirectory ([pscustomobject]@{ Name = 'pinned-backup'; Path = $backupRoot; Grants = @() })
@@ -775,6 +834,9 @@ if ($UpdatePinned) {
           Write-ProtectedFile $logPath (Get-Utf8Bytes ((ConvertTo-Json -InputObject @($log) -Depth 4) + "`n"))
         }
         'Verify' {
+          # The marker was removed and the tasks stopped for the swap, so the stricter
+          # task-result rule (which needs a running server) does not apply here; it applies on
+          # the next verify-install.ps1 run, once the marker exists again.
           if (-not (& $verifyBlock -AlreadyLoaded)) { throw 'verify-install.ps1 FAILED after the update.' }
         }
         'StartOnPass' {
@@ -818,15 +880,7 @@ if ($EmergencyRevoke) {
         'StopTask' { Stop-ScheduledTask -TaskName $step.Target -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue }
         'KillProcesses' {
           # Until none is left: a task restart or a child could otherwise slip through.
-          $total = 0; $left = -1
-          for ($round = 1; $round -le 10; $round++) {
-            $pass = Stop-AccountProcesses $step.Target
-            $total += $pass.Stopped
-            $left = $pass.Found - $pass.Stopped
-            if ($pass.Found -eq 0) { break }
-            Start-Sleep -Milliseconds 500
-          }
-          if ($pass.Found -ne 0) { throw "processes of $($step.Target) remain after 10 rounds ($left could not be stopped)" }
+          $total = Stop-AccountUntilNone $step.Target
           $line += " ($total stopped; none left)"
         }
         'RecordRevokeStart' {
@@ -1014,8 +1068,10 @@ if (-not (Test-GitVersionAtLeast -VersionText $gitVersion -Minimum $MinimumGitVe
 # Settings in the machine tier that loosen T3's lock for every session, or a Claude policy in
 # the registry, would win over T3's own lock: refuse until an administrator removes them.
 $existingAgent = Get-LocalUser -Name $AgentAccount -ErrorAction SilentlyContinue
-$looseners = Get-ClaudePolicySourceLooseners -ManagedSettingsPath $MachineManagedSettingsPath `
-  -AgentSid $(if ($existingAgent) { $existingAgent.SID.Value } else { '' })
+$looseners = if ($existingAgent) {
+  Invoke-WithUserHive -Sid $existingAgent.SID.Value -Body { param($root) Get-ClaudePolicySourceLooseners -ManagedSettingsPath $MachineManagedSettingsPath -AgentHiveRoot $root }
+} else { Get-ClaudePolicySourceLooseners -ManagedSettingsPath $MachineManagedSettingsPath }
+$looseners = @($looseners)
 if ($looseners.Count -gt 0) {
   throw "Claude policy settings outside the allowlist apply to every Claude session, T3's included:`n  $($looseners -join "`n  ")`nRemove them deliberately and re-run. Nothing was changed."
 }
@@ -1349,6 +1405,22 @@ if ($RotateConnectorToken -and $PSCmdlet.ShouldProcess("\T3CodePolicy\$($Tasks.R
   Write-Host '  connector token rotated: every previous connector session revoked; the mover places the new token within ten minutes'
 } elseif ((-not (Test-Path -LiteralPath $TokenPath)) -and $PSCmdlet.ShouldProcess("\T3CodePolicy\$($Tasks.Issuer)", 'Issue a connector token now (moved into connector\ within ten minutes)')) {
   Start-ScheduledTask -TaskName $Tasks.Issuer -TaskPath '\T3CodePolicy\'
+}
+
+# t3agent's own HKCU\Software\Policies: admin-only, so it cannot give itself a Claude policy.
+# Its profile exists once the server task has logged it on.
+if ($PSCmdlet.ShouldProcess("HKCU of $AgentAccount", 'Admin-only Software\Policies')) {
+  $profileReady = $false
+  for ($i = 0; $i -lt 30 -and -not $profileReady; $i++) {
+    $profileReady = $null -ne (Get-CimInstance Win32_UserProfile -Filter "SID='$($SidMap.agent)'" -ErrorAction SilentlyContinue)
+    if (-not $profileReady) { Start-Sleep -Seconds 2 }
+  }
+  if ($profileReady) {
+    Invoke-WithUserHive -Sid $SidMap.agent -Body { param($root) if ($root) { Set-UserPoliciesKeyAcl -Root $root -AccountSid $SidMap.agent } }
+    Write-Host "  $AgentAccount's HKCU\Software\Policies is admin-only"
+  } else {
+    Write-Warning "$AgentAccount has no profile yet: re-run the install once T3 has started to lock its HKCU\Software\Policies (the self-check reports it)."
+  }
 }
 
 Write-Host ''

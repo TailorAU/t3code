@@ -430,9 +430,19 @@ Invoke-Check 'firewall' {
 # ---------- machine managed settings ----------
 Invoke-Check 'managed-loosening' {
   $path = if ($installed.PSObject.Properties['machineManagedSettings']) { $installed.machineManagedSettings.path } else { 'C:\Program Files\ClaudeCode\managed-settings.json' }
-  $found = Get-ClaudePolicySourceLooseners -ManagedSettingsPath $path -AgentSid $agentSid
-  if (@($found).Count -gt 0) { throw (@($found) -join '; ') }
-  'the machine file, managed-settings.d drop-ins and the HKLM/HKCU policy keys hold only allowlisted keys'
+  # The agent's own HKCU, loaded for the check when it is not loaded.
+  $agentState = Invoke-WithUserHive -Sid $agentSid -Body {
+    param($root)
+    [pscustomobject]@{
+      Found = @(Get-ClaudePolicySourceLooseners -ManagedSettingsPath $path -AgentHiveRoot $root)
+      Policies = if ($root) { @(Get-UserPoliciesKeyIssues -Root $root -AccountSid $agentSid) } else { @('no profile yet') }
+    }
+  }
+  if (@($agentState.Found).Count -gt 0) { throw (@($agentState.Found) -join '; ') }
+  $policiesIssues = @($agentState.Policies | Where-Object { $_ -ne 'no profile yet' })
+  if ($policiesIssues.Count -gt 0) { throw "the agent's HKCU\Software\Policies: $($policiesIssues -join '; ')" }
+  $note = if (@($agentState.Policies) -contains 'no profile yet') { '; the agent has no profile yet (locked after its first start)' } else { "; the agent's HKCU\Software\Policies is admin-only" }
+  "the machine file, managed-settings.d drop-ins and the HKLM/HKCU policy keys hold only allowlisted keys$note"
 }
 
 Invoke-Check 'managed' {
@@ -504,7 +514,7 @@ Invoke-Check 'git-hooks' {
     foreach ($n in @(Get-ChildItem Env: | Where-Object { $_.Name -like 'GIT_CONFIG_*' } | ForEach-Object Name)) { Remove-Item -LiteralPath "Env:$n" -ErrorAction SilentlyContinue }
     Remove-Item -LiteralPath $repo -Recurse -Force -ErrorAction SilentlyContinue
   }
-  "$version; hooks folder and global config empty; a repository hook does not run with the T3 git settings\"
+  "$version; hooks folder and global config empty; a repository hook does not run with the T3 git settings"
 }
 
 # ---------- signing key after a revoke ----------

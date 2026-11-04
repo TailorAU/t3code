@@ -226,11 +226,11 @@ function Get-RegistryPolicyLooseners {
 <#
   Every Claude Code policy source on this machine checked against the allowlist: the machine
   file, every managed-settings.d\*.json drop-in beside it, and the registry policy keys
-  (HKLM, the administrator's HKCU, and the agent account's HKCU when its hive is loaded).
+  (HKLM, the administrator's HKCU, and the agent account's HKCU, whose hive the caller loads).
   Returns "source: key" strings; empty means nothing loosens the lock. Reads only.
 #>
 function Get-ClaudePolicySourceLooseners {
-  param([Parameter(Mandatory)][string] $ManagedSettingsPath, [string] $AgentSid)
+  param([Parameter(Mandatory)][string] $ManagedSettingsPath, [string] $AgentHiveRoot)
   $found = [System.Collections.Generic.List[string]]::new()
   if (Test-Path -LiteralPath $ManagedSettingsPath) {
     foreach ($item in (Get-ManagedSettingsLooseners ([IO.File]::ReadAllText($ManagedSettingsPath)))) { $found.Add("${ManagedSettingsPath}: $item") }
@@ -244,7 +244,7 @@ function Get-ClaudePolicySourceLooseners {
     }
   }
   $keys = @('HKLM:\SOFTWARE\Policies\ClaudeCode', 'HKCU:\SOFTWARE\Policies\ClaudeCode')
-  if ($AgentSid) { $keys += "Registry::HKEY_USERS\$AgentSid\SOFTWARE\Policies\ClaudeCode" }
+  if ($AgentHiveRoot) { $keys += "$AgentHiveRoot\SOFTWARE\Policies\ClaudeCode" }
   foreach ($key in $keys) {
     if (-not (Test-Path -LiteralPath $key)) { continue }
     $item = Get-Item -LiteralPath $key

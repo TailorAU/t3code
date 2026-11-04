@@ -64,7 +64,22 @@ const SVG_CONTENT_SECURITY_POLICY = "default-src 'none'; style-src 'unsafe-inlin
  * Tailor fork: the served web app may connect only to its own origin, and loads images only
  * from it, so rendered agent output cannot beacon data out through image URLs.
  */
-export const TAILOR_WEB_APP_CONTENT_SECURITY_POLICY = "connect-src 'self'; img-src 'self' data: blob:";
+export const TAILOR_WEB_APP_CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  "script-src 'self'",
+  // The UI and its code highlighter set inline styles.
+  "style-src 'self' 'unsafe-inline'",
+  "font-src 'self' data:",
+  "media-src 'self' blob:",
+  "connect-src 'self'",
+  "img-src 'self' data: blob:",
+  "frame-src 'none'",
+  "worker-src 'self' blob:",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+].join("; ");
 
 const HTML_CONTENT_SECURITY_POLICY =
   "sandbox allow-scripts allow-forms allow-popups allow-downloads";

@@ -36,10 +36,18 @@ export type BuiltInDriversEnv =
  */
 export const TAILOR_CURSOR_DRIVER_ENABLED = false as boolean;
 
+/**
+ * Tailor fork: the build runs Claude only. Every other driver is left out at compile time, so
+ * no user setting can enable it. Flip only in a reviewed PR that extends the policy and egress.
+ */
+export const TAILOR_CLAUDE_ONLY = true as boolean;
+
 const withoutDisabledDrivers = <D>(drivers: ReadonlyArray<D>): ReadonlyArray<D> =>
-  TAILOR_CURSOR_DRIVER_ENABLED
-    ? drivers
-    : drivers.filter((driver) => (driver as unknown) !== CursorDriver);
+  TAILOR_CLAUDE_ONLY
+    ? drivers.filter((driver) => (driver as unknown) === ClaudeDriver)
+    : TAILOR_CURSOR_DRIVER_ENABLED
+      ? drivers
+      : drivers.filter((driver) => (driver as unknown) !== CursorDriver);
 
 export const BUILT_IN_DRIVERS: ReadonlyArray<AnyProviderDriver<BuiltInDriversEnv>> =
   withoutDisabledDrivers<AnyProviderDriver<BuiltInDriversEnv>>([

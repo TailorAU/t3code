@@ -1,3 +1,4 @@
+#Requires -Version 7.2
 <#
 .SYNOPSIS
   Installs the T3 Code lock-down policy on one Windows machine. Run once, elevated.
@@ -72,14 +73,22 @@ param(
   [ValidateSet('Resolve', 'LoopbackOnly')][string] $ClaudeEgress = 'Resolve',
   [string] $ExpectedSha256,
   [string] $RuleGroup = 'T3 Code egress policy',
+  # The T3 home of the account that runs t3 serve (its base dir). Defaults to <profile>\.t3.
+  [string] $T3Home,
+  # Claude Code's machine-wide admin tier. Affects EVERY Claude session on the PC; the
+  # installer only adds deny entries for the T3 home and the policy folder.
+  [string] $MachineManagedSettingsPath = 'C:\Program Files\ClaudeCode\managed-settings.json',
+  [switch] $SkipMachineManagedSettings,
   [switch] $Uninstall
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-# The server reads the policy from this fixed path (tailorPolicyMarkerPath in ClaudeAdapterV2.ts).
-$PolicyDir = Join-Path $env:ProgramData 'T3CodePolicy'
+# The server reads the policy from the ProgramData known folder, not the ProgramData
+# environment variable (machinePolicy.ts); this does the same.
+$ProgramDataFolder = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+$PolicyDir = Join-Path $ProgramDataFolder 'T3CodePolicy'
 $ClaudeConfigDir = Join-Path $PolicyDir $ClaudeHomeName
 $InstallerDir = Join-Path $PolicyDir 'installer'
 
@@ -177,24 +186,28 @@ function Resolve-AllowedHosts([string[]] $hosts) {
 $SidAdministrators = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
 $SidSystem = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
 $SidUsers = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')
+$SidTrustedInstaller = New-Object Security.Principal.SecurityIdentifier('S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+$AdminOwners = @($SidAdministrators, $SidSystem, $SidTrustedInstaller)
 
-function New-ProtectedSecurity([bool] $isDirectory, [string] $readUser, [string] $modifyUser) {
+$InheritAll = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+$InheritNone = [Security.AccessControl.InheritanceFlags]::None
+$PropagateNone = [Security.AccessControl.PropagationFlags]::None
+$PropagateInheritOnly = [Security.AccessControl.PropagationFlags]::InheritOnly
+$Allow = [Security.AccessControl.AccessControlType]::Allow
+$RightsFull = [Security.AccessControl.FileSystemRights]::FullControl
+$RightsRead = [Security.AccessControl.FileSystemRights]::ReadAndExecute
+$RightsModify = [Security.AccessControl.FileSystemRights]::Modify
+
+# Administrators and SYSTEM full, inheritance off, owner Administrators. -UsersRead adds
+# BUILTIN\Users read (the policy folder only, so the server can read t3-policy.json).
+function New-AdminOnlySecurity([bool] $isDirectory, [switch] $UsersRead) {
   $security = if ($isDirectory) { New-Object Security.AccessControl.DirectorySecurity } else { New-Object Security.AccessControl.FileSecurity }
   $security.SetAccessRuleProtection($true, $false)
   $security.SetOwner($SidAdministrators)
-  $inherit = if ($isDirectory) { [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit' } else { [Security.AccessControl.InheritanceFlags]::None }
-  $none = [Security.AccessControl.PropagationFlags]::None
-  $allow = [Security.AccessControl.AccessControlType]::Allow
-  $full = [Security.AccessControl.FileSystemRights]::FullControl
-  $read = [Security.AccessControl.FileSystemRights]::ReadAndExecute
-  $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($SidAdministrators, $full, $inherit, $none, $allow)))
-  $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($SidSystem, $full, $inherit, $none, $allow)))
-  $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($SidUsers, $read, $inherit, $none, $allow)))
-  if ($readUser) { $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($readUser, $read, $inherit, $none, $allow))) }
-  if ($modifyUser) {
-    $modify = [Security.AccessControl.FileSystemRights]::Modify
-    $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($modifyUser, $modify, $inherit, $none, $allow)))
-  }
+  $inherit = if ($isDirectory) { $InheritAll } else { $InheritNone }
+  $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($SidAdministrators, $RightsFull, $inherit, $PropagateNone, $Allow)))
+  $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($SidSystem, $RightsFull, $inherit, $PropagateNone, $Allow)))
+  if ($UsersRead) { $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($SidUsers, $RightsRead, $inherit, $PropagateNone, $Allow))) }
   return $security
 }
 
@@ -204,93 +217,146 @@ function Assert-SafeExisting([string] $path) {
     throw "Refusing to use $path : it is a reparse point (junction or symbolic link). Remove it and re-run."
   }
   $owner = (Get-Acl -LiteralPath $path).GetOwner([Security.Principal.SecurityIdentifier])
-  if ($owner -ne $SidAdministrators -and $owner -ne $SidSystem) {
+  if ($AdminOwners -notcontains $owner) {
     throw "Refusing to use $path : owned by $owner, not Administrators or SYSTEM. Remove it and re-run."
   }
 }
 
-# Creates the folder with its protected ACL in one call, or checks and resets an existing one.
-function Ensure-ProtectedDirectory([string] $path, [string] $modifyUser) {
-  $security = New-ProtectedSecurity $true $null $modifyUser
+# Creates the folder with its protected ACL in the same call, or checks and resets an existing one.
+function Ensure-AdminOnlyDirectory([string] $path, [switch] $UsersRead) {
+  $security = New-AdminOnlySecurity $true -UsersRead:$UsersRead
   if (Test-Path -LiteralPath $path) {
     Assert-SafeExisting $path
-    if ($PSCmdlet.ShouldProcess($path, 'Reset ACL (Administrators/SYSTEM full, Users read' + $(if ($modifyUser) { ", $modifyUser modify" } else { '' }) + ')')) {
+    if ($PSCmdlet.ShouldProcess($path, 'Reset ACL to Administrators/SYSTEM' + $(if ($UsersRead) { ' (Users read)' } else { ' only' }))) {
       Set-Acl -LiteralPath $path -AclObject $security
     }
     return
   }
-  if ($PSCmdlet.ShouldProcess($path, 'Create directory with protected ACL')) {
-    if ($PSVersionTable.PSEdition -eq 'Desktop') {
-      [void][IO.Directory]::CreateDirectory($path, $security)
-    } else {
-      [void][IO.FileSystemAclExtensions]::Create((New-Object IO.DirectoryInfo($path)), $security)
-    }
+  if ($PSCmdlet.ShouldProcess($path, 'Create directory with an admin-only ACL')) {
+    [void][IO.FileSystemAclExtensions]::Create([IO.DirectoryInfo]::new($path), $security)
     Assert-SafeExisting $path
   }
 }
 
-# Replaces a file inside a protected folder: deletes whatever is there (so a planted hard
-# link or reparse point is removed, never written through), then writes and locks the new file.
-function Write-ProtectedFile([string] $path, [string] $content, [string] $readUser) {
+# Replaces a file inside an admin-only folder: deletes whatever is there (a planted link is
+# removed, never written through), creates the new file with CreateNew, then sets its ACL.
+function Write-AdminOnlyFile([string] $path, [byte[]] $bytes, [switch] $UsersRead) {
   $current = $null
   if (Test-Path -LiteralPath $path) {
     $item = Get-Item -LiteralPath $path -Force
-    if (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { $current = [IO.File]::ReadAllText($path) }
+    if (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { $current = [IO.File]::ReadAllBytes($path) }
   }
-  if ($current -eq $content) {
+  if ($null -ne $current -and [Linq.Enumerable]::SequenceEqual([byte[]]$current, $bytes)) {
     Write-Host "  unchanged: $path"
   } elseif ($PSCmdlet.ShouldProcess($path, 'Replace file')) {
     if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
-    [IO.File]::WriteAllText($path, $content, (New-Object Text.UTF8Encoding($false)))
+    $stream = [IO.FileStream]::new($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
   }
-  if ((Test-Path -LiteralPath $path) -and $PSCmdlet.ShouldProcess($path, 'Reset file ACL (read-only to non-admins)')) {
-    Set-Acl -LiteralPath $path -AclObject (New-ProtectedSecurity $false $readUser $null)
+  if ((Test-Path -LiteralPath $path) -and $PSCmdlet.ShouldProcess($path, 'Set file ACL (admin-only' + $(if ($UsersRead) { ', Users read' } else { '' }) + ')')) {
+    Set-Acl -LiteralPath $path -AclObject (New-AdminOnlySecurity $false -UsersRead:$UsersRead)
   }
 }
 
+function Get-Utf8Bytes([string] $text) { return [Text.UTF8Encoding]::new($false).GetBytes($text) }
+
 function Set-MachineVariable([string] $name, [string] $value) {
+  if ($name -notmatch '^T3CODE_[A-Z0-9_]+$') { throw "Refusing machine variable '$name': only T3CODE_* names are allowed." }
   $current = [Environment]::GetEnvironmentVariable($name, 'Machine')
   if ($current -eq $value) { Write-Host "  unchanged: $name"; return }
   $action = if ($null -eq $value) { 'Remove machine variable' } else { "Set machine variable to '$value'" }
   if ($PSCmdlet.ShouldProcess($name, $action)) {
     [Environment]::SetEnvironmentVariable($name, $value, 'Machine')
   }
-  $user = [Environment]::GetEnvironmentVariable($name, 'User')
-  if ($null -ne $value -and $null -ne $user -and $user -ne $value) {
-    Write-Warning "$name is also set for the current user ('$user'). The connector passes the policy value explicitly."
+}
+
+function Get-BytesSha256([byte[]] $bytes) {
+  return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+}
+
+# The binary and its folder must be owned by an admin principal and give no write to anyone else.
+function Assert-AdminControlledBinary([string] $path) {
+  # WriteData/CreateFiles, AppendData/CreateDirectories, WriteExtendedAttributes, DeleteSubdirectoriesAndFiles,
+  # WriteAttributes, Delete, ChangePermissions, TakeOwnership, GENERIC_ALL, GENERIC_WRITE.
+  $writeMask = 0x2 -bor 0x4 -bor 0x10 -bor 0x40 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+  foreach ($target in @($path, (Split-Path -Parent $path))) {
+    $acl = Get-Acl -LiteralPath $target
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier])
+    if ($AdminOwners -notcontains $owner) { throw "Refusing $target : owned by $owner, not an administrator principal." }
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+      if ($rule.AccessControlType -ne $Allow) { continue }
+      if ($AdminOwners -contains $rule.IdentityReference) { continue }
+      # An inherit-only entry (such as CREATOR OWNER) does not apply to the object itself.
+      if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
+      if (([int64]$rule.FileSystemRights -band $writeMask) -ne 0) {
+        throw "Refusing $target : $($rule.IdentityReference) can write it. Put the binary in an admin-only folder."
+      }
+    }
   }
 }
 
-function Get-FileSha256([string] $path) {
-  # Not Get-FileHash: Windows PowerShell 5.1 skips it under -WhatIf.
-  $sha = [Security.Cryptography.SHA256]::Create()
-  try { $bytes = $sha.ComputeHash([IO.File]::ReadAllBytes($path)) } finally { $sha.Dispose() }
-  return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+# Claude permission-rule form of an absolute path (matches claudeDenyRules.ts).
+function ConvertTo-ClaudeRulePath([string] $path) {
+  $posix = $path.Replace('\', '/').TrimEnd('/')
+  if ($posix -match '^([A-Za-z]):/(.*)$') { return '//' + $Matches[1].ToLowerInvariant() + '/' + $Matches[2] }
+  return '/' + $posix
 }
 
 # ---------- main ----------
 Assert-Elevated
 $scriptPath = $MyInvocation.MyCommand.Path
+$runningProtected = $scriptPath.StartsWith($InstallerDir + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
 if (-not $PolicyTemplate) { $PolicyTemplate = Join-Path (Split-Path -Parent $scriptPath) 't3-policy.template.json' }
+$mergeModule = Join-Path (Split-Path -Parent $scriptPath) 'ManagedSettingsMerge.psm1'
 
-# 0. Integrity: hash check, then a protected copy of the installer.
-$scriptHash = Get-FileSha256 $scriptPath
-$templateHash = Get-FileSha256 $PolicyTemplate
-Write-Host "Installer SHA-256: script=$scriptHash,template=$templateHash"
+# 0. Integrity. Read each file once; hash and use the same bytes.
+$scriptBytes = [IO.File]::ReadAllBytes($scriptPath)
+$templateBytes = [IO.File]::ReadAllBytes($PolicyTemplate)
+$moduleBytes = [IO.File]::ReadAllBytes($mergeModule)
+$scriptHash = Get-BytesSha256 $scriptBytes
+$templateHash = Get-BytesSha256 $templateBytes
+$moduleHash = Get-BytesSha256 $moduleBytes
+Write-Host "Installer SHA-256: script=$scriptHash,template=$templateHash,module=$moduleHash"
 if ($ExpectedSha256) {
   $expected = @{}
   foreach ($pair in $ExpectedSha256.Split(',')) { $kv = $pair.Split('=', 2); if ($kv.Length -eq 2) { $expected[$kv[0].Trim()] = $kv[1].Trim().ToLowerInvariant() } }
-  if ($expected['script'] -ne $scriptHash -or $expected['template'] -ne $templateHash) {
-    throw 'Hash mismatch: this installer or its template is not the reviewed version. Nothing was changed.'
+  if ($expected['script'] -ne $scriptHash -or $expected['template'] -ne $templateHash -or $expected['module'] -ne $moduleHash) {
+    throw 'Hash mismatch: this installer, its template or its module is not the reviewed version. Nothing was changed.'
   }
-} elseif (-not $scriptPath.StartsWith($InstallerDir, [StringComparison]::OrdinalIgnoreCase)) {
-  Write-Warning 'No -ExpectedSha256 given. Pass the hashes from the reviewed commit for a first install.'
+} elseif (-not $runningProtected) {
+  throw 'Pass -ExpectedSha256 script=<hex>,template=<hex>,module=<hex> from the reviewed commit. Only the protected copy may run without it.'
+}
+$policy = [Text.UTF8Encoding]::new($false).GetString($templateBytes) | ConvertFrom-Json
+Import-Module $mergeModule -Force
+
+# Copy into the admin-only installer folder first and run from there.
+if (-not $runningProtected -and -not $Uninstall) {
+  Ensure-AdminOnlyDirectory $PolicyDir -UsersRead
+  Ensure-AdminOnlyDirectory $InstallerDir
+  Write-AdminOnlyFile (Join-Path $InstallerDir 'install-policy.ps1') $scriptBytes
+  Write-AdminOnlyFile (Join-Path $InstallerDir 't3-policy.template.json') $templateBytes
+  Write-AdminOnlyFile (Join-Path $InstallerDir 'ManagedSettingsMerge.psm1') $moduleBytes
+  if (-not $WhatIfPreference) {
+    Write-Host "Continuing from the protected copy in $InstallerDir"
+    $forward = @{} + $PSBoundParameters
+    $forward.Remove('PolicyTemplate') | Out-Null
+    & (Join-Path $InstallerDir 'install-policy.ps1') @forward
+    exit $LASTEXITCODE
+  }
+  Write-Warning 'Preview: a real run continues from the protected copy.'
 }
 
-$policy = Get-Content -LiteralPath $PolicyTemplate -Raw | ConvertFrom-Json
 $serverVariables = @($policy.serverEnvironment.PSObject.Properties)
+foreach ($variable in $serverVariables) {
+  if ($variable.Name -notmatch '^T3CODE_[A-Z0-9_]+$') { throw "Template serverEnvironment has a non-T3CODE name: $($variable.Name)" }
+}
 
 # Validate every input before changing anything.
+$installedPath = Join-Path $PolicyDir 't3-policy.json'
+$previousInstalled = $null
+if (Test-Path -LiteralPath $installedPath) {
+  try { $previousInstalled = (Get-Content -LiteralPath $installedPath -Raw | ConvertFrom-Json).installed } catch { $previousInstalled = $null }
+}
 if (-not $Uninstall) {
   foreach ($name in 'T3Exe', 'ClaudeExe') {
     $value = (Get-Variable -Name $name).Value
@@ -298,6 +364,7 @@ if (-not $Uninstall) {
     $full = [IO.Path]::GetFullPath($value)
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "Not found: $full" }
     if ([IO.Path]::GetExtension($full) -ne '.exe') { throw "-$name must be an .exe: $full" }
+    Assert-AdminControlledBinary $full
     Set-Variable -Name $name -Value $full -WhatIf:$false
   }
   if (-not $AllowedHosts) { $AllowedHosts = @($policy.egress.allowedHosts) }
@@ -305,7 +372,16 @@ if (-not $Uninstall) {
     if ($hostName -notmatch '^(?=.{1,253}$)([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}$') { throw "Not a host name: $hostName" }
   }
   foreach ($entry in $ExtraAllowedAddresses) { [void](ConvertTo-Range $entry) }
-  [void](New-Object Security.Principal.NTAccount($RunAsUser)).Translate([Security.Principal.SecurityIdentifier])
+  $runAsSid = (New-Object Security.Principal.NTAccount($RunAsUser)).Translate([Security.Principal.SecurityIdentifier])
+  if (-not $T3Home) {
+    $profilePath = (Get-CimInstance Win32_UserProfile -Filter "SID='$($runAsSid.Value)'").LocalPath
+    if (-not $profilePath) { throw "No profile found for $RunAsUser; pass -T3Home." }
+    $T3Home = Join-Path $profilePath '.t3'
+  }
+  $disabledProfiles = @(Get-NetFirewallProfile | Where-Object { -not $_.Enabled })
+  if ($disabledProfiles.Count -gt 0) {
+    throw "Windows Firewall is off for: $(($disabledProfiles | ForEach-Object Name) -join ', '). Turn it on; the egress rules do nothing while it is off."
+  }
 }
 
 # Build the new firewall rule set before touching the old one.
@@ -327,59 +403,128 @@ if (-not $Uninstall) {
 }
 $previousRules = @(Get-NetFirewallRule -Group $RuleGroup -ErrorAction SilentlyContinue)
 
+# The machine-wide admin tier: deny the agent the T3 home and the policy folder. Only these.
+function Get-MachineDenyEntries([string] $t3Home) {
+  $entries = [System.Collections.Generic.List[string]]::new()
+  foreach ($root in @($PolicyDir, $t3Home)) {
+    $rule = ConvertTo-ClaudeRulePath $root
+    foreach ($tool in 'Read', 'Edit', 'Write') { $entries.Add("$tool($rule/**)") }
+  }
+  return $entries.ToArray()
+}
+
+function Update-MachineManagedSettings([string[]] $entries) {
+  $path = $MachineManagedSettingsPath
+  $existing = if (Test-Path -LiteralPath $path) { [IO.File]::ReadAllText($path) } else { $null }
+  $merge = Get-ManagedSettingsMerge -ExistingText $existing -Entries $entries   # throws on a malformed file
+  if ($merge.Added.Count -eq 0) { Write-Host "  unchanged: $path"; return $null }
+  Write-Host "  $path : adding to permissions.deny:"
+  $merge.Added | ForEach-Object { Write-Host "    + $_" }
+  if ($PSCmdlet.ShouldProcess($path, "Merge $($merge.Added.Count) deny entries (every other key unchanged)")) {
+    if ($null -ne $existing) {
+      $backup = Get-ManagedSettingsBackupPath $path
+      Copy-Item -LiteralPath $path -Destination $backup
+      Write-Host "  backup: $backup"
+    }
+    Write-ManagedSettingsAtomically -Path $path -Text $merge.Text
+  }
+  return [ordered]@{ path = $path; added = $merge.Added; created = $merge.Created }
+}
+
+function Undo-MachineManagedSettings($record) {
+  if ($null -eq $record -or -not (Test-Path -LiteralPath $record.path)) { return }
+  $existing = [IO.File]::ReadAllText($record.path)
+  $removal = Get-ManagedSettingsRemoval -ExistingText $existing -Added @($record.added) -Created $record.created
+  Write-Host "  $($record.path) : removing only the entries this installer added:"
+  @($record.added) | ForEach-Object { Write-Host "    - $_" }
+  if ($PSCmdlet.ShouldProcess($record.path, 'Remove the recorded deny entries')) {
+    Copy-Item -LiteralPath $record.path -Destination (Get-ManagedSettingsBackupPath $record.path)
+    if ($removal.DeleteFile) { Remove-Item -LiteralPath $record.path -Force }
+    else { Write-ManagedSettingsAtomically -Path $record.path -Text $removal.Text }
+  }
+}
+
 if ($Uninstall) {
   if ($previousRules.Count -gt 0 -and $PSCmdlet.ShouldProcess($RuleGroup, "Remove $($previousRules.Count) firewall rule(s)")) { $previousRules | Remove-NetFirewallRule }
   foreach ($variable in $serverVariables) { Set-MachineVariable $variable.Name $null }
-  $policyFile = Join-Path $PolicyDir 't3-policy.json'
-  if ((Test-Path -LiteralPath $policyFile) -and $PSCmdlet.ShouldProcess($policyFile, 'Remove installed policy')) { Remove-Item -LiteralPath $policyFile -Force }
-  Write-Host 'Uninstalled. With the policy removed the server no longer requires the policy Claude home.'
+  if ($null -ne $previousInstalled -and $previousInstalled.PSObject.Properties['machineManagedSettings']) {
+    Undo-MachineManagedSettings $previousInstalled.machineManagedSettings
+  }
+  if ((Test-Path -LiteralPath $installedPath) -and $PSCmdlet.ShouldProcess($installedPath, 'Remove installed policy')) { Remove-Item -LiteralPath $installedPath -Force }
+  Write-Host 'Uninstalled. With the policy removed, a Windows server refuses to run Claude until it is installed again.'
   return
 }
 
-Write-Host "1. Protected folders under $PolicyDir"
-Ensure-ProtectedDirectory $PolicyDir $null
-Ensure-ProtectedDirectory $InstallerDir $null
-Ensure-ProtectedDirectory $ClaudeConfigDir $RunAsUser
+Write-Host "1. Admin-only folders under $PolicyDir"
+Ensure-AdminOnlyDirectory $PolicyDir -UsersRead
+Ensure-AdminOnlyDirectory $InstallerDir
+# The Claude home starts admin-only; its files are written before the run-as account gets any access.
+Ensure-AdminOnlyDirectory $ClaudeConfigDir
 
-Write-Host '   Protected installer copy'
-if (-not $scriptPath.StartsWith($InstallerDir, [StringComparison]::OrdinalIgnoreCase)) {
-  Write-ProtectedFile (Join-Path $InstallerDir 'install-policy.ps1') ([IO.File]::ReadAllText($scriptPath)) $null
-  Write-ProtectedFile (Join-Path $InstallerDir 't3-policy.template.json') ([IO.File]::ReadAllText($PolicyTemplate)) $null
+Write-Host "2. Claude settings -> $ClaudeConfigDir"
+Write-AdminOnlyFile (Join-Path $ClaudeConfigDir 'settings.json') (Get-Utf8Bytes (($policy.claudeInstance.settings | ConvertTo-Json -Depth 10) + "`n"))
+$claudeJson = Join-Path $ClaudeConfigDir '.claude.json'
+if (-not (Test-Path -LiteralPath $claudeJson)) { Write-AdminOnlyFile $claudeJson (Get-Utf8Bytes "{}`n") }
+if ($PSCmdlet.ShouldProcess($ClaudeConfigDir, "Grant ${RunAsUser}: read the home, create subfolders, modify only .claude.json and inside subfolders")) {
+  $acl = Get-Acl -LiteralPath $ClaudeConfigDir
+  # Root: read and create subfolders, but no file creation and no change to settings.json.
+  $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($runAsSid, [Security.AccessControl.FileSystemRights]'ReadAndExecute, CreateDirectories', $InheritNone, $PropagateNone, $Allow)))
+  # Inside subfolders (Claude's projects, todos, sessions and so on): modify.
+  $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($runAsSid, $RightsModify, [Security.AccessControl.InheritanceFlags]::ContainerInherit, $PropagateInheritOnly, $Allow)))
+  $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($runAsSid, $RightsModify, $InheritAll, $PropagateInheritOnly, $Allow)))
+  Set-Acl -LiteralPath $ClaudeConfigDir -AclObject $acl
+  $fileAcl = Get-Acl -LiteralPath $claudeJson
+  $fileAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($runAsSid, $RightsModify, $InheritNone, $PropagateNone, $Allow)))
+  Set-Acl -LiteralPath $claudeJson -AclObject $fileAcl
+  $settingsAcl = Get-Acl -LiteralPath (Join-Path $ClaudeConfigDir 'settings.json')
+  $settingsAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($runAsSid, $RightsRead, $InheritNone, $PropagateNone, $Allow)))
+  Set-Acl -LiteralPath (Join-Path $ClaudeConfigDir 'settings.json') -AclObject $settingsAcl
 }
 
-Write-Host '2. Installed policy and T3 settings seed'
-$installed = [ordered]@{ t3Exe = $T3Exe; claudeExe = $ClaudeExe; claudeConfigDir = $ClaudeConfigDir; runAsUser = $RunAsUser; installerSha256 = "script=$scriptHash,template=$templateHash" }
+Write-Host '3. Machine-wide Claude admin tier (deny entries only)'
+$machineRecord = $null
+if (-not $SkipMachineManagedSettings) {
+  $machineRecord = Update-MachineManagedSettings (Get-MachineDenyEntries $T3Home)
+  if ($null -eq $machineRecord -and $null -ne $previousInstalled -and $previousInstalled.PSObject.Properties['machineManagedSettings']) {
+    $machineRecord = $previousInstalled.machineManagedSettings
+  }
+}
+
+Write-Host '4. Installed policy and T3 settings seed'
+$installed = [ordered]@{
+  t3Exe = $T3Exe
+  t3ExeSha256 = Get-BytesSha256 ([IO.File]::ReadAllBytes($T3Exe))
+  claudeExe = $ClaudeExe
+  claudeExeSha256 = Get-BytesSha256 ([IO.File]::ReadAllBytes($ClaudeExe))
+  claudeConfigDir = $ClaudeConfigDir
+  t3Home = $T3Home
+  runAsUser = $RunAsUser
+  instanceEnvironmentAllowlist = @($policy.claudeInstance.environmentAllowlist)
+  installerSha256 = "script=$scriptHash,template=$templateHash,module=$moduleHash"
+}
+if ($null -ne $machineRecord) { $installed['machineManagedSettings'] = $machineRecord }
 $policy | Add-Member -NotePropertyName installed -NotePropertyValue $installed -Force
-Write-ProtectedFile (Join-Path $PolicyDir 't3-policy.json') (($policy | ConvertTo-Json -Depth 12) + "`n") $null
+Write-AdminOnlyFile $installedPath (Get-Utf8Bytes (($policy | ConvertTo-Json -Depth 12) + "`n")) -UsersRead
 
 $seed = [ordered]@{}
 foreach ($p in $policy.t3SettingsSeed.PSObject.Properties) { $seed[$p.Name] = $p.Value }
-$instances = [ordered]@{}
-foreach ($driver in @($policy.disabledDrivers)) { $instances[$driver] = [ordered]@{ driver = $driver; enabled = $false } }
-$instances[$policy.claudeInstance.instanceId] = [ordered]@{
-  driver = $policy.claudeInstance.driver
-  enabled = $true
-  config = [ordered]@{ binaryPath = $ClaudeExe; homePath = $ClaudeConfigDir }
-  environment = @($policy.claudeInstance.environment.PSObject.Properties |
-      Where-Object { $_.Name -ne '$comment' } |
-      ForEach-Object { [ordered]@{ name = $_.Name; value = [string]$_.Value; sensitive = $false } })
+$seed['providerInstances'] = [ordered]@{
+  ($policy.claudeInstance.instanceId) = [ordered]@{
+    driver = $policy.claudeInstance.driver
+    enabled = $true
+    config = [ordered]@{ binaryPath = $ClaudeExe; homePath = $ClaudeConfigDir }
+  }
 }
-$seed['providerInstances'] = $instances
-# The seed stays in the protected folder; the connector applies it. The server does not trust it:
-# it enforces the Claude home and binary from t3-policy.json itself.
-Write-ProtectedFile (Join-Path $PolicyDir 't3-settings.seed.json') (($seed | ConvertTo-Json -Depth 10) + "`n") $null
+Write-AdminOnlyFile (Join-Path $PolicyDir 't3-settings.seed.json') (Get-Utf8Bytes (($seed | ConvertTo-Json -Depth 10) + "`n")) -UsersRead
 
-Write-Host '3. Machine environment (T3CODE_* only)'
+Write-Host '5. Machine environment (T3CODE_* only)'
 foreach ($variable in $serverVariables) { Set-MachineVariable $variable.Name ([string]$variable.Value) }
 foreach ($name in @($policy.serverEnvironmentMustBeUnset)) {
-  if ([Environment]::GetEnvironmentVariable($name, 'Machine')) { Write-Warning "$name is set machine-wide; the policy requires it unset for t3 serve (the connector clears it)." }
-  if ([Environment]::GetEnvironmentVariable($name, 'User')) { Write-Warning "$name is set for the current user; the policy requires it unset for t3 serve (the connector clears it)." }
+  if ([Environment]::GetEnvironmentVariable($name, 'Machine')) { Write-Warning "$name is set machine-wide; it must be unset for t3 serve (the connector clears it)." }
+  if ([Environment]::GetEnvironmentVariable($name, 'User')) { Write-Warning "$name is set for the current user; it must be unset for t3 serve (the connector clears it)." }
 }
 
-Write-Host "4. Claude settings -> $ClaudeConfigDir"
-Write-ProtectedFile (Join-Path $ClaudeConfigDir 'settings.json') (($policy.claudeInstance.settings | ConvertTo-Json -Depth 10) + "`n") $RunAsUser
-
-Write-Host '5. Firewall (new rules first, then the previous ones are removed)'
+Write-Host '6. Firewall (new rules first, then the previous ones are removed)'
 foreach ($rule in $rules) {
   if ($PSCmdlet.ShouldProcess($rule.DisplayName, "Add block rule for $($rule.Program) ($($rule.RemoteAddress.Count) ranges)")) {
     New-NetFirewallRule -Name $rule.Name -Group $RuleGroup -DisplayName $rule.DisplayName -Program $rule.Program `

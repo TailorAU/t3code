@@ -24,6 +24,9 @@ import {
   AuthTerminalOperateScope,
   ORCHESTRATION_V2_WS_METHODS,
   AuthTerminalReadScope,
+  AuthTailorConnectorScope,
+  TAILOR_CONNECTOR_COMMANDS,
+  TAILOR_CONNECTOR_RPCS,
   type AuthEnvironmentScope,
   EnvironmentAuthorizationError,
   RpcScopeAuthorization,
@@ -282,6 +285,14 @@ export const layer = (
   onAuthorized?: (method: string, payload: unknown) => Effect.Effect<void>,
 ) =>
   Layer.succeed(RpcScopeAuthorization)((effect, { rpc, payload }) => {
+    // Tailor fork: a connector token reaches only the contract RPCs and commands.
+    if (scopes.includes(AuthTailorConnectorScope)) {
+      return tailorConnectorAllows(rpc._tag, payload)
+        ? onAuthorized === undefined
+          ? effect
+          : Effect.tap(effect, () => onAuthorized(rpc._tag, payload))
+        : Effect.fail(rpcAuthorizationError(AuthTailorConnectorScope));
+    }
     const requiredScopes = requiredScopesForRpcCall(rpc._tag, payload);
     const requiredScope = requiredScopes.find((scope) => !scopes.includes(scope));
     if (requiredScope !== undefined) return Effect.fail(rpcAuthorizationError(requiredScope));
@@ -289,6 +300,21 @@ export const layer = (
       ? effect
       : Effect.tap(effect, () => onAuthorized(rpc._tag, payload));
   });
+
+/**
+ * Tailor fork: what a `tailor:connector` token may call. Exactly the five contract RPCs, and
+ * for dispatchCommand only the five contract command types. Everything else is refused,
+ * whatever other scopes the token also carries.
+ */
+export function tailorConnectorAllows(method: string, payload: unknown): boolean {
+  if (!(TAILOR_CONNECTOR_RPCS as ReadonlyArray<string>).includes(method)) return false;
+  if (method !== ORCHESTRATION_V2_WS_METHODS.dispatchCommand) return true;
+  const type =
+    typeof payload === "object" && payload !== null
+      ? (payload as { readonly type?: unknown }).type
+      : undefined;
+  return typeof type === "string" && (TAILOR_CONNECTOR_COMMANDS as ReadonlyArray<string>).includes(type);
+}
 
 /** Retrying can install or restart tools even though ordinary listing is readable. */
 export const requiredScopeForDeviceList = (input: DeviceListInput): AuthEnvironmentScope =>

@@ -26,14 +26,26 @@ configuration only for the rest. The policy always wins over user settings.
 | Telemetry off | Fork default off; `T3CODE_OTEL_SDK_DISABLED=true`; Claude instance `DISABLE_TELEMETRY`, `DISABLE_ERROR_REPORTING`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`; firewall | Build, environment, firewall |
 | Updates off | `enableProviderUpdateChecks=false`; connector token lacks `environment:maintain`; firewall blocks GitHub and npm for `t3.exe`; Claude `DISABLE_AUTOUPDATER=1`. `T3CODE_DISABLE_AUTO_UPDATE` affects only the desktop app | Settings, scope, firewall (weaker than a switch) |
 | Proxy variables unset for `t3 serve` | `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NODE_OPTIONS` must be unset; the connector starts it with an explicit environment | Connector |
-| Other providers off | `disabledDrivers` in the settings seed; Cursor removed at compile time | Seed / build |
+| Claude only | The build contains the Claude driver only (`TAILOR_CLAUDE_ONLY`) | Build |
+| Instance settings cannot loosen the policy | With the policy installed, the driver takes the Claude binary and home from `t3-policy.json`, ignores launch arguments and `--settings`, and keeps only allowlisted instance variables | Build reads the admin-only file |
+| Connector reaches only its contract | `tailor:connector` scope: the five contract RPCs and five dispatch commands, nothing else | Build |
+
+## The machine-wide Claude file
+
+The installer also adds deny entries to `C:\Program Files\ClaudeCode\managed-settings.json`.
+**That file is Claude Code's administrator tier and affects every Claude session on this PC**,
+not only T3's. The installer therefore only adds entries that deny Claude's file tools the T3
+home and the `T3CodePolicy` folder, keeps every other setting in the file exactly as it was,
+refuses a malformed file, backs the old file up, and on uninstall removes only the entries it
+added. Pass `-SkipMachineManagedSettings` to leave the file alone.
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
 | `t3-policy.template.json` | Generic policy. No hostnames, paths, accounts or credentials; the installer adds those. |
-| `install-policy.ps1` | Run elevated, per machine. Idempotent, `-WhatIf` friendly, `-Uninstall` reverses it. |
+| `install-policy.ps1` | Run elevated with PowerShell 7.2+, per machine. Idempotent, `-WhatIf` friendly, `-Uninstall` reverses it. |
+| `ManagedSettingsMerge.psm1` | The machine-wide `managed-settings.json` merge; tests in `tests/`. |
 | `provider-config.md` | Model provider as configuration only (API key or Bedrock in Sydney, model pin). |
 
 What the installer writes, all under `%ProgramData%\T3CodePolicy` (folders created with a
@@ -44,7 +56,7 @@ refused):
 | --- | --- |
 | `t3-policy.json` | The template plus an `installed` block (T3 and Claude binary paths, Claude home, run-as account, installer hashes). The server reads this fixed path. |
 | `t3-settings.seed.json` | T3 settings for the connector to apply (Supervised default, update checks off, other drivers off, the Claude instance pointing at the policy home and binary). |
-| `claude-home\settings.json` | The Claude instance settings (Bypass and Auto disabled, deny rules), read-only to non-admins. |
+| `claude-home\` | The Claude instance home. Admin-only at the root; the run-as account may read it, create subfolders, modify `.claude.json` and work inside subfolders, but cannot create or replace files at the root (`settings.json`, `remote-settings.json`). |
 | `installer\` | A protected copy of the installer and template for later refreshes. |
 
 ## Installer parameters
@@ -53,12 +65,15 @@ refused):
 | --- | --- | --- | --- |
 | `-T3Exe` | yes | | Full path of the `t3.exe` built from this fork that the connector starts |
 | `-ClaudeExe` | yes | | Full path of a Claude binary used only by T3's Claude instance, in an admin-only folder (the firewall rule applies to that path) |
-| `-ExpectedSha256` | first install | none | `script=<hex>,template=<hex>` from the reviewed commit; the installer refuses to run on a mismatch |
+| `-ExpectedSha256` | yes, except the protected copy | none | `script=<hex>,template=<hex>,module=<hex>` from the reviewed commit; the installer refuses to run without it or on a mismatch |
 | `-ClaudeHomeName` | no | `claude-home` | Folder name of the Claude home under `%ProgramData%\T3CodePolicy` |
 | `-RunAsUser` | no | the account running the installer | Account that runs `t3 serve`; gets Modify on the Claude home only |
 | `-AllowedHosts` | no | template `egress.allowedHosts` | Model endpoints the Claude binary may reach; add a gateway host if one is used |
 | `-ExtraAllowedAddresses` | no | none | Provider-published IP ranges (CIDR) to allow in addition to DNS results |
 | `-ClaudeEgress` | no | `Resolve` | `Resolve` = allow the DNS addresses of `-AllowedHosts` now; `LoopbackOnly` = allow loopback only, for use with an allowlisting proxy |
+| `-T3Home` | no | `<run-as profile>\.t3` | The T3 base dir, denied to Claude in the machine-wide file |
+| `-MachineManagedSettingsPath` | no | `C:\Program Files\ClaudeCode\managed-settings.json` | Claude Code's machine-wide admin tier |
+| `-SkipMachineManagedSettings` | no | | Do not touch the machine-wide file |
 | `-RuleGroup` | no | `T3 Code egress policy` | Firewall rule group the installer owns and replaces |
 | `-Uninstall` | no | | Remove the rules, machine variables and installed policy |
 
@@ -67,6 +82,7 @@ Get the hashes from the reviewed commit, on any machine:
 ```powershell
 (Get-FileHash .\tailor\policy\install-policy.ps1 -Algorithm SHA256).Hash.ToLower()
 (Get-FileHash .\tailor\policy\t3-policy.template.json -Algorithm SHA256).Hash.ToLower()
+(Get-FileHash .\tailor\policy\ManagedSettingsMerge.psm1 -Algorithm SHA256).Hash.ToLower()
 ```
 
 Example (preview only):
@@ -75,7 +91,7 @@ Example (preview only):
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\tailor\policy\install-policy.ps1 `
   -T3Exe 'C:\Program Files\T3Code\t3.exe' `
   -ClaudeExe 'C:\Program Files\T3Code\claude\claude.exe' `
-  -ExpectedSha256 'script=<hex>,template=<hex>' -WhatIf
+  -ExpectedSha256 'script=<hex>,template=<hex>,module=<hex>' -WhatIf
 ```
 
 Later refreshes run the protected copy:
@@ -96,3 +112,12 @@ endpoints rotate addresses, so:
 - or use `-ClaudeEgress LoopbackOnly` with a loopback proxy that allowlists by host name,
   set as `HTTPS_PROXY` on the Claude provider instance only (never on `t3 serve`). The
   proxy is not part of this PR.
+
+## Not done yet
+
+- **Dedicated service account.** T3 and its Claude still run as the interactive user. Moving
+  them to a password-less local service account (T3 home in that profile, so the user's shell
+  cannot mint tokens or edit T3 settings) needs a service wrapper for `t3 serve`; next stage.
+- **Connector token issuance.** Issue `--scope tailor:connector` by hand for now; the installer
+  will write it into an admin-protected file readable only by the connector's account once the
+  service account exists.

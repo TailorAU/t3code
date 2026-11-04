@@ -21,7 +21,10 @@ Patches to upstream code, each marked `Tailor fork` in a comment:
 - `pnpm-workspace.yaml`: advisory overrides (`@modelcontextprotocol/sdk` 1.32.2, `proxy-addr` 2.0.8, `zod` 4.6.6, `dompurify` 3.4.17) and `undici` 8.12.2 in the catalog.
 - `packages/contracts/src/providerPolicy.ts`: Supervised default and the compile-time mode ceiling (`clampRuntimeMode`), applied in `Orchestrator.ts`, `ws.ts`, `RuntimePolicy.ts`, `serverSettings.ts` and the MCP access code.
 - `apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts`: query lock (no settings files, strict MCP, capped mode, compiled deny rules, no web tools), fail-closed policy guard, no standing grants, read-only T3 tools pre-approved only, Auto cap from the Claude home.
-- `apps/server/src/provider/builtInDrivers.ts`: Cursor driver off.
+- `apps/server/src/provider/builtInDrivers.ts`: Claude driver only.
+- `apps/server/src/provider/Drivers/ClaudeDriver.ts`, `apps/server/src/tailor/machinePolicy.ts`: the machine policy sets the Claude binary and home, launch arguments are ignored, instance variables are allowlisted, Windows refuses to run without the policy.
+- `packages/contracts/src/auth.ts`, `apps/server/src/auth/RpcAuthorization.ts`: the `tailor:connector` scope.
+- `apps/server/src/cli/config.ts`: loopback bind by default.
 - `apps/server/src/telemetry/AnalyticsService.ts`: analytics default off.
 - `apps/server/src/http.ts`: web app CSP. `packages/shared/src/favicon.ts`, `apps/web/src/openVsxThemes.ts`: third-party fetches off.
 - `apps/server/vite.config.ts`, `apps/web/vite.config.ts`: build refuses Clerk and relay values (`tailor/build/`).

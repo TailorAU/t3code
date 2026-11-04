@@ -22,7 +22,7 @@ Severity: Critical, High, Medium, Low, Info. Status: Fixed (in this PR), Mitigat
 | T3-04 | MCP TypeScript SDK 1.29.0 (advisories up to CVSS 8.6); Cursor SDK bundles its own copy | High | Fixed |
 | T3-05 | `proxy-addr` 2.0.7, IP spoofing via IPv4-mapped IPv6 (CVSS 9.1) | Critical | Fixed |
 | T3-06 | Default runtime mode is Full access and there is no admin lock | High | Fixed (compile-time ceiling, T3-17) |
-| T3-07 | `orchestration:operate` is broader than the connector needs | Medium | Open |
+| T3-07 | `orchestration:operate` is broader than the connector needs | Medium | Fixed by T3-37 |
 | T3-08 | Listener exposure and bind address | Medium | Mitigated |
 | T3-09 | WebSocket upgrade Origin check (corrected: it exists) | Info | No action |
 | T3-10 | Remote layers (Connect relay, pairing, Tailscale, SSH, peer links, guest share) ship in the binary | Medium | Mitigated, residual |
@@ -43,6 +43,19 @@ Severity: Critical, High, Medium, Low, Info. Status: Fixed (in this PR), Mitigat
 | T3-25 | Browser egress (Google favicon service, Open VSX, no CSP); hosted values compiled in | Medium | Fixed |
 | T3-26 | Unused upstream workflows and unpinned actions | Medium | Fixed |
 | T3-27 | Web tools and proxy variables | Low | Fixed |
+| T3-28 | Build guard file not committed (ignored by `build/`) | Blocker | Fixed |
+| T3-29 | User launch arguments and `--settings` got past the lock | High | Fixed |
+| T3-30 | Capabilities probe and `claude -p` text generation were not locked | High | Fixed |
+| T3-31 | Policy configuration was user-writable (drivers, instance env, launch args, run-as account) | High | Partly fixed; service account Open |
+| T3-32 | Claude home writable at its root; Users could read it | Medium | Fixed |
+| T3-33 | No machine-wide admin-tier deny rules | Medium | Fixed (merge, opt-out switch) |
+| T3-34 | Policy location from an environment variable; Windows ran without a policy | Medium | Fixed |
+| T3-35 | Installer integrity, input validation and file-write ordering | Medium | Fixed |
+| T3-36 | Binaries in user-writable folders; no binary hash check | Medium | Fixed (Claude checked at start; T3 recorded) |
+| T3-37 | Connector token broader than the five contract RPCs | Medium | Fixed (`tailor:connector`); issuance Open |
+| T3-38 | CSP covered connect and images only | Medium | Fixed |
+| T3-39 | T3-home deny rules did not follow `--base-dir`; attachments | Medium | Fixed |
+| T3-40 | Managed service defaulted to private-network bind; pnpm not pinned by integrity | Medium | Fixed |
 
 ## Findings
 
@@ -383,18 +396,136 @@ pinned to commit SHAs.
 `ALL_PROXY` (and lower-case forms) and `NODE_OPTIONS` must be unset for `t3 serve`; the
 connector starts it with an explicit environment, and the installer warns if they are set.
 
+### T3-28 Build guard file not committed (Blocker, Fixed)
+
+`.gitignore` ignores `build/`, so `tailor/build/assertNoRemoteBuildConfig.ts` never reached
+the branch. `.gitignore` now un-ignores `tailor/build/`; `git status --ignored` shows no other
+ignored file the fork relies on.
+
+### T3-29 Launch arguments and `--settings` (High, Fixed)
+
+The instance's `launchArgs` (user-writable T3 settings) passed `--settings`, extra CLI flags,
+`--add-dir`, append-system-prompt text and permission flags to Claude. In this build
+(`TAILOR_IGNORE_LAUNCH_ARGS`) they are ignored everywhere: the driver blanks them, the adapter
+sanitises its options again, and `makeClaudeQueryOptions` neither parses them nor uses
+`--settings`. Tests run hostile arguments through `makeClaudeQueryOptions` and through a real
+turn (`--setting-sources`, `--managed-settings`, `--allowedTools`, `--mcp-config`,
+`--plugin-dir`, `--agents`, `--allow-dangerously-skip-permissions`,
+`--dangerously-skip-permissions`, `--permission-mode`, `--settings` with `permissions.allow` and
+`hooks`, append prompts, `--add-dir /`) and assert the locked options. The Claude adapter also
+caps any mode the CLI reports or that would be restored after plan mode
+(`tailorCapPermissionMode`), and caps Full access and Auto at query-policy level.
+
+### T3-30 Probe and text generation (High, Fixed)
+
+The capabilities probe now loads no settings files (`settingSources: []`), keeps hooks off and
+strict MCP, and carries the compiled deny rules. `claude -p` text generation carries the deny
+rules in its flag settings (hooks were already off). Both use the binary and home the driver
+takes from the machine policy (T3-31), never from user settings.
+
+### T3-31 Policy configuration (High, partly fixed)
+
+Fixed: the build contains the Claude driver only (`TAILOR_CLAUDE_ONLY`). When the machine
+policy is installed the driver overrides the instance's binary and home with the recorded
+ones, blanks launch arguments and keeps only allowlisted instance variables (the compiled
+list, narrowed by `installed.instanceEnvironmentAllowlist`; proxy, `NODE_OPTIONS` and
+`CLAUDE_CONFIG_DIR` are never allowed).
+
+Open: running T3 and its Claude under a dedicated local service account, with the T3 home in
+that account's profile, so the interactive user and the agent's shell cannot mint tokens or
+edit T3 settings. `t3.exe` is not a Windows service binary, so this needs a service wrapper
+(or a scheduled task with a virtual account) plus a password-less account set-up; it is the
+next stage's first item. Until then the run-as account is the interactive user and the
+controls are the build ceiling, the query lock, the deny rules and Supervised approvals.
+Connector token issuance into an admin-protected, user-readable file is part of the same work.
+
+### T3-32 Claude home (Medium, Fixed)
+
+The Claude home starts admin-only (no Users read). Its files (`settings.json`, `.claude.json`)
+are written before the run-as account gets any access, created with `CreateNew` after any
+existing path is deleted. The account then gets read and create-subfolder on the root (no file
+creation, so it cannot plant `remote-settings.json` or replace `settings.json`), modify on
+`.claude.json`, and modify only inside subfolders. The compiled deny rules also cover the
+resolved Claude home: no `Edit`/`Write` anywhere in it, no `Read` of `.claude.json`,
+`.credentials.json`, `remote-settings.json` or `settings.json`.
+
+### T3-33 Machine-wide admin tier (Medium, Fixed)
+
+The installer merges deny entries for the T3 home and the policy folder into
+`C:\Program Files\ClaudeCode\managed-settings.json`. That file applies to **every** Claude
+Code session on the PC, so the merge only adds those entries to `permissions.deny`
+(de-duplicated), keeps every other key and value (unknown keys included), refuses a malformed
+file and writes nothing, backs the old file up as `managed-settings.json.t3bak-<UTC>`, writes
+through a temp file and an atomic rename after re-parsing, records what it added in
+`t3-policy.json`, and on uninstall removes only those entries (deleting the file only if it
+created it and it is now empty). `-WhatIf` lists the exact entries. Fixture tests:
+`tailor/policy/tests/ManagedSettingsMerge.Tests.ps1` (no file, a file with other permissions,
+hooks, env and unknown keys, idempotent re-install, malformed file refused and untouched,
+uninstall restoring the original). `-SkipMachineManagedSettings` leaves the file alone.
+
+### T3-34 Policy location and fail closed (Medium, Fixed)
+
+The server finds the policy through the "Common AppData" known folder, read from the registry
+by `reg.exe` at its fixed path, never the `ProgramData` environment variable
+(`apps/server/src/tailor/machinePolicy.ts`). On a real Windows server (`tailorPolicyRequired`,
+set by the CLI config) a missing or unreadable policy means the driver points Claude at a
+binary that cannot run and the adapter refuses every query.
+
+### T3-35 Installer integrity and ordering (Medium, Fixed)
+
+The installer reads each file once and hashes and parses the same bytes; requires
+`-ExpectedSha256 script=,template=,module=` unless it is the protected copy; copies itself,
+the template and the merge module into the admin-only `installer` folder first and continues
+from there; validates `serverEnvironment` names against `^T3CODE_[A-Z0-9_]+$`; refuses to run
+with any Windows Firewall profile disabled; and requires PowerShell 7.2+.
+
+### T3-36 Binary locations and hashes (Medium, Fixed)
+
+The installer refuses a `t3.exe` or Claude binary whose file or folder is not owned by an
+administrator principal or that any other principal can write. It records both SHA-256 values
+in `t3-policy.json`; the server checks the Claude binary's hash before the first query. The T3
+binary's hash is recorded for the connector to check before it starts `t3 serve` (a process
+cannot meaningfully verify itself).
+
+### T3-37 Connector scope (Medium, Fixed; issuance Open)
+
+New scope `tailor:connector`: a token carrying it reaches exactly the five contract RPCs, and
+through `dispatchCommand` exactly the five contract command types
+(`RpcAuthorization.tailorConnectorAllows`), whatever else the token carries. The contract test
+checks the lists against `tailor/contract/connector-rpc-contract.json`. Issue it with
+`t3 auth session issue --scope tailor:connector --label connector --token-only --ttl 7d`.
+End-to-end use of the token against handlers that check scopes internally is not yet tested.
+
+### T3-38 Content-Security-Policy (Medium, Fixed)
+
+The web app's HTML is served with `default-src 'self'; script-src 'self'; style-src 'self'
+'unsafe-inline'; font-src 'self' data:; media-src 'self' blob:; connect-src 'self'; img-src
+'self' data: blob:; frame-src 'none'; worker-src 'self' blob:; object-src 'none'; base-uri
+'self'; form-action 'self'; frame-ancestors 'none'`. Not yet checked against the built UI in a
+browser (part of T3-01).
+
+### T3-39 Base dir and attachments (Medium, Fixed)
+
+The deny rules now follow the server's real base dir (`ServerConfig.baseDir`) as well as
+`~/.t3` and `T3CODE_HOME`. Reads are denied for the database, secrets, settings and identity
+files, logs, browser artifacts, caches and runtime; `userdata/attachments` stays readable.
+Nothing under the base dir may be edited or written. Tested in `claudeLock.test.ts`.
+
+### T3-40 Bind default and pnpm (Medium, Fixed)
+
+Web mode binds `127.0.0.1` unless `T3CODE_LAN`/`--lan` is explicitly true; a managed service no
+longer defaults to private networks. The gate installs pnpm 12.14.0 only after checking the
+tarball against its registry SHA-512.
+
 ## What was verified
 
-- Locally on Windows (frozen lockfile): the contracts suite with the contract and build-guard
-  tests (160/160), and the gate's server tests: connector scopes, mode clamp, Claude lock,
-  mode cap, `McpToolAccess`, `RpcAuthorization`, `AnalyticsService` and the provider
-  registry (165/165). The installer under `-WhatIf` with PowerShell 7 and Windows
-  PowerShell 5.1, its hash check (it refuses a wrong hash), input validation, the reparse and
-  owner refusals, and its address arithmetic.
-- `ClaudeAdapterV2.test.ts` is not in the gate: 13 of its tests fail on Windows at upstream
-  `v0.1.6`. With this patch 27 fail: those 13 plus 14 upstream expectations of behaviour the
-  fork changes on purpose (launch-argument permission modes, session grants, Auto
-  renegotiation, unlocked query options).
-- Not verified: a full build, the full upstream suite, an elevated install, the firewall
-  rules applied, the server refusing a wrong Claude home on a real install, and the live
-  egress capture (T3-01).
+- Locally on Windows (frozen lockfile): the contracts suite (161/161, including the contract,
+  connector-scope and build-guard tests) and the gate's server tests (496 passed, 1 upstream
+  skip), now including `ClaudeAdapterV2.test.ts`, the probe, text generation and CLI config
+  tests. Server `src` and contracts typecheck clean. The managed-settings merge fixtures pass.
+  The installer previews with `-WhatIf` under PowerShell 7: it refuses a missing hash, a
+  user-writable binary and a bad host name, and shows the exact machine-file diff.
+- Not verified: a full build, the full upstream suite, an elevated install, folder creation
+  and ACLs on a real machine, the firewall rules applied, the policy guard and binary hash on
+  a real install, the CSP in a browser, the connector token end to end, and the live egress
+  capture (T3-01).

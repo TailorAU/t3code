@@ -1,5 +1,5 @@
 {
-  "$comment": "Generic lock-down policy template for a T3 Code v0.1.6 server run by a supervising connector. T3 Code has no managed-policy file of its own (see tailor/policy/README.md); install-policy.ps1 turns this template into machine environment variables, a read-only Claude settings file and an optional settings seed, and the connector launches 't3 serve' only with the 'serverEnvironment' below. No hostnames, paths, accounts or credentials belong in this file; machine-specific values are installer parameters.",
+  "$comment": "Generic lock-down policy template for a T3 Code v0.1.6 server run by a supervising connector. T3 Code has no managed-policy file of its own (see tailor/policy/README.md); install-policy.ps1 turns this template into machine environment variables, a read-only Claude settings file and an optional settings seed, and the connector launches 't3 serve' only with the 'serverEnvironment' below. No hostnames, paths, accounts or credentials belong in this file; machine-specific values are installer parameters. The build runs Claude only (TAILOR_CLAUDE_ONLY); disabledDrivers is no longer needed.",
   "policyVersion": 1,
   "t3Version": "0.1.6",
   "clients": {
@@ -87,26 +87,32 @@
       "DISABLE_TELEMETRY": "1",
       "DISABLE_ERROR_REPORTING": "1",
       "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
-    }
+    },
+    "environmentAllowlist": [
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_BASE_URL",
+      "ANTHROPIC_MODEL",
+      "ANTHROPIC_DEFAULT_OPUS_MODEL",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL",
+      "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+      "ANTHROPIC_SMALL_FAST_MODEL",
+      "CLAUDE_CODE_USE_BEDROCK",
+      "AWS_REGION",
+      "AWS_PROFILE",
+      "DISABLE_AUTOUPDATER",
+      "DISABLE_TELEMETRY",
+      "DISABLE_ERROR_REPORTING",
+      "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+    ]
   },
-  "disabledDrivers": [
-    "codex",
-    "cursor",
-    "grok",
-    "opencode",
-    "antigravity",
-    "pi",
-    "muse",
-    "fx",
-    "acpRegistry"
-  ],
+  "disabledDrivers": [],
   "connectorToken": {
     "scopes": [
-      "orchestration:read",
-      "orchestration:operate"
+      "tailor:connector"
     ],
-    "issueCommand": "t3 auth session issue --scope orchestration:read --scope orchestration:operate --label connector --token-only",
-    "rpcAllowlist": "tailor/contract/connector-rpc-contract.json"
+    "issueCommand": "t3 auth session issue --scope tailor:connector --label connector --token-only --ttl 7d",
+    "rpcAllowlist": "tailor/contract/connector-rpc-contract.json",
+    "$comment": "tailor:connector reaches only the five contract RPCs and five dispatch commands (RpcAuthorization.tailorConnectorAllows)."
   },
   "egress": {
     "$comment": "Defaults for install-policy.ps1 -AllowedHosts. Override per machine.",

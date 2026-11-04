@@ -5,6 +5,7 @@ import {
   type ServerProviderSlashCommand,
   type ServerProviderResetCredits,
 } from "@t3tools/contracts";
+import { tailorClaudeManagedSettings } from "../tailor/claudeDenyRules.ts";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -189,11 +190,9 @@ const CAPABILITIES_PROBE_TIMEOUT_MS = 25_000;
 // Native CLI startup on Windows can exceed the shared probe deadline.
 const CLAUDE_VERSION_CHECK_TIMEOUT_MS = 20_000;
 
-const CLAUDE_CAPABILITIES_PROBE_SETTING_SOURCES = [
-  "user",
-  "project",
-  "local",
-] as const satisfies ReadonlyArray<SettingSource>;
+// Tailor fork: the probe loads no settings files either (upstream: user, project, local), so a
+// repository's settings, hooks and plugins never run during a health check.
+const CLAUDE_CAPABILITIES_PROBE_SETTING_SOURCES = [] as const satisfies ReadonlyArray<SettingSource>;
 
 export function buildClaudeCapabilitiesProbeQueryOptions(input: {
   readonly executablePath: string;
@@ -208,7 +207,10 @@ export function buildClaudeCapabilitiesProbeQueryOptions(input: {
     abortController: input.abortController,
     settingSources: [...CLAUDE_CAPABILITIES_PROBE_SETTING_SOURCES],
     // Keep settings for slash-command discovery, but disable hooks so health checks do not run SessionStart repeatedly.
-    settings: { disableAllHooks: true },
+    settings: {
+      disableAllHooks: true,
+      ...tailorClaudeManagedSettings(input.environment),
+    } as unknown as NonNullable<ClaudeQueryOptions["settings"]>,
     allowedTools: [],
     // Exclude filesystem MCP servers; omit strict mode when managed-mcp.json already excludes them and forbids the flag.
     mcpServers: {},

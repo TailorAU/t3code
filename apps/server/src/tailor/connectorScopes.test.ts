@@ -14,7 +14,12 @@ import {
 import { describe, expect, it } from "@effect/vitest";
 
 import contract from "../../../../tailor/contract/connector-rpc-contract.json" with { type: "json" };
-import { RPC_REQUIRED_SCOPES, requiredScopeForRpcMethod } from "../auth/RpcAuthorization.ts";
+import {
+  RPC_REQUIRED_SCOPES,
+  requiredScopeForRpcMethod,
+  tailorConnectorAllows,
+} from "../auth/RpcAuthorization.ts";
+import { TAILOR_CONNECTOR_COMMANDS, TAILOR_CONNECTOR_RPCS } from "@t3tools/contracts";
 
 const CONNECTOR_SCOPES: ReadonlyArray<AuthEnvironmentScope> = [
   AuthOrchestrationReadScope,
@@ -53,6 +58,32 @@ describe("Tailor connector token scopes", () => {
     for (const method of Object.keys(RPC_REQUIRED_SCOPES)) {
       if (!method.startsWith("terminal.")) continue;
       expect(CONNECTOR_SCOPES, method).not.toContain(requiredScopeForRpcMethod(method));
+    }
+  });
+
+  it("gives the tailor:connector scope exactly the contract RPCs and commands", () => {
+    const contractRpcs = Object.keys(rpcs).sort();
+    expect([...TAILOR_CONNECTOR_RPCS].sort()).toEqual(contractRpcs);
+    const commands = (
+      contract.rpcs as unknown as Record<string, { readonly commands?: Record<string, unknown> }>
+    )["orchestration.dispatchCommand"]?.commands;
+    expect([...TAILOR_CONNECTOR_COMMANDS].sort()).toEqual(Object.keys(commands ?? {}).sort());
+
+    for (const method of TAILOR_CONNECTOR_RPCS) {
+      if (method === "orchestration.dispatchCommand") continue;
+      expect(tailorConnectorAllows(method, {}), method).toBe(true);
+    }
+    for (const type of TAILOR_CONNECTOR_COMMANDS) {
+      expect(tailorConnectorAllows("orchestration.dispatchCommand", { type }), type).toBe(true);
+    }
+    // Every other dispatch command and every other RPC is refused.
+    for (const type of ["thread.runtime-mode.set", "thread.delete", "checkpoint.rollback", "thread.fork"]) {
+      expect(tailorConnectorAllows("orchestration.dispatchCommand", { type }), type).toBe(false);
+    }
+    expect(tailorConnectorAllows("orchestration.dispatchCommand", undefined)).toBe(false);
+    for (const method of Object.keys(RPC_REQUIRED_SCOPES)) {
+      if ((TAILOR_CONNECTOR_RPCS as ReadonlyArray<string>).includes(method)) continue;
+      expect(tailorConnectorAllows(method, {}), method).toBe(false);
     }
   });
 });

@@ -43,10 +43,12 @@ describe("Tailor Claude mode cap", () => {
     );
   });
 
-  it("keeps upstream behaviour when nothing is disabled", () => {
-    assert.strictEqual(
-      ClaudeAdapterV2.claudeRuntimeQueryPolicyForRuntimePolicy(policyFor("auto")).permissionMode,
-      "auto",
-    );
+  it("caps Full access and Auto even when nothing is disabled", () => {
+    for (const mode of ["full-access", "auto"] as const) {
+      const queryPolicy = ClaudeAdapterV2.claudeRuntimeQueryPolicyForRuntimePolicy(policyFor(mode));
+      assert.strictEqual(queryPolicy.permissionMode, "default", mode);
+      assert.isTrue(queryPolicy.installPermissionCallback, mode);
+      assert.isUndefined(queryPolicy.allowDangerouslySkipPermissions, mode);
+    }
   });
 });

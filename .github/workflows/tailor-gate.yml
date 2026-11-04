@@ -49,11 +49,22 @@ jobs:
           cache: false
           run-install: false
 
+      # pnpm is pinned by its registry integrity: the tarball is checked before it is installed.
+      - name: Install pnpm 12.14.0 (integrity-checked)
+        shell: bash
+        env:
+          PNPM_SHA512: wYum2HmT09Fky16JSPMrLAbuhUSH4GzY2GeBNC+z5btGNDZwNHEehoArqpw3vqkGzhkprQjXCITJfYAd8TOJpg==
+        run: |
+          npm pack pnpm@12.14.0 --pack-destination "$RUNNER_TEMP" --silent
+          actual="$(openssl dgst -sha512 -binary "$RUNNER_TEMP/pnpm-12.14.0.tgz" | openssl base64 -A)"
+          test "$actual" = "$PNPM_SHA512" || { echo "pnpm tarball integrity mismatch"; exit 1; }
+          npm install -g "$RUNNER_TEMP/pnpm-12.14.0.tgz" --ignore-scripts
+
       # Only the server, its workspace dependencies and the root tooling; no install
       # scripts. The lockfile is frozen, so a drifted override fails here.
       - name: Install (frozen lockfile)
         shell: bash
-        run: npx -y pnpm@12.14.0 install --frozen-lockfile --ignore-scripts --filter "t3..." --filter "@t3tools/monorepo"
+        run: pnpm install --frozen-lockfile --ignore-scripts --filter "t3..." --filter "@t3tools/monorepo"
 
       - name: Connector contract and contracts suite
         shell: bash
@@ -69,15 +80,27 @@ jobs:
           CI: "1"
         run: >-
           ../../node_modules/.bin/vp test run
-          src/tailor/connectorScopes.test.ts
-          src/tailor/claudeModeCap.test.ts
-          src/tailor/claudeLock.test.ts
-          src/tailor/modeClamp.test.ts
+          src/tailor
+          src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
+          src/provider/ClaudeCapabilitiesProbe.test.ts
+          src/textGeneration/ClaudeTextGeneration.test.ts
+          src/cli/config.test.ts
           src/mcp/McpToolAccess.test.ts
           src/auth/RpcAuthorization.test.ts
           src/telemetry/AnalyticsService.test.ts
           src/provider/ProviderInstanceRegistryHydration.test.ts
           src/provider/ProviderRegistry.test.ts
+
+      - name: Machine managed-settings merge fixtures
+        shell: pwsh
+        run: ./tailor/policy/tests/ManagedSettingsMerge.Tests.ps1
+
+      - name: Installer parses
+        shell: pwsh
+        run: |
+          $t = $null; $e = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD/tailor/policy/install-policy.ps1", [ref]$t, [ref]$e)
+          if ($e.Count -gt 0) { $e | ForEach-Object { Write-Error $_.Message }; exit 1 }
 
   full-suite:
     name: Full suite, informational (windows-latest)

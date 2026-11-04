@@ -1,4 +1,5 @@
 import * as Effect from "effect/Effect";
+import { tailorClaudeManagedSettings } from "../tailor/claudeDenyRules.ts";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -174,6 +175,10 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
       ...(typeof thinking === "boolean" ? { alwaysThinkingEnabled: thinking } : {}),
       ...(fastMode ? { fastMode: true } : {}),
       ...(ultracode ? { ultracode: true } : {}),
+      // Tailor fork: the compiled deny rules apply to `claude -p` as well.
+      ...tailorClaudeManagedSettings(environment, {
+        claudeHome: claudeEnvironment.CLAUDE_CONFIG_DIR,
+      }),
     };
     const settingsJson = yield* encodeJsonForOperation(
       operation,

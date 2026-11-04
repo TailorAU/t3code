@@ -70,8 +70,14 @@ permission mode.
 
 ## Other providers
 
-Codex, Cursor, Grok, OpenCode, Antigravity, Pi, Muse, fx and ACP registry agents are
-disabled by the policy. Cursor is also removed from the server at compile time
-(`TAILOR_CURSOR_DRIVER_ENABLED` in `apps/server/src/provider/builtInDrivers.ts`).
-Enabling any other provider is a reviewed change that also extends the egress
-allowlist.
+The build contains the Claude driver only (`TAILOR_CLAUDE_ONLY` in
+`apps/server/src/provider/builtInDrivers.ts`). Adding any other provider is a reviewed change
+that also extends the policy and the egress allowlist.
+
+## What the user-writable instance settings can no longer change
+
+With the machine policy installed, the Claude binary and home come from `t3-policy.json`;
+launch arguments (including `--settings`) are ignored; and only these instance variables are
+kept: the credential and model variables above, `AWS_REGION`, `AWS_PROFILE` and the four
+`DISABLE_*`/`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` switches. Proxy variables,
+`NODE_OPTIONS` and `CLAUDE_CONFIG_DIR` are always dropped.

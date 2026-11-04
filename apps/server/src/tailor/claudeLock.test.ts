@@ -51,13 +51,41 @@ describe("Tailor Claude query lock", () => {
       "Write(**/.claude/**)",
       "Edit(**/.mcp.json)",
       "Write(**/.mcp.json)",
-      "Read(~/.t3/**)",
+      "Read(~/.t3/userdata/*.sqlite*)",
+      "Read(~/.t3/userdata/secrets/**)",
       "Edit(~/.t3/**)",
-      "Read(//c/Data/t3-home/**)",
+      "Write(~/.t3/**)",
+      "Read(//c/Data/t3-home/userdata/secrets/**)",
       "Write(//c/Data/t3-home/**)",
     ]) {
       assert.include(deny, rule);
     }
+    // Attachments under the base dir stay readable.
+    assert.isUndefined(deny.find((rule) => rule.startsWith("Read(") && rule.includes("attachments")));
+    assert.isUndefined(deny.find((rule) => rule === "Read(~/.t3/**)"));
+  });
+
+  it("follows the server's real base dir and the resolved Claude home", () => {
+    const locked = ClaudeAdapterV2.tailorLockClaudeQueryOptions(baseOptions, "default", {}, {
+      t3BaseDir: "D:\\T3\\base",
+      claudeHome: "C:\\ProgramData\\T3CodePolicy\\claude-home",
+    });
+    const deny = (locked.managedSettings as { permissions: { deny: string[] } }).permissions.deny;
+    for (const rule of [
+      "Read(//d/T3/base/userdata/*.sqlite*)",
+      "Edit(//d/T3/base/**)",
+      "Edit(//c/ProgramData/T3CodePolicy/claude-home/**)",
+      "Read(//c/ProgramData/T3CodePolicy/claude-home/.claude.json)",
+      "Read(//c/ProgramData/T3CodePolicy/claude-home/remote-settings.json)",
+    ]) {
+      assert.include(deny, rule);
+    }
+    assert.strictEqual(locked.strictMcpConfig, true);
+    const managed = ClaudeAdapterV2.tailorLockClaudeQueryOptions(baseOptions, "default", {}, {
+      managedMcpConfig: true,
+    });
+    // Next to an administrator's managed-mcp.json Claude rejects the flag; that file governs MCP.
+    assert.isUndefined(managed.strictMcpConfig);
   });
 
   it("pre-approves only T3's read-only MCP tools", () => {
@@ -93,20 +121,5 @@ describe("Tailor Claude query lock", () => {
       toolUseID: "tool-2",
     }) as { behavior: string };
     assert.strictEqual(always.behavior, "deny");
-  });
-
-  it("reads the installed policy's Claude home and binary, failing closed", () => {
-    assert.strictEqual(
-      ClaudeAdapterV2.tailorPolicyMarkerPath("win32", { ProgramData: "C:\\ProgramData" }),
-      "C:\\ProgramData\\T3CodePolicy\\t3-policy.json",
-    );
-    assert.deepEqual(
-      ClaudeAdapterV2.tailorInstalledClaudePaths(
-        JSON.stringify({ installed: { claudeConfigDir: "C:\\p\\home", claudeExe: "C:\\p\\c.exe" } }),
-      ),
-      { claudeConfigDir: "C:\\p\\home", claudeExe: "C:\\p\\c.exe" },
-    );
-    assert.isNull(ClaudeAdapterV2.tailorInstalledClaudePaths("{}"));
-    assert.isNull(ClaudeAdapterV2.tailorInstalledClaudePaths("not json"));
   });
 });

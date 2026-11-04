@@ -1,0 +1,91 @@
+#Requires -Version 7.2
+# Tailor fork: fixture tests for the machine-wide managed-settings.json merge.
+# Run: pwsh -NoProfile -File tailor/policy/tests/ManagedSettingsMerge.Tests.ps1  (exit 0 = pass)
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSScriptRoot '..' 'ManagedSettingsMerge.psm1') -Force
+
+$failures = [System.Collections.Generic.List[string]]::new()
+function Assert-True([bool] $condition, [string] $message) { if (-not $condition) { $failures.Add($message) } }
+function Same-Json([string] $a, [string] $b) {
+  return (($a | ConvertFrom-Json -AsHashtable -Depth 100 | ConvertTo-Json -Depth 100 -Compress) -eq
+    ($b | ConvertFrom-Json -AsHashtable -Depth 100 | ConvertTo-Json -Depth 100 -Compress))
+}
+
+$ours = @('Read(//c/ProgramData/T3CodePolicy/**)', 'Edit(//c/ProgramData/T3CodePolicy/**)', 'Read(//c/Users/svc/.t3/**)')
+$workRoot = Join-Path ([IO.Path]::GetTempPath()) ('t3-managed-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $workRoot | Out-Null
+
+try {
+  # (a) No file: our entries only, everything recorded as created.
+  $a = Get-ManagedSettingsMerge -ExistingText $null -Entries $ours
+  $aParsed = $a.Text | ConvertFrom-Json -AsHashtable
+  Assert-True ($a.Added.Count -eq 3) '(a) adds all three entries'
+  Assert-True (@($aParsed.permissions.deny).Count -eq 3) '(a) deny has exactly our entries'
+  Assert-True ($a.Created.file -and $a.Created.permissions -and $a.Created.deny) '(a) records what it created'
+
+  # (b) Existing file with other permissions, hooks, env and an unknown key: all survive.
+  $original = @'
+{
+  "permissions": {
+    "allow": ["Bash(git status)"],
+    "deny": ["Read(./.env)", "Read(//c/Users/svc/.t3/**)"],
+    "disableBypassPermissionsMode": "disable"
+  },
+  "hooks": { "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "audit.cmd" }] }] },
+  "env": { "HTTPS_PROXY": "http://proxy.example:8080" },
+  "someFutureKey": { "nested": [1, 2, { "x": true }] }
+}
+'@
+  $b = Get-ManagedSettingsMerge -ExistingText $original -Entries $ours
+  $bParsed = $b.Text | ConvertFrom-Json -AsHashtable -Depth 100
+  Assert-True ($b.Added.Count -eq 2) '(b) adds only the two missing entries'
+  Assert-True (@($bParsed.permissions.deny | Where-Object { $_ -eq 'Read(//c/Users/svc/.t3/**)' }).Count -eq 1) '(b) no duplicate of an entry already present'
+  Assert-True (@($bParsed.permissions.deny)[0] -eq 'Read(./.env)') '(b) existing deny entries keep their order'
+  Assert-True (@($bParsed.permissions.allow)[0] -eq 'Bash(git status)') '(b) allow kept'
+  Assert-True ($bParsed.permissions.disableBypassPermissionsMode -eq 'disable') '(b) other permission keys kept'
+  Assert-True ($bParsed.hooks.PreToolUse[0].hooks[0].command -eq 'audit.cmd') '(b) hooks kept'
+  Assert-True ($bParsed.env.HTTPS_PROXY -eq 'http://proxy.example:8080') '(b) env kept'
+  Assert-True ($bParsed.someFutureKey.nested[2].x -eq $true) '(b) unknown keys kept'
+  Assert-True (-not ($b.Created.file -or $b.Created.permissions -or $b.Created.deny)) '(b) created nothing'
+
+  # (c) Re-install is idempotent.
+  $c = Get-ManagedSettingsMerge -ExistingText $b.Text -Entries $ours
+  Assert-True ($c.Added.Count -eq 0) '(c) re-install adds nothing'
+  Assert-True ($c.Text -eq $b.Text) '(c) re-install leaves the text unchanged'
+
+  # (d) A malformed file is refused and left untouched on disk.
+  $malformedPath = Join-Path $workRoot 'managed-settings.json'
+  $malformed = '{ "permissions": { "deny": [ "Read(x)" ] '
+  [IO.File]::WriteAllText($malformedPath, $malformed)
+  $refused = $false
+  try { [void](Get-ManagedSettingsMerge -ExistingText ([IO.File]::ReadAllText($malformedPath)) -Entries $ours) } catch { $refused = $true }
+  Assert-True $refused '(d) malformed file is refused'
+  Assert-True ([IO.File]::ReadAllText($malformedPath) -eq $malformed) '(d) malformed file untouched'
+  $refusedShape = $false
+  try { [void](Get-ManagedSettingsMerge -ExistingText '{ "permissions": { "deny": "Read(x)" } }' -Entries $ours) } catch { $refusedShape = $true }
+  Assert-True $refusedShape '(d) a non-list deny is refused'
+
+  # (e) Uninstall after (b) restores the original semantically, other entries unchanged.
+  $e = Get-ManagedSettingsRemoval -ExistingText $b.Text -Added $b.Added -Created $b.Created
+  Assert-True (-not $e.DeleteFile) '(e) keeps a file we did not create'
+  Assert-True (Same-Json $e.Text $original) '(e) uninstall restores the original content'
+  # And uninstall after (a) deletes the file it created.
+  $ea = Get-ManagedSettingsRemoval -ExistingText $a.Text -Added $a.Added -Created $a.Created
+  Assert-True $ea.DeleteFile '(e) deletes a file it created once it is empty'
+
+  # Atomic write lands the exact text and leaves no temp file.
+  $target = Join-Path $workRoot 'out' 'managed-settings.json'
+  Write-ManagedSettingsAtomically -Path $target -Text $b.Text
+  Assert-True ([IO.File]::ReadAllText($target) -eq $b.Text) 'atomic write lands the text'
+  Assert-True (@(Get-ChildItem (Split-Path $target) -Filter '*.tmp' -Force).Count -eq 0) 'atomic write leaves no temp file'
+  Assert-True ((Get-ManagedSettingsBackupPath $target) -match '\.t3bak-\d{8}T\d{6}Z$') 'backup name carries a UTC timestamp'
+} finally {
+  Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+if ($failures.Count -gt 0) {
+  $failures | ForEach-Object { Write-Host "FAIL: $_" }
+  exit 1
+}
+Write-Host 'ManagedSettingsMerge: all checks passed.'
+exit 0

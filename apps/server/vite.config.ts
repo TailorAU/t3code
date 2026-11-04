@@ -12,10 +12,13 @@ import {
   isExternalCliDependency,
   shouldBundleCliDependency,
 } from "../../scripts/lib/cli-external-packages.ts";
+import { assertNoRemoteBuildConfig } from "../../tailor/build/assertNoRemoteBuildConfig.ts";
 
 export { shouldBundleCliDependency };
 
 const repoEnv = loadRepoEnv();
+// Tailor fork: no Clerk, relay or relay-tracing value may be compiled in.
+assertNoRemoteBuildConfig({ ...process.env, ...repoEnv });
 const cliBuildChannel = /^[^-+]+-(?:nightly|preview)\./.test(packageJson.version)
   ? "nightly"
   : "latest";

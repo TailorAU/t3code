@@ -29,7 +29,26 @@ export const RuntimeMode = Schema.Literals([
   "full-access",
 ]);
 export type RuntimeMode = typeof RuntimeMode.Type;
-export const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
+
+/**
+ * Tailor fork (TailorAU/t3code): compile-time ceiling on every runtime mode the server
+ * stores, hands to a provider, or grants to an MCP caller. Full access and Auto never
+ * exist in this build; the most permissive mode is Auto-accept edits.
+ */
+export const TAILOR_MAX_RUNTIME_MODE: RuntimeMode = "auto-accept-edits";
+const TAILOR_RUNTIME_MODE_RANK: Record<RuntimeMode, number> = {
+  "approval-required": 0,
+  "auto-accept-edits": 1,
+  auto: 2,
+  "full-access": 3,
+};
+export const clampRuntimeMode = (mode: RuntimeMode): RuntimeMode =>
+  TAILOR_RUNTIME_MODE_RANK[mode] > TAILOR_RUNTIME_MODE_RANK[TAILOR_MAX_RUNTIME_MODE]
+    ? TAILOR_MAX_RUNTIME_MODE
+    : mode;
+
+/** Tailor fork: Supervised by default (upstream: "full-access"). */
+export const DEFAULT_RUNTIME_MODE: RuntimeMode = "approval-required";
 
 export const ProviderInteractionMode = Schema.Literals(["default", "plan"]);
 export type ProviderInteractionMode = typeof ProviderInteractionMode.Type;

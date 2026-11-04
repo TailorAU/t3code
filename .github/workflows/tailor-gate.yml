@@ -1,0 +1,105 @@
+# Tailor fork gate (TailorAU/t3code). Required check on tailor/main.
+#
+# Runs the connector contract test, the connector scope and mode-cap tests, the
+# contracts suite and the provider-registry tests on Windows (the target platform).
+# The upstream workflows in this folder target upstream's self-hosted runners and
+# are disabled on the fork.
+#
+# Minutes are billed and rationed: Windows only; non-draft pull requests to
+# tailor/main and manual runs only; no schedule; superseded runs cancelled. The
+# whole upstream suite runs only when asked (workflow_dispatch with full_suite) and
+# is informational: upstream's own Windows lane says it does not pass on Windows yet.
+name: Tailor gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches:
+      - tailor/main
+  workflow_dispatch:
+    inputs:
+      full_suite:
+        description: "Also run every package's test suite (informational, slow)."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tailor-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Tailor gate (windows-latest)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      # Only the server, its workspace dependencies and the root tooling; no install
+      # scripts. The lockfile is frozen, so a drifted override fails here.
+      - name: Install (frozen lockfile)
+        shell: bash
+        run: npx -y pnpm@12.14.0 install --frozen-lockfile --ignore-scripts --filter "t3..." --filter "@t3tools/monorepo"
+
+      - name: Connector contract and contracts suite
+        shell: bash
+        working-directory: packages/contracts
+        env:
+          CI: "1"
+        run: ../../node_modules/.bin/vp test run --config ../../vite.config.ts --dir .
+
+      - name: Connector scopes, mode clamp, Claude lock, MCP access, registry, telemetry
+        shell: bash
+        working-directory: apps/server
+        env:
+          CI: "1"
+        run: >-
+          ../../node_modules/.bin/vp test run
+          src/tailor/connectorScopes.test.ts
+          src/tailor/claudeModeCap.test.ts
+          src/tailor/claudeLock.test.ts
+          src/tailor/modeClamp.test.ts
+          src/mcp/McpToolAccess.test.ts
+          src/auth/RpcAuthorization.test.ts
+          src/telemetry/AnalyticsService.test.ts
+          src/provider/ProviderInstanceRegistryHydration.test.ts
+          src/provider/ProviderRegistry.test.ts
+
+  full-suite:
+    name: Full suite, informational (windows-latest)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.full_suite }}
+    continue-on-error: true
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - name: Install
+        run: vp install
+
+      - name: Test
+        run: vp run --concurrency-limit 4 -r test

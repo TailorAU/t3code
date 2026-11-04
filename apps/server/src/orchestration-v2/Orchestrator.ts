@@ -4,6 +4,14 @@ import type {
   OrchestrationV2SearchThreadResult,
   OrchestrationV2ThreadHistoryPage,
 } from "@t3tools/contracts";
+import { clampRuntimeMode } from "@t3tools/contracts";
+
+/** Tailor fork: thread.create, thread.runtime-mode.set and delegated_task.request carry a mode. */
+function clampCommandRuntimeMode(command: OrchestrationV2ServerCommand): OrchestrationV2ServerCommand {
+  if (!("runtimeMode" in command)) return command;
+  const runtimeMode = clampRuntimeMode(command.runtimeMode);
+  return runtimeMode === command.runtimeMode ? command : { ...command, runtimeMode };
+}
 import {
   latestExecutedRun,
   latestRootProviderFailure,
@@ -13801,7 +13809,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     awaitRestartContinuation: Effect.fn("OrchestratorV2.awaitRestartContinuation")(function (run) {
       return effectOutbox.awaitSettled(`effect:restart-continuation:${run.id}`).pipe(Effect.ignore);
     }),
-    dispatch: dispatchWithReceipt,
+    // Tailor fork: every command, from a client or from the server itself, is clamped here.
+    dispatch: Effect.fn("orchestrationV2.dispatch.clamped")(function* (
+      command: OrchestrationV2ServerCommand,
+    ) {
+      return yield* dispatchWithReceipt(clampCommandRuntimeMode(command));
+    }),
     autoArmLimitRecovery: Effect.fn("OrchestratorV2.autoArmLimitRecovery")(function (input) {
       return threadDispatch.withLock(
         input.threadId,

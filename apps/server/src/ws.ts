@@ -1,4 +1,5 @@
 import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
+import { clampRuntimeMode } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
@@ -2051,7 +2052,8 @@ export const layerWsRpc = (
                       ? {}
                       : { generateTitle: input.generateTitle }),
                     modelSelection: input.modelSelection,
-                    runtimeMode: input.runtimeMode,
+                    // Tailor fork: launches are clamped like every other mode.
+                    runtimeMode: clampRuntimeMode(input.runtimeMode),
                     interactionMode: input.interactionMode,
                     workspaceStrategy: input.workspaceStrategy,
                     ...(input.initialMessage === undefined

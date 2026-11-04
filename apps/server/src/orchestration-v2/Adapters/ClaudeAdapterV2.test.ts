@@ -607,7 +607,8 @@ describe("ClaudeAdapterV2 native protocol logging", () => {
       allowedTools: ["Read"],
     });
     assert.deepEqual(overrides, {
-      allowedTools: ["Read", "mcp__t3-code__*"],
+      // Tailor fork: only T3's read-only tools are pre-approved.
+      allowedTools: ["Read", ...ClaudeAdapterV2.CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS],
       mcpServers: {
         "t3-code": {
           type: "http",

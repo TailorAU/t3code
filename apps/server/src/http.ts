@@ -60,6 +60,12 @@ const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
 const SVG_CONTENT_SECURITY_POLICY = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
 // Opaque origin blocks cookies, storage and API access while allowing scripts.
 // Agent HTML can open without a click, so disallow blocking modals.
+/**
+ * Tailor fork: the served web app may connect only to its own origin, and loads images only
+ * from it, so rendered agent output cannot beacon data out through image URLs.
+ */
+export const TAILOR_WEB_APP_CONTENT_SECURITY_POLICY = "connect-src 'self'; img-src 'self' data: blob:";
+
 const HTML_CONTENT_SECURITY_POLICY =
   "sandbox allow-scripts allow-forms allow-popups allow-downloads";
 
@@ -664,6 +670,8 @@ const handleStaticAndDevRequest = Effect.fn("handleStaticAndDevRequest")(
     const headers: Record<string, string> = {
       "Cache-Control": cacheControl,
       ...validators(fileInfo),
+      // Tailor fork: the web app talks only to this server (fetch, XHR, WebSocket).
+      ...(isHtml ? { "Content-Security-Policy": TAILOR_WEB_APP_CONTENT_SECURITY_POLICY } : {}),
     };
     const etag = headers.ETag;
     const lastModified = headers["Last-Modified"];

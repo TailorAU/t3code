@@ -10,6 +10,9 @@ import {
   resolveThemeLabelCollisions,
 } from "./vscodeThemeImport";
 
+/** Tailor fork: compile-time switch for Open VSX theme search and import. */
+export const TAILOR_DISABLE_OPEN_VSX = true as boolean;
+
 const OPEN_VSX_SEARCH_URL = "https://open-vsx.org/api/-/search";
 const MAX_VSIX_BYTES = 20 * 1024 * 1024;
 const MAX_SEARCH_BYTES = 512 * 1024;
@@ -241,6 +244,8 @@ export async function searchOpenVsxThemes(
   query: string,
   { signal, sortBy = "downloadCount" }: OpenVsxThemeSearchOptions = {},
 ): Promise<OpenVsxThemeExtension[]> {
+  // Tailor fork: no Open VSX theme search or import (it reaches open-vsx.org from the browser).
+  if (TAILOR_DISABLE_OPEN_VSX) throw new Error("Open VSX theme search is turned off in this build.");
   const searchText = query.trim();
   if (!searchText) return [];
   const url = new URL(OPEN_VSX_SEARCH_URL);
@@ -626,6 +631,7 @@ export async function importOpenVsxThemeExtension(
   extension: OpenVsxThemeExtension,
   signal?: AbortSignal,
 ): Promise<ReadonlyArray<ThemeDefinition>> {
+  if (TAILOR_DISABLE_OPEN_VSX) throw new Error("Open VSX theme import is turned off in this build.");
   const manifestResponse = await fetch(extension.manifestUrl, signal ? { signal } : {});
   if (!manifestResponse.ok) throw new Error("That Open VSX extension has no readable manifest.");
   const manifestBytes = await readCappedResponse(

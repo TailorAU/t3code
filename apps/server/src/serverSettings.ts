@@ -19,6 +19,7 @@ import {
   globalIdleCompaction,
   withIdleCompaction,
 } from "@t3tools/contracts";
+import { clampRuntimeMode } from "@t3tools/contracts";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -462,10 +463,16 @@ function selectionSupportsTextGeneration(
 }
 
 function resolveTextGenerationProvider(settings: ServerSettings): ServerSettings {
-  return isModelSelectionProviderEnabled(settings, settings.textGenerationModelSelection) &&
+  const resolved =
+    isModelSelectionProviderEnabled(settings, settings.textGenerationModelSelection) &&
     selectionSupportsTextGeneration(settings, settings.textGenerationModelSelection)
-    ? settings
-    : fallbackTextGenerationProvider(settings);
+      ? settings
+      : fallbackTextGenerationProvider(settings);
+  // Tailor fork: every settings read clamps the default mode to the build's ceiling.
+  const defaultRuntimeMode = clampRuntimeMode(resolved.defaultRuntimeMode);
+  return defaultRuntimeMode === resolved.defaultRuntimeMode
+    ? resolved
+    : { ...resolved, defaultRuntimeMode };
 }
 
 function fallbackTextGenerationProvider(settings: ServerSettings): ServerSettings {

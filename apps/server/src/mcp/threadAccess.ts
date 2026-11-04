@@ -9,6 +9,7 @@ import {
   ThreadId,
   type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
+import { clampRuntimeMode } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 
@@ -106,7 +107,11 @@ export const loadCaller = Effect.fn("mcp.loadCaller")(function* () {
     scope,
     threads,
     caller,
-    limits: { runtimeMode: caller.runtimeMode, interactionMode: caller.interactionMode },
+    // Tailor fork: T3's own MCP tools never see a mode above the build's ceiling.
+    limits: {
+      runtimeMode: clampRuntimeMode(caller.runtimeMode),
+      interactionMode: caller.interactionMode,
+    },
   } satisfies Caller;
 });
 

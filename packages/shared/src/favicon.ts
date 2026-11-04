@@ -71,6 +71,9 @@ export function toolActivityFaviconUrl(
   );
 }
 
+/** Tailor fork: compile-time switch for the Google favicon service. */
+export const TAILOR_DISABLE_FAVICON_SERVICE = true as boolean;
+
 export function faviconUrlForOrigin(rawUrl: string | null | undefined, size = 32): string | null {
   if (!rawUrl) return null;
   try {
@@ -78,6 +81,8 @@ export function faviconUrlForOrigin(rawUrl: string | null | undefined, size = 32
     if (!url.hostname) return null;
     if (url.protocol !== "http:" && url.protocol !== "https:") return null;
     if (!isPublicFaviconHost(url.hostname)) return null;
+    // Tailor fork: no third-party favicon service; it would tell Google every host the UI shows.
+    if (TAILOR_DISABLE_FAVICON_SERVICE) return null;
     return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(url.hostname)}&sz=${size}`;
   } catch {
     return null;

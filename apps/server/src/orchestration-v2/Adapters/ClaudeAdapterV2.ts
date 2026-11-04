@@ -1612,7 +1612,107 @@ export function makeClaudeQueryOptions(input: {
   ];
   const withDirectories =
     additionalDirectories.length === 0 ? options : { ...options, additionalDirectories };
-  return input.cwd === null ? withDirectories : { ...withDirectories, cwd: input.cwd };
+  return tailorLockClaudeQueryOptions(
+    input.cwd === null ? withDirectories : { ...withDirectories, cwd: input.cwd },
+    input.permissionMode,
+    input.environment,
+  );
+}
+
+/**
+ * Tailor fork: the machine policy written by tailor/policy/install-policy.ps1. Its folder is
+ * writable only by Administrators and SYSTEM. The location is fixed at compile time, not
+ * configurable, so a user setting cannot move it.
+ */
+export function tailorPolicyMarkerPath(
+  platform: string,
+  environment: Readonly<Record<string, string | undefined>>,
+): string {
+  if (platform === "win32") {
+    const programData = environment.ProgramData ?? environment.PROGRAMDATA ?? "C:\\ProgramData";
+    return `${programData.replace(/[\\/]+$/, "")}\\T3CodePolicy\\t3-policy.json`;
+  }
+  return "/etc/t3code-policy/t3-policy.json";
+}
+
+/** The installed Claude home and binary recorded in the machine policy, or null if absent. */
+export function tailorInstalledClaudePaths(
+  raw: string,
+): { readonly claudeConfigDir: string; readonly claudeExe: string } | null {
+  try {
+    const parsed = JSON.parse(raw) as {
+      readonly installed?: { readonly claudeConfigDir?: unknown; readonly claudeExe?: unknown };
+    };
+    const installed = parsed.installed;
+    return typeof installed?.claudeConfigDir === "string" &&
+      installed.claudeConfigDir.length > 0 &&
+      typeof installed.claudeExe === "string" &&
+      installed.claudeExe.length > 0
+      ? { claudeConfigDir: installed.claudeConfigDir, claudeExe: installed.claudeExe }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Tailor fork: tools the agent never gets, whatever the settings say. */
+export const TAILOR_CLAUDE_DISALLOWED_TOOLS: ReadonlyArray<string> = ["WebSearch", "WebFetch"];
+
+/** Claude permission-rule form of an absolute path: `//c/Users/x` on Windows, `//home/x` elsewhere. */
+function claudeAbsoluteRulePath(filePath: string): string {
+  const posix = filePath.replace(/\\/g, "/").replace(/\/+$/, "");
+  const drive = /^([A-Za-z]):\/(.*)$/.exec(posix);
+  return drive ? `//${drive[1]!.toLowerCase()}/${drive[2]}` : `/${posix}`;
+}
+
+/**
+ * Tailor fork: policy-tier Claude settings compiled into the server. They reach the Claude
+ * binary as `managedSettings`, which no user, project or local file can loosen. Agents may
+ * not edit Claude or MCP configuration, and may not read or change T3's own state (its
+ * signing key, session store and settings).
+ */
+export function tailorClaudeManagedSettings(environment?: NodeJS.ProcessEnv): ClaudeSdkSettings {
+  const t3Homes = ["~/.t3"];
+  const configured = environment?.T3CODE_HOME ?? process.env.T3CODE_HOME;
+  if (configured !== undefined && configured.trim().length > 0) {
+    t3Homes.push(claudeAbsoluteRulePath(configured.trim()));
+  }
+  const protectedConfig = ["**/.claude/**", "**/.mcp.json", "~/.claude.json"];
+  return {
+    permissions: {
+      deny: [
+        ...protectedConfig.flatMap((pattern) => [`Edit(${pattern})`, `Write(${pattern})`]),
+        ...t3Homes.flatMap((home) => [`Read(${home}/**)`, `Edit(${home}/**)`, `Write(${home}/**)`]),
+      ],
+    },
+  } as ClaudeSdkSettings;
+}
+
+/**
+ * Tailor fork: the last word on every Claude query this server opens.
+ * - `settingSources: []`: no user, project or local settings file is loaded, so a
+ *   repository's `.claude/settings*.json` hooks, permissions and MCP approvals never apply.
+ * - `strictMcpConfig`: only the MCP servers T3 passes; a repository's `.mcp.json` is ignored.
+ * - The permission mode is the runtime policy's, capped at acceptEdits; launch arguments
+ *   (`--permission-mode`, `--dangerously-skip-permissions`) cannot raise it.
+ */
+export function tailorLockClaudeQueryOptions(
+  options: ClaudeAgentSdkQueryOptions,
+  requestedMode: PermissionMode | undefined,
+  environment?: NodeJS.ProcessEnv,
+): ClaudeAgentSdkQueryOptions {
+  const { allowDangerouslySkipPermissions: _skipPermissions, ...rest } = options;
+  const mode = requestedMode ?? "default";
+  return {
+    ...rest,
+    permissionMode: mode === "bypassPermissions" || mode === "auto" ? "default" : mode,
+    settingSources: [],
+    strictMcpConfig: true,
+    managedSettings: tailorClaudeManagedSettings(environment),
+    disallowedTools: Array.from(
+      new Set([...(rest.disallowedTools ?? []), ...TAILOR_CLAUDE_DISALLOWED_TOOLS]),
+    ),
+  };
 }
 
 /**
@@ -1726,9 +1826,10 @@ export function claudeMcpQueryOverrides(input: {
   if (session === undefined) {
     return input.allowedTools === undefined ? {} : { allowedTools: input.allowedTools };
   }
-  const mcpAllowedTools = input.readOnlySandbox
-    ? CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS
-    : [CLAUDE_T3_MCP_TOOL_WILDCARD];
+  // Tailor fork: only T3's read-only tools are pre-approved; every other T3 tool asks.
+  // Upstream pre-approves CLAUDE_T3_MCP_TOOL_WILDCARD outside read-only sandboxes.
+  void input.readOnlySandbox;
+  const mcpAllowedTools = CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS;
   return {
     allowedTools: Array.from(new Set([...(input.allowedTools ?? []), ...mcpAllowedTools])),
     mcpServers: {
@@ -2557,7 +2658,10 @@ export function claudeRuntimeQueryPolicyForRuntimePolicy(
   availability: ClaudeBypassAvailability = CLAUDE_BYPASS_FULLY_AVAILABLE,
 ): ClaudeRuntimeQueryPolicy {
   const requestedMode = permissionModeForClaudeRuntimePolicy(runtimePolicy);
-  const downgraded = requestedMode === "bypassPermissions" && availability.bypassDisabled;
+  // Tailor fork: a disabled Auto mode also caps a requested Auto, not only a Full access fallback.
+  const downgraded =
+    (requestedMode === "bypassPermissions" && availability.bypassDisabled) ||
+    (requestedMode === "auto" && availability.autoDisabled);
   const permissionMode = downgraded
     ? availability.autoDisabled
       ? "default"
@@ -3422,18 +3526,15 @@ export function permissionResultFromDecision(input: {
   readonly suggestions?: Parameters<CanUseTool>[2]["suggestions"];
   readonly feedback?: string;
 }): PermissionResult {
+  // Tailor fork: no standing grants. "Accept for session" approves this one call only, so a
+  // single answer can never widen what later calls may do (upstream adds session rules,
+  // falling back to the whole tool name).
   if (input.decision === "accept" || input.decision === "acceptForSession") {
     return {
       behavior: "allow",
       updatedInput: input.toolInput,
       toolUseID: input.toolUseID,
-      decisionClassification:
-        input.decision === "acceptForSession" ? "user_permanent" : "user_temporary",
-      ...(input.decision === "acceptForSession"
-        ? {
-            updatedPermissions: toSessionPermissionUpdates(input.toolName, input.suggestions),
-          }
-        : {}),
+      decisionClassification: "user_temporary",
     };
   }
 
@@ -3450,7 +3551,8 @@ export function permissionResultFromDecision(input: {
   };
 }
 
-function toSessionPermissionUpdates(
+/** Upstream's session grant builder; unused while the Tailor fork allows no standing grants. */
+export function toSessionPermissionUpdates(
   toolName: string,
   suggestions: ReadonlyArray<PermissionUpdate> | undefined,
 ): Array<PermissionUpdate> {
@@ -4516,6 +4618,38 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
     adapterOptions.settings.homePath.trim().length > 0 ||
     adapterOptions.environment.CLAUDE_CONFIG_DIR !== hostEnvironment.CLAUDE_CONFIG_DIR;
   const announcedBypassDowngrades = new Set<ThreadId>();
+  // Tailor fork: when the machine policy is installed, Claude runs only from the policy's
+  // Claude home and binary. Anything else, or an unreadable policy, refuses to start a query.
+  const tailorPolicyCheck = yield* Effect.cached(
+    Effect.gen(function* () {
+      const markerPath = tailorPolicyMarkerPath(hostPlatform, hostEnvironment);
+      const raw = yield* fileSystem.readFileString(markerPath).pipe(
+        Effect.map((text): string | null => text),
+        Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(null)),
+      );
+      if (raw === null) return;
+      const installed = tailorInstalledClaudePaths(raw);
+      const same = (left: string, right: string) =>
+        hostPlatform === "win32"
+          ? path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase()
+          : path.resolve(left) === path.resolve(right);
+      const binaryPath = adapterOptions.settings.binaryPath.trim();
+      if (
+        installed === null ||
+        !same(homePath, installed.claudeConfigDir) ||
+        binaryPath.length === 0 ||
+        !same(binaryPath, installed.claudeExe)
+      ) {
+        return yield* new ClaudeAgentSdkQueryRunnerError({
+          method: "tailorPolicy",
+          cause: `The machine policy (${markerPath}) requires this Claude instance to use its Claude home and binary.`,
+        });
+      }
+    }),
+  );
+  const tailorPolicyGuard = tailorPolicyCheck.pipe(
+    Effect.mapError((cause) => queryRunnerError(cause, "tailorPolicy")),
+  );
   const readBypassSettings = (filePath: string) =>
     fileSystem.readFileString(filePath).pipe(
       Effect.flatMap(decodeClaudeBypassSettings),
@@ -4739,9 +4873,21 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const queryPolicyForTurn = Effect.fnUntraced(function* (
           turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
         ) {
-          if (
-            permissionModeForClaudeRuntimePolicy(turnInput.runtimePolicy) !== "bypassPermissions"
-          ) {
+          const requestedMode = permissionModeForClaudeRuntimePolicy(turnInput.runtimePolicy);
+          if (requestedMode === "auto" && customHome) {
+            // Tailor fork: Claude skips a custom home's settings.json (settingSources leave out
+            // "user"), so its disableAutoMode would never apply. Enforce it here; an unreadable
+            // file fails closed to Supervised.
+            const home = yield* readBypassSettings(path.join(homePath, "settings.json")).pipe(
+              Effect.map(claudeBypassAvailability),
+              Effect.option,
+            );
+            return claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy, {
+              bypassDisabled: false,
+              autoDisabled: Option.isNone(home) || home.value.autoDisabled,
+            });
+          }
+          if (requestedMode !== "bypassPermissions") {
             return claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy);
           }
           const cwd = turnInput.runtimePolicy.cwd;
@@ -10087,6 +10233,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
           nativeThreadId: string,
         ) {
+          yield* tailorPolicyGuard;
           const queryPolicy = yield* queryPolicyForTurn(turnInput);
           const mcpSession = yield* mcpSessions.read(turnInput.threadId);
           const mcpOverrides = claudeMcpQueryOverrides({

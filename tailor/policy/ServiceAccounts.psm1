@@ -328,7 +328,9 @@ function Get-T3LauncherText {
     [string] $SettingsSeedPath,
     # The bridge pipe shim (Get-BridgePipeShimText) and the pwsh that runs it.
     [Parameter(Mandatory)][string] $PipeShimPath,
-    [Parameter(Mandatory)][string] $PwshPath
+    [Parameter(Mandatory)][string] $PwshPath,
+    # The only PATH T3 and its children get: admin-owned folders (installer-checked).
+    [Parameter(Mandatory)][string[]] $ServerPath
   )
   $q = $script:LauncherQuote
   $set = foreach ($name in $Environment.Keys) {
@@ -352,6 +354,7 @@ $(Get-MarkerCheckText -MarkerPath $MarkerPath -RequiredFiles $RequiredFiles)
 $(Get-UnsetText $MustBeUnset)
 $($set -join "`n")
 `$env:T3CODE_HOME = $(& $q $T3Home)
+`$env:PATH = $(& $q ($ServerPath -join ';'))
 $seed
 while (`$true) {
   `$refusal = Test-T3Verified
@@ -360,10 +363,18 @@ while (`$true) {
   # The bridge pipe (as this account), relaying only to the t3 serve just started.
   `$shim = Start-Process -FilePath $(& $q $PwshPath) -NoNewWindow -PassThru -ArgumentList @(
     '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $(& $q $PipeShimPath), '-ServerPid', [string]`$server.Id)
-  if (`$shim.WaitForExit(5000) -and `$shim.ExitCode -eq 3) {
-    Write-Error 'BRIDGE PIPE REFUSED: another process already holds the T3 bridge pipe name. The bridge cannot reach T3 until it is gone.' -ErrorAction Continue
+  while (-not `$server.HasExited) {
+    if (`$shim.HasExited) {
+      if (`$shim.ExitCode -eq 3) {
+        Write-Error 'BRIDGE PIPE REFUSED: another process already holds the T3 bridge pipe name. The bridge cannot reach T3 until it is gone.' -ErrorAction Continue
+      }
+      Start-Sleep -Seconds 5
+      # Restarted while T3 is up: the bridge must never find the name free for long.
+      `$shim = Start-Process -FilePath $(& $q $PwshPath) -NoNewWindow -PassThru -ArgumentList @(
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $(& $q $PipeShimPath), '-ServerPid', [string]`$server.Id)
+    }
+    [void]`$server.WaitForExit(2000)
   }
-  `$server.WaitForExit()
   if (-not `$shim.HasExited) { Stop-Process -Id `$shim.Id -Force -ErrorAction SilentlyContinue }
   Start-Sleep -Seconds 10
 }
@@ -437,12 +448,18 @@ if (`$refusal) { Write-Warning "Token not issued: `$refusal"; exit 1 }
 `$t3 = $(& $q $T3Exe)
 `$drop = $(& $q $DropPath)
 function Get-ConnectorSessions {
-  @((& `$t3 auth session list --base-dir `$env:T3CODE_HOME --json) | ConvertFrom-Json |
-    Where-Object { @(`$_.scopes) -contains 'tailor:connector' } | Sort-Object { [DateTime]`$_.issuedAt } -Descending)
+  `$listed = & `$t3 auth session list --base-dir `$env:T3CODE_HOME --json
+  if (`$LASTEXITCODE -ne 0) { throw "Listing sessions failed (`$LASTEXITCODE)." }
+  @(`$listed | ConvertFrom-Json | Where-Object { @(`$_.scopes) -contains 'tailor:connector' } | Sort-Object { [DateTime]`$_.issuedAt } -Descending)
+}
+function Revoke-ConnectorSession([string] `$sessionId) {
+  & `$t3 auth session revoke --base-dir `$env:T3CODE_HOME `$sessionId | Out-Null
+  if (`$LASTEXITCODE -ne 0) { throw "Revoking a connector session failed (`$LASTEXITCODE)." }
 }
 if (`$RevokeAllPrevious) {
   # Rotate now: every existing connector session goes first, whatever happens next.
-  foreach (`$old in (Get-ConnectorSessions)) { & `$t3 auth session revoke --base-dir `$env:T3CODE_HOME `$old.sessionId | Out-Null }
+  foreach (`$old in (Get-ConnectorSessions)) { Revoke-ConnectorSession `$old.sessionId }
+  if (@(Get-ConnectorSessions).Count -ne 0) { Write-Error 'Connector sessions remain after revoking them all.' -ErrorAction Continue; exit 4 }
 }
 # This account may create the drop file but not see or delete it: claim it first, then issue.
 try {
@@ -471,9 +488,10 @@ try {
 # Daily: keep the newest previous token, which the bridge still holds until the mover runs.
 # -RevokeAllPrevious (install -RotateConnectorToken): revoke every previous connector session.
 `$keep = if (`$RevokeAllPrevious) { 0 } else { 1 }
-foreach (`$old in (`$sessions | Select-Object -Skip `$keep)) {
-  & `$t3 auth session revoke --base-dir `$env:T3CODE_HOME `$old.sessionId | Out-Null
-}
+foreach (`$old in (`$sessions | Select-Object -Skip `$keep)) { Revoke-ConnectorSession `$old.sessionId }
+# Proven, not assumed: re-list; only the new session (and, daily, one previous) may remain.
+`$left = @(Get-ConnectorSessions | Where-Object { `$_.sessionId -ne `$newSession })
+if (`$left.Count -gt `$keep) { Write-Error "`$(`$left.Count) previous connector sessions remain; expected at most `$keep." -ErrorAction Continue; exit 4 }
 "@
 }
 
@@ -734,8 +752,9 @@ function New-T3BridgePipeSecurity {
   $rule = { param($sid, $rights) [System.IO.Pipes.PipeAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid), [System.IO.Pipes.PipeAccessRights]$rights, 'Allow') }
   $security.AddAccessRule((& $rule $BridgeSid 'ReadWrite'))
   $security.AddAccessRule((& $rule 'S-1-5-18' 'ReadWrite'))
-  # Only the owner may add instances (FILE_CREATE_PIPE_INSTANCE); it needs nothing else.
-  $security.AddAccessRule((& $rule $OwnerSid 'CreateNewInstance, Synchronize'))
+  # Only the owner may add instances: FILE_CREATE_PIPE_INSTANCE plus read/write, which
+  # CreateNamedPipe needs for a further instance (0x12019f). Nobody else gets create-instance.
+  $security.AddAccessRule((& $rule $OwnerSid 'ReadWrite, CreateNewInstance, Synchronize'))
   return $security
 }
 
@@ -757,7 +776,7 @@ function Get-T3BridgePipeIssues {
     $sid = $ace.SecurityIdentifier.Value; $mask = [int64]$ace.AccessMask
     $seen[$sid] = $true
     if ($sid -eq $AgentSid) {
-      if (($mask -band (-bnot ($createInstance -bor 0x100000))) -ne 0) { $issues.Add("the agent account has more than create-instance (0x$('{0:x}' -f $mask))") }
+      if ($mask -ne 0x12019f) { $issues.Add("the agent account has 0x$('{0:x}' -f $mask), not exactly read/write + create-instance (0x12019f)") }
     } elseif ($sid -eq $BridgeSid -or $sid -eq 'S-1-5-18') {
       if (($mask -band $createInstance) -ne 0) { $issues.Add("$sid may create pipe instances") }
       if ($sid -eq $BridgeSid -and ($mask -band 0x3) -ne 0x3) { $issues.Add('the bridge account cannot read and write the pipe') }
@@ -825,7 +844,7 @@ $($script:PipeNativeSource)
 `$security = [System.IO.Pipes.PipeSecurity]::new()
 `$security.SetAccessRuleProtection(`$true, `$false)
 `$security.SetOwner([Security.Principal.SecurityIdentifier]::new($(& $q $AgentSid)))
-foreach (`$g in @(@($(& $q $BridgeSid), 'ReadWrite'), @('S-1-5-18', 'ReadWrite'), @($(& $q $AgentSid), 'CreateNewInstance, Synchronize'))) {
+foreach (`$g in @(@($(& $q $BridgeSid), 'ReadWrite'), @('S-1-5-18', 'ReadWrite'), @($(& $q $AgentSid), 'ReadWrite, CreateNewInstance, Synchronize'))) {
   `$security.AddAccessRule([System.IO.Pipes.PipeAccessRule]::new([Security.Principal.SecurityIdentifier]::new(`$g[0]), [System.IO.Pipes.PipeAccessRights]`$g[1], 'Allow'))
 }
 `$descriptor = `$security.GetSecurityDescriptorBinaryForm()
@@ -854,10 +873,13 @@ while (`$true) {
   `$tcp = [Net.Sockets.TcpClient]::new()
   try {
     `$tcp.Connect([Net.IPAddress]::Loopback, $T3Port)
-    `$local = ([Net.IPEndPoint]`$tcp.Client.LocalEndPoint).Port
-    # The accepting side of this very connection must be the t3 serve the launcher started.
-    `$accepted = @(Get-NetTCPConnection -LocalPort $T3Port -RemotePort `$local -State Established -ErrorAction SilentlyContinue | ForEach-Object OwningProcess)
-    if (`$accepted.Count -ne 1 -or `$accepted[0] -ne `$ServerPid) { throw "the T3 port is not served by T3 (PID `$(`$accepted -join ', '))" }
+    `$mine = [Net.IPEndPoint]`$tcp.Client.LocalEndPoint
+    `$theirs = [Net.IPEndPoint]`$tcp.Client.RemoteEndPoint
+    # The accepting side of this very connection (all four of its address and port values)
+    # must be the t3 serve the launcher started.
+    `$accepted = @(Get-NetTCPConnection -State Established -LocalAddress `$theirs.Address.ToString() -LocalPort `$theirs.Port ``
+      -RemoteAddress `$mine.Address.ToString() -RemotePort `$mine.Port -ErrorAction SilentlyContinue | ForEach-Object OwningProcess)
+    if (`$theirs.Port -ne $T3Port -or `$accepted.Count -ne 1 -or `$accepted[0] -ne `$ServerPid) { throw "the T3 port is not served by T3 (PID `$(`$accepted -join ', '))" }
   } catch {
     Write-Warning "Bridge connection refused: `$(`$_.Exception.Message)"
     `$tcp.Dispose(); `$pipe.Dispose(); continue
@@ -865,6 +887,31 @@ while (`$true) {
   `$net = `$tcp.GetStream()
   `$relays.Add([pscustomobject]@{ Pipe = `$pipe; Tcp = `$tcp; Task = [Threading.Tasks.Task]::WhenAny(`$pipe.CopyToAsync(`$net), `$net.CopyToAsync(`$pipe)) })
 }
+"@
+}
+
+<#
+  The SYSTEM pipe probe (on-demand task 'T3 pipe probe'): SYSTEM is in the pipe's DACL, so it
+  reads the security descriptor the pipe was created with, without being its owner, and writes
+  it to probe\pipe.json for verify-install.ps1.
+#>
+function Get-PipeProbeText {
+  param([Parameter(Mandatory)][string] $ResultPath)
+  $q = $script:LauncherQuote
+  return @"
+# Generated by install-policy.ps1. Runs as SYSTEM, on demand, for verify-install.ps1.
+$($script:PinModulesText)
+`$ErrorActionPreference = 'Stop'
+Add-Type -Namespace T3Policy -Name PipeNative -MemberDefinition @'
+$($script:PipeNativeSource)
+'@
+`$path = ([string][char]92) * 2 + '.' + [char]92 + 'pipe' + [char]92 + $(& $q $script:BridgePipeName)
+`$result = [ordered]@{ present = `$false }
+try { `$result.sddl = [T3Policy.PipeNative]::ReadSddl(`$path); `$result.present = `$true } catch { `$result.error = `$_.Exception.Message }
+`$result.at = [DateTime]::UtcNow.ToString('o')
+`$out = $(& $q $ResultPath)
+if (Test-Path -LiteralPath `$out) { [IO.File]::Delete(`$out) }
+[IO.File]::WriteAllText(`$out, (`$result | ConvertTo-Json))
 "@
 }
 
@@ -939,7 +986,11 @@ function Compare-PreInstallSnapshot {
   A scheduled task's security descriptor (SDDL): only Administrators and SYSTEM may change,
   delete, start or stop it. Read access for others is allowed.
 #>
-<# The security descriptor every task is registered with: Administrators and SYSTEM only. #>
+<#
+  The security descriptor every task is registered with: Administrators and SYSTEM only. The
+  flags 0x16 (TASK_CREATE_OR_UPDATE | TASK_DONT_ADD_PRINCIPAL_ACE) stop Task Scheduler adding
+  read access for the run-as account.
+#>
 $script:TaskSddl = 'D:P(A;;FA;;;BA)(A;;FA;;;SY)'
 
 function Get-TaskSecurityIssues {
@@ -1184,14 +1235,14 @@ function Register-ServiceTask {
   $definition = $service.NewTask(0)
   $definition.XmlText = $Xml
   if ($System) {
-    [void]$folder.RegisterTaskDefinition($TaskName, $definition, 6, 'SYSTEM', $null, 5, $script:TaskSddl)   # TASK_LOGON_SERVICE_ACCOUNT
+    [void]$folder.RegisterTaskDefinition($TaskName, $definition, 0x16, 'SYSTEM', $null, 5, $script:TaskSddl)   # TASK_LOGON_SERVICE_ACCOUNT
     return
   }
   $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
   $plain = $null
   try {
     $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-    [void]$folder.RegisterTaskDefinition($TaskName, $definition, 6, ".\$Account", $plain, 1, $script:TaskSddl)   # TASK_LOGON_PASSWORD
+    [void]$folder.RegisterTaskDefinition($TaskName, $definition, 0x16, ".\$Account", $plain, 1, $script:TaskSddl)   # TASK_LOGON_PASSWORD
   } finally {
     [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
     if ($null -ne $plain) { Clear-ManagedString $plain; $plain = $null }
@@ -1235,7 +1286,7 @@ Export-ModuleMember -Function New-ServiceAccountPasswordChars, Get-ServiceAccoun
   Get-MarkerCheckText, Get-T3LauncherText, Get-BridgeLauncherText, Get-TokenIssuerText, Get-TokenMoverText,
   Get-KeyRotationText, Get-EmergencyRevokePlan, Test-SigningKeyFresh, Get-LastRevokeTime,
   Initialize-T3PipeNative, Get-T3BridgePipePath, New-T3BridgePipeSecurity, Get-T3BridgePipeIssues, Connect-T3BridgePipe,
-  Get-BridgePipeShimText, ConvertFrom-UserRightsInf, Compare-UserRightsSnapshot,
+  Get-BridgePipeShimText, Get-PipeProbeText, ConvertFrom-UserRightsInf, Compare-UserRightsSnapshot,
   Compare-PreInstallSnapshot, Get-TaskSecurityIssues, Get-AgentProbeText, Test-AgentProbeResult,
   Test-GitVersionAtLeast, Clear-ManagedString,
   Get-AccountGroups, Set-ServiceAccount, Invoke-SeceditUserRights, Register-ServiceTask, Remove-ServiceTask,

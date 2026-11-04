@@ -90,6 +90,10 @@ Severity: Critical, High, Medium, Low, Info. Status: Fixed (in this PR), Mitigat
 | T3-72 | Revoke left pairing links; one kill pass; scope not stated | Medium | Fixed |
 | T3-73 | Delta review: investigation tools, git knobs, managed-tier helpers, HTML caching, tasks' own accounts, workspace owners, upgrade baselines, host checks, account adoption | Medium | Fixed (UNVERIFIED elevated where noted) |
 | T3-74 | Upstream MCP tests outside the gate failed under the Supervised ceiling | Low | Fixed (rewritten; `src/mcp` in the gate) |
+| T3-75 | An unresolved command ran a fixed substitute path any user could plant | High | Fixed (refused, nothing spawned) |
+| T3-76 | The bridge pipe as built could not add instances; descriptor read as owner | High | Fixed |
+| T3-77 | Task Scheduler added read access for each task's own account | High | Fixed (`TASK_DONT_ADD_PRINCIPAL_ACE`) |
+| T3-78 | Delta review 3: rotation proof, libuv note, `.git` links, kill counting, bridge attestation, PATH, four-tuple, managed-tier allowlist, race coverage | Medium | Fixed (UNVERIFIED elevated where noted) |
 
 ## Findings
 
@@ -977,12 +981,59 @@ Codex transcript recorded at full access: the build has no Codex driver and no f
 Tests with the policy installed (a stubbed ProgramData known folder) cover the orchestrator
 and MCP worktree checks.
 
+### T3-75 No substitute command (High, Fixed)
+
+An unresolved bare name was rewritten to `C:\T3CodePolicy-refused\command-not-allowed.exe`,
+which was then spawned; any user can create that folder, so a planted file would have run as
+`t3agent` (for example in place of `gh auth token`, whose output is trusted). Now an unresolved
+name is refused with a `NotFound` platform error and nothing is spawned; a `shell: true` launch
+runs only if its first token is an existing absolute program path; piped commands are refused
+on Windows (none are used). All server spawns through the Effect spawner pass the decorator;
+the remaining direct `node:child_process` spawns use absolute paths (Claude from the policy,
+`reg.exe`, `process.execPath`) or run only off Windows. Test: an unresolved name spawns nothing
+even when every absolute path "exists".
+
+### T3-76 Bridge pipe (High, Fixed; UNVERIFIED elevated)
+
+Adding an instance needs read/write plus create-instance, so the owner (`t3agent`) now gets
+exactly `0x12019f`, and the shim's loop can keep an instance listening. The descriptor is read
+by a SYSTEM probe task (SYSTEM is in the DACL) instead of by the owner. Test with the
+installer's own grants: a further instance by the owner succeeds; with only the bridge's
+grant it fails.
+
+### T3-77 Task descriptors (High, Fixed; UNVERIFIED elevated)
+
+`RegisterTaskDefinition` gets flags `0x16` (create or update, `TASK_DONT_ADD_PRINCIPAL_ACE`),
+so the explicit Administrators/SYSTEM descriptor is what the task keeps. The self-check also
+fails on a task whose last result is a failure.
+
+### T3-78 Delta review 3 (Medium, Fixed; UNVERIFIED elevated where noted)
+
+- Rotation proof: the issuer checks the exit code of every list and revoke, re-lists, and exits
+  non-zero if more connector sessions remain than allowed.
+- `NoDefaultCurrentDirectoryInExePath` protects libuv because it is in the server's own
+  environment (set at the CLI entry); the comment and test now say so.
+- A `.git` that is a link or junction is refused; nested submodule gitdirs are allowed.
+- Revoke counts a process as stopped only when `Stop-Process` succeeds, and loops until none
+  is found.
+- `-BridgeExe` requires `-BridgeUsesPipeOnly` until the bridge client is reviewed (loopback is
+  not filtered by Windows Firewall).
+- T3's PATH is set by the launcher from admin-only folders; the server skips its PATH
+  re-read under the policy; Claude may not edit folders that could reach t3agent's PATH or
+  profile; the self-check checks the recorded PATH.
+- The shim matches its connection's full four-tuple, and the launcher restarts it if it dies.
+- The machine managed tier is checked against an allowlist of restrictive keys.
+- The orchestrator's under-lock recheck is covered again: a plan-limited caller's write is
+  refused when the user raises the interaction mode after the check.
+
 ## What was verified
 
 - Locally on Windows (frozen lockfile), after the delta review: the contracts suite (161/161)
-  and the gate's server tests: `src/mcp` 292/292 (27 files, every upstream MCP test now in the
-  gate), and the rest 475 passed plus 1 upstream skip (19 files: git hardening including a real
-  planted-`git.exe` spawn and `.git` file checks, worktree checks with the policy installed,
+  and the gate's server tests, 770 passed plus 1 upstream skip: `src/tailor`, `src/mcp` (every
+  upstream MCP test, including the restored interaction-mode race) and `http.test.ts` 366/366
+  in 38 files, and the other gate files 404 passed plus 1 skip (git hardening including a real
+  planted-`git.exe` spawn, refusal with nothing spawned, `.git` link and nested-submodule
+  checks, worktree checks with the policy installed,
   workspace paths, CSP and the frame-only HTML rule with its cache headers, signing-key
   rotation, the investigation argv, `http.test.ts`). Server `src` and contracts typecheck
   clean. `t3 auth rotate-signing-keys` ran from source against a throwaway base dir: four keys

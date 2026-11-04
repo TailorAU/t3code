@@ -98,11 +98,14 @@ function Test-Parses([string] $text) { $errors = $null; [void][Management.Automa
 $launcher = Get-T3LauncherText -T3Exe 'C:\Program Files\T3Code\t3.exe' -T3Home 'C:\ProgramData\T3CodePolicy\t3-home' `
   -Environment ([ordered]@{ T3CODE_HOST = '127.0.0.1'; T3CODE_LAN = 'false' }) -MustBeUnset @('HTTPS_PROXY', 'NODE_OPTIONS') `
   -MarkerPath 'C:\ProgramData\T3CodePolicy\service\verified.json' -RequiredFiles @('C:\Program Files\T3Code\t3.exe') -SettingsSeedPath 'C:\ProgramData\T3CodePolicy\service\t3-settings.seed.json' `
-  -PipeShimPath 'C:\ProgramData\T3CodePolicy\service\bridge-pipe.ps1' -PwshPath 'C:\Program Files\PowerShell\7\pwsh.exe'
+  -PipeShimPath 'C:\ProgramData\T3CodePolicy\service\bridge-pipe.ps1' -PwshPath 'C:\Program Files\PowerShell\7\pwsh.exe' `
+  -ServerPath @('C:\Windows\System32', 'C:\Program Files\Git\cmd')
 Assert-True (Test-Parses $launcher) 'the T3 launcher parses'
 $firstCode = @($launcher -split "`n" | Where-Object { $_.Trim() -and -not $_.TrimStart().StartsWith('#') })[0]
 Assert-True ($firstCode.StartsWith('$env:PSModulePath')) 'the module-path pin is the launcher''s first statement'
 Assert-True ($launcher.Contains('bridge-pipe.ps1') -and $launcher.IndexOf("'serve'") -lt $launcher.IndexOf('bridge-pipe.ps1')) 'the launcher starts the bridge pipe shim after t3 serve'
+Assert-True ($launcher.Contains("`$env:PATH = 'C:\Windows\System32;C:\Program Files\Git\cmd'")) 'the launcher sets the admin-controlled PATH'
+Assert-True ($launcher.Contains('if ($shim.HasExited)')) 'the launcher restarts the shim if it dies while T3 runs'
 Assert-True ($launcher.Contains("`$env:T3CODE_HOST = '127.0.0.1'")) 'launcher sets the policy environment'
 Assert-True ($launcher.Contains("Remove-Item -LiteralPath 'Env:HTTPS_PROXY'")) 'launcher clears proxy variables'
 Assert-True ($launcher.Contains("`$env:T3CODE_HOME = 'C:\ProgramData\T3CodePolicy\t3-home'")) 'launcher pins the T3 home'
@@ -110,9 +113,9 @@ $loop = $launcher.IndexOf('while')
 Assert-True ($launcher.IndexOf('Test-T3Verified', $loop) -gt $loop -and $launcher.IndexOf('Test-T3Verified', $loop) -lt $launcher.IndexOf('Start-Process')) 'launcher checks the marker before every start'
 Assert-True ($launcher.Contains('t3-settings.seed.json')) 'the launcher (t3agent) seeds T3 settings, not the installer'
 $refused = $false
-try { [void](Get-T3LauncherText -T3Exe 'x.exe' -T3Home 'h' -Environment ([ordered]@{ 'PATH' = 'x' }) -MustBeUnset @() -MarkerPath 'm' -RequiredFiles @('x') -PipeShimPath 's' -PwshPath 'p') } catch { $refused = $true }
+try { [void](Get-T3LauncherText -T3Exe 'x.exe' -T3Home 'h' -Environment ([ordered]@{ 'PATH' = 'x' }) -MustBeUnset @() -MarkerPath 'm' -RequiredFiles @('x') -PipeShimPath 's' -PwshPath 'p' -ServerPath @('C:\Windows')) } catch { $refused = $true }
 Assert-True $refused 'launcher refuses non-T3CODE variables'
-$quoted = Get-T3LauncherText -T3Exe "C:\it's\t3.exe" -T3Home 'h' -Environment ([ordered]@{}) -MustBeUnset @() -MarkerPath 'm' -RequiredFiles @("C:\it's\t3.exe") -PipeShimPath 's' -PwshPath 'p'
+$quoted = Get-T3LauncherText -T3Exe "C:\it's\t3.exe" -T3Home 'h' -Environment ([ordered]@{}) -MustBeUnset @() -MarkerPath 'm' -RequiredFiles @("C:\it's\t3.exe") -PipeShimPath 's' -PwshPath 'p' -ServerPath @('C:\Windows')
 Assert-True ($quoted.Contains("'C:\it''s\t3.exe'") -and (Test-Parses $quoted)) 'launcher quotes paths safely'
 $bridge = Get-BridgeLauncherText -BridgeExe 'C:\Program Files\T3Bridge\bridge.exe' -TokenPath 'C:\ProgramData\T3CodePolicy\connector\token' `
   -KeyPath 'C:\ProgramData\T3CodePolicy\bridge\tailor-api-key' -MustBeUnset @('HTTPS_PROXY') -MarkerPath 'm' -RequiredFiles @('b') -AgentSid 'S-1-5-21-9-1001'
@@ -128,6 +131,7 @@ Assert-True ($issuer.Contains('sessionId -ne $newSession')) 'the new session is 
 $rotateFirst = $issuer.IndexOf('if (`$RevokeAllPrevious) {'.Replace('`', ''))
 Assert-True ($rotateFirst -gt 0 -and $rotateFirst -lt $issuer.IndexOf('CreateNew')) 'rotate-now revokes every previous session before it tries to claim the drop'
 Assert-True ($issuer.Contains('exit 2')) 'rotate-now fails loudly when an unmoved token blocks the drop'
+Assert-True ($issuer.Contains('LASTEXITCODE -ne 0) { throw "Listing') -and $issuer.Contains('Revoking a connector session failed') -and $issuer.Contains('exit 4')) 'revokes are checked and the remaining sessions re-listed'
 $mover = Get-TokenMoverText -DropPath 'C:\d\token' -TokenPath 'C:\c\token' -AgentSid 'S-1-5-21-9-1001' -BridgeSid 'S-1-5-21-9-1002'
 Assert-True (Test-Parses $mover) 'the mover parses'
 Assert-True ($mover.Contains('ReparsePoint') -and $mover.Contains('hardlink') -and $mover.Contains("'S-1-5-21-9-1001'")) 'the mover refuses links and foreign owners'
@@ -165,12 +169,37 @@ $pipeSecurity = New-T3BridgePipeSecurity -OwnerSid $agentT -BridgeSid $bridgeT
 $pipeSddl = $pipeSecurity.GetSecurityDescriptorSddlForm('Owner, Access')
 Assert-True (@(Get-T3BridgePipeIssues -Sddl $pipeSddl -AgentSid $agentT -BridgeSid $bridgeT).Count -eq 0) "the planned pipe descriptor passes ($pipeSddl)"
 Assert-True ($pipeSecurity.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq $agentT -and $pipeSecurity.AreAccessRulesProtected) 'owner t3agent, protected DACL'
+Assert-True ($pipeSddl.Contains("(A;;0x12019f;;;$agentT)") -and $pipeSddl.Contains("(A;;0x12019b;;;$bridgeT)")) "the owner gets exactly 0x12019f, the bridge 0x12019b ($pipeSddl)"
+# The installer's grants, with the test user standing in for t3agent: a further instance by the
+# owner succeeds; with only the bridge's grant (no create-instance) it fails.
+$ownerSecurity = New-T3BridgePipeSecurity -OwnerSid ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -BridgeSid 'S-1-5-32-546'
+$ownerName = 't3test-owner-' + [guid]::NewGuid().ToString('N')
+Initialize-T3PipeNative
+$ownerPath = Get-T3BridgePipePath $ownerName
+$firstOwned = [T3Policy.PipeNative]::Create($ownerPath, $ownerSecurity.GetSecurityDescriptorBinaryForm(), $true, 8)
+try {
+  $more = $false; try { [T3Policy.PipeNative]::Create($ownerPath, $ownerSecurity.GetSecurityDescriptorBinaryForm(), $false, 8).Dispose(); $more = $true } catch { }
+  Assert-True $more 'with the installer grants, the owner can add instances (the shim keeps one listening)'
+} finally { $firstOwned.Dispose() }
+$bridgeOnly = [System.IO.Pipes.PipeSecurity]::new()
+$bridgeOnly.SetAccessRuleProtection($true, $false)
+$bridgeOnly.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User)
+$bridgeOnly.AddAccessRule([System.IO.Pipes.PipeAccessRule]::new([Security.Principal.WindowsIdentity]::GetCurrent().User, 'ReadWrite, Synchronize', 'Allow'))
+$bridgeName = 't3test-bridge-' + [guid]::NewGuid().ToString('N')
+$bridgePath = Get-T3BridgePipePath $bridgeName
+$firstBridge = [T3Policy.PipeNative]::Create($bridgePath, $bridgeOnly.GetSecurityDescriptorBinaryForm(), $true, 8)
+try {
+  $more = $false; try { [T3Policy.PipeNative]::Create($bridgePath, $bridgeOnly.GetSecurityDescriptorBinaryForm(), $false, 8).Dispose(); $more = $true } catch { }
+  Assert-True (-not $more) 'with only the bridge grant (no create-instance), adding an instance fails'
+} finally { $firstBridge.Dispose() }
+Assert-True (Test-Parses (Get-PipeProbeText -ResultPath 'C:\P\probe\pipe.json')) 'the SYSTEM pipe probe parses'
 foreach ($bad in @(
-    @('O:BAD:P(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x100004;;;S-1-5-21-9-1001)', 'owner not the agent'),
-    @("O:S-1-5-21-9-1001D:P(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x100004;;;S-1-5-21-9-1001)(A;;0x12019b;;;BU)", 'Users granted'),
-    @("O:S-1-5-21-9-1001D:P(A;;0x12019f;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x100004;;;S-1-5-21-9-1001)", 'the bridge may create instances'),
-    @("O:S-1-5-21-9-1001D:P(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x12019f;;;S-1-5-21-9-1001)", 'the agent has more than create-instance'),
-    @("O:S-1-5-21-9-1001D:(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x100004;;;S-1-5-21-9-1001)", 'DACL not protected'))) {
+    @('O:BAD:P(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x12019f;;;S-1-5-21-9-1001)', 'owner not the agent'),
+    @("O:S-1-5-21-9-1001D:P(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x12019f;;;S-1-5-21-9-1001)(A;;0x12019b;;;BU)", 'Users granted'),
+    @("O:S-1-5-21-9-1001D:P(A;;0x12019f;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x12019f;;;S-1-5-21-9-1001)", 'the bridge may create instances'),
+    @("O:S-1-5-21-9-1001D:P(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x1f01ff;;;S-1-5-21-9-1001)", 'the agent has more than its grant'),
+    @("O:S-1-5-21-9-1001D:P(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x100004;;;S-1-5-21-9-1001)", 'the agent cannot add instances'),
+    @("O:S-1-5-21-9-1001D:(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x12019f;;;S-1-5-21-9-1001)", 'DACL not protected'))) {
   Assert-True (@(Get-T3BridgePipeIssues -Sddl $bad[0] -AgentSid $agentT -BridgeSid $bridgeT).Count -gt 0) "pipe check catches: $($bad[1])"
 }
 Initialize-T3PipeNative
@@ -218,7 +247,7 @@ Assert-True (Test-Parses $shim) 'the pipe shim parses'
 Assert-True ($shim.Contains('Create(`$path, `$descriptor, `$true'.Replace('`', '')) -and $shim.Contains('exit 3')) 'the shim creates the first instance with FIRST_PIPE_INSTANCE and refuses if it exists'
 $waitAt = $shim.IndexOf('WaitForConnectionAsync'); $nextAt = $shim.IndexOf('Create($path, $descriptor, $false', $waitAt); $relayAt = $shim.IndexOf('TcpClient', $waitAt)
 Assert-True ($nextAt -gt $waitAt -and $nextAt -lt $relayAt) 'the next instance listens before the connected one is handed off'
-Assert-True ($shim.Contains('-RemotePort $local -State Established') -and $shim.Contains('-ne $ServerPid')) 'the shim checks the accepting process of its own connection'
+Assert-True ($shim.Contains('-LocalAddress $theirs.Address') -and $shim.Contains('-RemoteAddress $mine.Address') -and $shim.Contains('-RemotePort $mine.Port') -and $shim.Contains('-ne $ServerPid')) 'the shim matches the full four-tuple of its own connection'
 
 # User rights: only our SIDs added to our four rights.
 $sidA = 'S-1-5-21-9-1001'; $sidB = 'S-1-5-21-9-1002'

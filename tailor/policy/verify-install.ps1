@@ -311,6 +311,7 @@ $taskPlan = @(
   @{ Name = $installed.tasks.Rotate; User = $installed.agentAccount; Launcher = (Join-Path $service 'rotate-keys.ps1') }
   @{ Name = $installed.tasks.RotateToken; User = $installed.agentAccount; Launcher = (Join-Path $service 'issue-token.ps1') }
   @{ Name = $installed.tasks.Probe; User = $installed.agentAccount; Launcher = (Join-Path $service 'probe-agent.ps1') }
+  @{ Name = $installed.tasks.PipeProbe; User = 'SYSTEM'; Launcher = (Join-Path $service 'probe-pipe.ps1') }
 )
 $scheduler = New-Object -ComObject 'Schedule.Service'
 $scheduler.Connect()
@@ -337,7 +338,10 @@ foreach ($t in $taskPlan) {
     $sddl = $scheduler.GetFolder('\T3CodePolicy').GetTask($t.Name).GetSecurityDescriptor(4)
     $sdIssues = Get-TaskSecurityIssues -Sddl $sddl
     if (@($sdIssues).Count -gt 0) { throw (@($sdIssues) -join '; ') }
-    "as $($p.UserId), $($p.LogonType), LeastPrivilege, one action, only admins may change or run it"
+    # Last result: 0, still running, never run yet, or stopped by the installer.
+    $last = [int64](Get-ScheduledTaskInfo -TaskName $t.Name -TaskPath '\T3CodePolicy\').LastTaskResult
+    if (@(0, 0x41301, 0x41303, 0x41306) -notcontains $last) { throw "last result 0x$('{0:x}' -f $last)" }
+    "as $($p.UserId), $($p.LogonType), LeastPrivilege, one action, only admins may change or run it, last result 0x$('{0:x}' -f $last)"
   }
 }
 
@@ -364,6 +368,37 @@ Invoke-Check 'agent-probe' {
   if (@($issues).Count -gt 0) { throw (@($issues) -join '; ') }
   $pipeNote = if ($result.pipe.present) { 'bridge pipe owned by the agent, DACL as planned, no second first instance' } else { 'bridge pipe not up (T3 not started yet)' }
   "$pipeNote; as the agent: privileges $(@($result.privileges) -join ', '); no privileged group; $($expected.Count) access tests as expected"
+}
+
+# ---------- the bridge pipe, read as SYSTEM ----------
+Invoke-Check 'bridge-pipe' {
+  $pipeResult = Join-Path $PolicyDir 'probe\pipe.json'
+  if (Test-Path -LiteralPath $pipeResult) { [IO.File]::Delete($pipeResult) }
+  $code = Invoke-TaskAndWait $installed.tasks.PipeProbe
+  if ($code -ne 0) { throw "the pipe probe task did not finish successfully (result: $code)" }
+  if ((Get-Acl -LiteralPath $pipeResult).GetOwner([Security.Principal.SecurityIdentifier]).Value -notin 'S-1-5-18', 'S-1-5-32-544') { throw 'the pipe probe result is not SYSTEM''s' }
+  $pipe = Get-Content -LiteralPath $pipeResult -Raw | ConvertFrom-Json
+  [IO.File]::Delete($pipeResult)
+  if (-not $pipe.present) {
+    if ($RequirePipe) { throw "the bridge pipe is not up ($($pipe.error))" }
+    return 'not up (T3 not started yet); checked again once T3 runs'
+  }
+  $issues = Get-T3BridgePipeIssues -Sddl ([string]$pipe.sddl) -AgentSid $agentSid -BridgeSid $bridgeSid
+  if (@($issues).Count -gt 0) { throw (@($issues) -join '; ') }
+  "owner the agent account; t3bridge and SYSTEM read/write; the owner read/write + create-instance; nobody else ($($pipe.sddl))"
+}
+
+# ---------- T3's PATH ----------
+Invoke-Check 'server-path' {
+  $dirs = @($installed.serverPath)
+  if ($dirs.Count -eq 0) { throw 'no server PATH recorded' }
+  foreach ($dir in $dirs) {
+    if ($dir -match '\\WindowsApps(\\|$)') { throw "$dir is on T3's PATH" }
+    Assert-AdminOnlyWrite $dir
+  }
+  $launcherText = [IO.File]::ReadAllText((Join-Path $service 'start-t3.ps1'))
+  if (-not $launcherText.Contains("`$env:PATH = '" + ($dirs -join ';').Replace("'", "''") + "'")) { throw 'the launcher does not set exactly the recorded PATH' }
+  "$($dirs.Count) admin-owned folders; no WindowsApps; the server does not re-read PATH under the policy"
 }
 
 # ---------- firewall ----------
@@ -401,7 +436,7 @@ Invoke-Check 'managed' {
 }
 
 # ---------- hashes ----------
-$serviceFiles = @('start-t3.ps1', 'bridge-pipe.ps1', 'issue-token.ps1', 'move-token.ps1', 'rotate-keys.ps1', 'probe-agent.ps1', 't3-settings.seed.json') | ForEach-Object { Join-Path $service $_ }
+$serviceFiles = @('start-t3.ps1', 'bridge-pipe.ps1', 'issue-token.ps1', 'move-token.ps1', 'rotate-keys.ps1', 'probe-agent.ps1', 'probe-pipe.ps1', 't3-settings.seed.json') | ForEach-Object { Join-Path $service $_ }
 if ($installed.PSObject.Properties['bridgeExe']) { $serviceFiles += Join-Path $service 'start-bridge.ps1' }
 Invoke-Check 'hashes' {
   $pairs = @(@($installed.t3Exe, $installed.t3ExeSha256), @($installed.claudeExe, $installed.claudeExeSha256))

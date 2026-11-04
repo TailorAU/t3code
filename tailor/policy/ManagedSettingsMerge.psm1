@@ -161,24 +161,41 @@ function Test-ManagedSettingsUnchanged {
 }
 
 <#
-  Settings in the machine managed tier that would loosen T3's lock for every session: allow or
-  ask rules, a default permission mode, or environment variables. The installer refuses and
-  verify-install.ps1 fails while any is present (the administrator removes them deliberately).
+  The machine managed tier may hold only keys on this ALLOWLIST: T3's own entries and settings
+  that can only restrict Claude. Anything else (allow or ask rules, modes, env, helpers that
+  run programs, MCP server switches, keys this module does not know) is reported, and the
+  installer refuses and verify-install.ps1 fails until an administrator removes it.
   Pure; $ExistingText = $null means there is no file.
 #>
+$script:AllowedManagedKeys = @{
+  '$schema' = 'documentation only'
+  'parentSettingsBehavior' = 'must be "merge" (checked separately)'
+  'disableAllHooks' = 'only true restricts'
+  'allowManagedHooksOnly' = 'restricts hooks to this tier'
+  'allowManagedPermissionRulesOnly' = 'restricts permission rules to this tier'
+  'allowManagedMcpServersOnly' = 'restricts MCP servers to this tier'
+  'deniedMcpServers' = 'deny list'
+  'disableBypassPermissionsMode' = 'restricts modes'
+  'disableAutoMode' = 'restricts modes'
+  'cleanupPeriodDays' = 'local transcript retention'
+}
+$script:AllowedManagedPermissionKeys = @('deny', 'disableBypassPermissionsMode', 'disableAutoMode')
 function Get-ManagedSettingsLooseners {
   param([AllowNull()][object] $ExistingText)
   if ($null -eq $ExistingText) { return @() }
   $settings = ConvertFrom-ManagedSettingsText ([string]$ExistingText)
   $found = [System.Collections.Generic.List[string]]::new()
-  if ($settings.Contains('permissions') -and $settings['permissions'] -is [System.Collections.IDictionary]) {
-    foreach ($key in 'allow', 'ask', 'defaultMode', 'additionalDirectories') {
-      if ($settings['permissions'].Contains($key)) { $found.Add("permissions.$key") }
+  foreach ($key in @($settings.Keys)) {
+    if ($key -eq 'permissions') {
+      if ($settings['permissions'] -isnot [System.Collections.IDictionary]) { $found.Add('permissions'); continue }
+      foreach ($inner in @($settings['permissions'].Keys)) {
+        if ($script:AllowedManagedPermissionKeys -notcontains $inner) { $found.Add("permissions.$inner") }
+      }
+    } elseif ($key -eq 'disableAllHooks' -and $settings[$key] -ne $true) {
+      $found.Add('disableAllHooks (not true)')
+    } elseif (-not $script:AllowedManagedKeys.ContainsKey($key)) {
+      $found.Add($key)
     }
-  }
-  foreach ($key in 'defaultMode', 'env', 'apiKeyHelper', 'hooks', 'otelHeadersHelper', 'awsAuthRefresh',
-      'awsCredentialExport', 'gcpAuthRefresh', 'enableAllProjectMcpServers', 'enabledMcpjsonServers') {
-    if ($settings.Contains($key)) { $found.Add($key) }
   }
   return $found.ToArray()
 }

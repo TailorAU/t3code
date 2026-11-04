@@ -119,7 +119,9 @@ Assert-True (Test-ManagedSettingsUnchanged -CurrentText $fresh.Text -BackupText 
 
 # Machine-tier settings that loosen the lock are found.
 Assert-True (@(Get-ManagedSettingsLooseners $null).Count -eq 0) 'no file: nothing to report'
-Assert-True (@(Get-ManagedSettingsLooseners '{ "permissions": { "deny": ["Bash"] }, "model": "x" }').Count -eq 0) 'deny rules and other keys are fine'
+Assert-True (@(Get-ManagedSettingsLooseners '{ "permissions": { "deny": ["Bash"], "disableBypassPermissionsMode": "disable" }, "parentSettingsBehavior": "merge", "disableAllHooks": true, "deniedMcpServers": [] }').Count -eq 0) 'allowlisted, restrictive keys are fine'
+Assert-True (@(Get-ManagedSettingsLooseners '{ "model": "x" }') -contains 'model') 'any key off the allowlist is reported'
+Assert-True (@(Get-ManagedSettingsLooseners '{ "disableAllHooks": false }').Count -eq 1) 'disableAllHooks other than true is reported'
 $loose = @(Get-ManagedSettingsLooseners '{ "permissions": { "allow": ["Bash"], "ask": ["Edit"], "defaultMode": "acceptEdits" }, "env": { "A": "1" }, "defaultMode": "x", "hooks": {} }')
 foreach ($k in 'permissions.allow', 'permissions.ask', 'permissions.defaultMode', 'env', 'defaultMode', 'hooks') { Assert-True ($loose -contains $k) "$k is reported" }
 $helpers = @(Get-ManagedSettingsLooseners '{ "otelHeadersHelper": "x", "awsAuthRefresh": "x", "awsCredentialExport": "x", "gcpAuthRefresh": "x", "enableAllProjectMcpServers": true, "enabledMcpjsonServers": ["a"] }')

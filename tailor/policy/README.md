@@ -45,7 +45,13 @@ The installer therefore only:
   exists. If the key is present with another value the installer refuses and changes nothing;
   T3 also repeats its deny rules in each query's flag settings, so they hold either way.
 
-Every other setting is kept exactly as it was. It refuses a malformed file, writes the undo
+Every other setting is kept exactly as it was, but the machine tier may hold only keys on an
+allowlist (`ManagedSettingsMerge.psm1`): `permissions.deny`, `permissions.disableBypassPermissionsMode`,
+`permissions.disableAutoMode`, `parentSettingsBehavior`, `disableAllHooks` (true only),
+`allowManagedHooksOnly`, `allowManagedPermissionRulesOnly`, `allowManagedMcpServersOnly`,
+`deniedMcpServers`, `disableBypassPermissionsMode`, `disableAutoMode`, `cleanupPeriodDays` and
+`$schema`, all of which can only restrict. Anything else makes the installer refuse and the
+self-check fail until an administrator removes it. It refuses a malformed file, writes the undo
 record before the file, backs the old file up, writes atomically, keeps "created by us" across
 re-runs, and on uninstall removes only what it added. Pass `-SkipMachineManagedSettings` to
 leave the file alone.
@@ -139,7 +145,9 @@ handle, never by path. No folder grants anything to the interactive user, `Users
 | `-AgentAccount` | no | `t3agent` | Local account created to run `t3 serve`, its Claude and the token issuer |
 | `-BridgeAccount` | no | `t3bridge` | Local account created to run the bridge and read the connector token |
 | `-BridgeExe` | no | none | The bridge executable; registers its task (admin-only folder, hash recorded) |
-| `-GitExe` | no | `git` on PATH | The git the self-check uses (admin-only folder, at least 2.50.1, hash recorded) |
+| `-GitExe` | no | `git` on PATH | The git every T3 git call and the self-check use (admin-only folder, at least 2.50.1, hash recorded) |
+| `-NodeExe` | no | none | A node.exe whose folder goes on T3's PATH (admin-only folder) |
+| `-BridgeUsesPipeOnly` | with `-BridgeExe` | | Attests the bridge build reaches T3 only through the pipe, with no TCP fallback |
 | `-TailorApiHosts` | with `-BridgeExe` | none | tailor.au API host names the bridge may reach (for example api.example.com) |
 | `-WorkspaceRoots` | no | none | More project roots besides `workspaces\`; each gets an admins + `t3agent` ACL, and its parent must be admin-only |
 | `-ConnectorTokenDays` | no | `7` | Lifetime of each connector token (2 to 30); a new one is issued daily |
@@ -161,7 +169,9 @@ No administrator code runs inside the T3 home. The token is issued and rotated w
 step:
 
 All tasks are registered with an explicit security descriptor: Administrators and SYSTEM
-only; nobody else, the run-as account included, can read, run, change or stop them.
+only, with `TASK_DONT_ADD_PRINCIPAL_ACE` so Task Scheduler does not add read access for the
+run-as account; nobody else can read, run, change or stop them. The self-check also requires
+each task's last result to be success (or running, not yet run, or stopped by the installer).
 
 1. `\T3CodePolicy\T3 token issuer` runs as `t3agent` daily (and once after install). It claims
    `connector-drop\token` (create only), issues a `tailor:connector` token with T3's own CLI
@@ -224,6 +234,18 @@ rotate credentials held outside T3; rotate these by hand:
 - the model credential on the Claude provider instance (API key, or the Bedrock credential),
   at the provider;
 - any repository credential you gave `t3agent`.
+
+## T3's PATH and programs
+
+The T3 launcher sets the only PATH T3 and its children get: System32, the Windows folder,
+`System32\Wbem`, and the folders of PowerShell 7, the policy's git, Claude, `t3.exe` and
+`-NodeExe` (each must be admin-only; WindowsApps is refused). While the policy is present the
+server never re-reads PATH from the user environment or a PowerShell profile. On Windows every
+bare program name is resolved from PATH's absolute entries only; a name found nowhere is
+refused and nothing is spawned (there is no fallback path). A `shell: true` launch runs only
+if it starts with an existing absolute program path. Claude may not edit the folders that
+could reach t3agent's PATH or its shell start (`%APPDATA%\npm`, pnpm, WindowsApps,
+`~\.local\bin`, scoop, volta, bun, and the PowerShell profile folders).
 
 ## Getting code in and out
 
@@ -332,16 +354,18 @@ next to `t3 serve`:
 - the first instance is created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so it fails if anyone
   already holds the name; the shim then refuses to run and the launcher logs
   `BRIDGE PIPE REFUSED` loudly;
-- its security descriptor: owner `t3agent`; protected DACL with `t3bridge` read/write, SYSTEM
-  read/write, `t3agent` (the owner) create-instance only; nobody else, not `Users`, not the
-  interactive user, not Administrators. The first instance's descriptor is the pipe's: a later
+- its security descriptor: owner `t3agent`; protected DACL with `t3bridge` read/write
+  (`0x12019b`), SYSTEM read/write, and `t3agent` (the owner) read/write plus create-instance
+  (`0x12019f`, what a further instance needs); nobody else, not `Users`, not the interactive
+  user, not Administrators. Only the owner can add instances. The first instance's descriptor is the pipe's: a later
   instance cannot change the owner or the DACL (checked by the self-check probe);
 - `PIPE_REJECT_REMOTE_CLIENTS`;
 - the next instance is listening before a connected one is handed off, so the name is never
   free while T3 runs;
 - each connection is relayed to T3's loopback listener only after the shim checks, on that
-  very connection, that the accepting process is the `t3 serve` the launcher started
-  (`t3agent` can see its own processes).
+  very connection (its full four-tuple: both addresses and ports), that the accepting process
+  is the `t3 serve` the launcher started (`t3agent` can see its own processes); the launcher
+  restarts the shim if it dies while T3 runs.
 
 The connector token is still required over the pipe: the pipe is defence in depth, not
 authentication by itself. The bridge (tailor-app builds it) must, for every connection:
@@ -356,7 +380,13 @@ authentication by itself. The bridge (tailor-app builds it) must, for every conn
    it only the tailor.au API hosts.
 
 `Connect-T3BridgePipe` in `ServiceAccounts.psm1` is the reference client (tested). The bridge
-task starts only after the installer has seen the pipe up with the planned owner and DACL.
+task starts only after the installer has seen the pipe up with the planned owner and DACL, read
+by a SYSTEM probe task (`T3 pipe probe`) that opens it as SYSTEM, not as its owner.
+
+Until the real bridge client exists and has been reviewed, `-BridgeExe` also requires
+`-BridgeUsesPipeOnly`: the operator attests that the bridge build reaches T3 only through the
+pipe. **Windows Firewall does not filter loopback traffic**, so a bridge with a TCP fallback
+to `127.0.0.1` would bypass the pipe and its owner check entirely.
 
 ## Design choice: who can hold the T3 token
 

@@ -142,8 +142,9 @@ export function applyTailorGitHardening(env: NodeJS.ProcessEnv = process.env): v
     else env[key] = value;
   }
   for (const name of REMOVED_GIT_ENVIRONMENT) delete env[name];
-  // Windows: never resolve a bare command name in the working directory (cmd.exe, CreateProcess
-  // search and libuv honour this), so a planted git.exe in a repository is not run.
+  // Windows: set in the SERVER's own environment, where libuv and the CreateProcess search read
+  // it when this process spawns: a bare name is never looked up in the child's working
+  // directory. (gitSpawner.ts also resolves every bare name itself and refuses the rest.)
   if (process.platform === "win32") env.NoDefaultCurrentDirectoryInExePath = "1";
 }
 

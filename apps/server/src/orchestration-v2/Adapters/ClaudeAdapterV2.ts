@@ -2557,7 +2557,10 @@ export function claudeRuntimeQueryPolicyForRuntimePolicy(
   availability: ClaudeBypassAvailability = CLAUDE_BYPASS_FULLY_AVAILABLE,
 ): ClaudeRuntimeQueryPolicy {
   const requestedMode = permissionModeForClaudeRuntimePolicy(runtimePolicy);
-  const downgraded = requestedMode === "bypassPermissions" && availability.bypassDisabled;
+  // Tailor fork: a disabled Auto mode also caps a requested Auto, not only a Full access fallback.
+  const downgraded =
+    (requestedMode === "bypassPermissions" && availability.bypassDisabled) ||
+    (requestedMode === "auto" && availability.autoDisabled);
   const permissionMode = downgraded
     ? availability.autoDisabled
       ? "default"
@@ -4739,18 +4742,19 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const queryPolicyForTurn = Effect.fnUntraced(function* (
           turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
         ) {
-          if (
-            permissionModeForClaudeRuntimePolicy(turnInput.runtimePolicy) !== "bypassPermissions"
-          ) {
+          const requestedMode = permissionModeForClaudeRuntimePolicy(turnInput.runtimePolicy);
+          // Tailor fork: check the managed settings for Auto as well as Full access.
+          if (requestedMode !== "bypassPermissions" && requestedMode !== "auto") {
             return claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy);
           }
           const cwd = turnInput.runtimePolicy.cwd;
           if (bypassCache === null || bypassCache.cwd !== cwd) {
             const resolved = yield* resolveBypassAvailability(cwd).pipe(Effect.option);
             if (Option.isNone(resolved)) {
+              // Unreadable settings fail closed; a requested Auto then runs Supervised.
               return claudeRuntimeQueryPolicyForRuntimePolicy(turnInput.runtimePolicy, {
                 bypassDisabled: true,
-                autoDisabled: false,
+                autoDisabled: requestedMode === "auto",
               });
             }
             bypassCache = { cwd, availability: resolved.value };

@@ -95,6 +95,10 @@ jobs:
         shell: pwsh
         run: ./tailor/policy/tests/ManagedSettingsMerge.Tests.ps1
 
+      - name: Service account planning tests
+        shell: pwsh
+        run: ./tailor/policy/tests/ServiceAccounts.Tests.ps1
+
       - name: Installer parses
         shell: pwsh
         run: |

@@ -10,7 +10,7 @@ connector: loopback only, Supervised by default, egress limited to the model end
 | Path | What |
 | --- | --- |
 | `tailor/SECURITY-REVIEW.md` | Adversarial review of the server at v0.1.6 and this patch; findings and status |
-| `tailor/policy/` | Lock-down policy template, the one-time installer and the provider configuration |
+| `tailor/policy/` | Lock-down policy template, the installer (service accounts `t3agent` and `t3bridge`, protected folders, firewall, machine-wide deny entries) and the provider configuration |
 | `tailor/contract/connector-rpc-contract.json` | The RPCs, fields and scopes the connector depends on |
 | `packages/contracts/src/tailorConnectorContract.test.ts` | Fails when an upstream bump changes the connector contract |
 | `apps/server/src/tailor/` | Scope and mode-cap tests |

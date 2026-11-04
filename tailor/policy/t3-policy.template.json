@@ -107,12 +107,12 @@
   },
   "disabledDrivers": [],
   "connectorToken": {
+    "$comment": "Issued by install-policy.ps1 into %ProgramData%\\T3CodePolicy\\connector\\token, readable by the t3bridge account only, never printed. tailor:connector reaches only the five contract RPCs and five dispatch commands (RpcAuthorization.tailorConnectorAllows).",
     "scopes": [
       "tailor:connector"
     ],
-    "issueCommand": "t3 auth session issue --scope tailor:connector --label connector --token-only --ttl 7d",
-    "rpcAllowlist": "tailor/contract/connector-rpc-contract.json",
-    "$comment": "tailor:connector reaches only the five contract RPCs and five dispatch commands (RpcAuthorization.tailorConnectorAllows)."
+    "ttl": "7d",
+    "rpcAllowlist": "tailor/contract/connector-rpc-contract.json"
   },
   "egress": {
     "$comment": "Defaults for install-policy.ps1 -AllowedHosts. Override per machine.",
@@ -121,5 +121,8 @@
       "bedrock-runtime.ap-southeast-2.amazonaws.com",
       "bedrock-runtime.ap-southeast-4.amazonaws.com"
     ]
+  },
+  "bridge": {
+    "$comment": "The T3 bridge runs as t3bridge, opens no listener, and dials out only to loopback (T3) and the tailor.au API hosts given to install-policy.ps1 -TailorApiHosts (for example api.example.com). Its tailor.au key lives in %ProgramData%\\T3CodePolicy\\bridge, readable by t3bridge only."
   }
 }

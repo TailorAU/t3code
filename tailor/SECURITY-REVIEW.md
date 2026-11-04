@@ -46,16 +46,17 @@ Severity: Critical, High, Medium, Low, Info. Status: Fixed (in this PR), Mitigat
 | T3-28 | Build guard file not committed (ignored by `build/`) | Blocker | Fixed |
 | T3-29 | User launch arguments and `--settings` got past the lock | High | Fixed |
 | T3-30 | Capabilities probe and `claude -p` text generation were not locked | High | Fixed |
-| T3-31 | Policy configuration was user-writable (drivers, instance env, launch args, run-as account) | High | Partly fixed; service account Open |
+| T3-31 | Policy configuration was user-writable (drivers, instance env, launch args, run-as account) | High | Fixed (service accounts UNVERIFIED until an elevated run) |
 | T3-32 | Claude home writable at its root; Users could read it | Medium | Fixed |
 | T3-33 | No machine-wide admin-tier deny rules | Medium | Fixed (merge, opt-out switch) |
 | T3-34 | Policy location from an environment variable; Windows ran without a policy | Medium | Fixed |
 | T3-35 | Installer integrity, input validation and file-write ordering | Medium | Fixed |
 | T3-36 | Binaries in user-writable folders; no binary hash check | Medium | Fixed (Claude checked at start; T3 recorded) |
-| T3-37 | Connector token broader than the five contract RPCs | Medium | Fixed (`tailor:connector`); issuance Open |
+| T3-37 | Connector token broader than the five contract RPCs | Medium | Fixed (`tailor:connector`, issued by the installer; UNVERIFIED) |
 | T3-38 | CSP covered connect and images only | Medium | Fixed |
 | T3-39 | T3-home deny rules did not follow `--base-dir`; attachments | Medium | Fixed |
 | T3-40 | Managed service defaulted to private-network bind; pnpm not pinned by integrity | Medium | Fixed |
+| T3-41 | Claude lanes share the operator's account, so any token the connector can read they can read | High | Fixed by design (t3bridge); relies on stage 2 |
 
 ## Findings
 
@@ -423,21 +424,43 @@ strict MCP, and carries the compiled deny rules. `claude -p` text generation car
 rules in its flag settings (hooks were already off). Both use the binary and home the driver
 takes from the machine policy (T3-31), never from user settings.
 
-### T3-31 Policy configuration (High, partly fixed)
+### T3-31 Policy configuration (High, Fixed; service accounts UNVERIFIED)
 
-Fixed: the build contains the Claude driver only (`TAILOR_CLAUDE_ONLY`). When the machine
-policy is installed the driver overrides the instance's binary and home with the recorded
-ones, blanks launch arguments and keeps only allowlisted instance variables (the compiled
-list, narrowed by `installed.instanceEnvironmentAllowlist`; proxy, `NODE_OPTIONS` and
-`CLAUDE_CONFIG_DIR` are never allowed).
+The build contains the Claude driver only (`TAILOR_CLAUDE_ONLY`). When the machine policy is
+installed the driver overrides the instance's binary and home with the recorded ones, blanks
+launch arguments and keeps only allowlisted instance variables (the compiled list, narrowed by
+`installed.instanceEnvironmentAllowlist`; proxy, `NODE_OPTIONS` and `CLAUDE_CONFIG_DIR` are
+never allowed).
 
-Open: running T3 and its Claude under a dedicated local service account, with the T3 home in
-that account's profile, so the interactive user and the agent's shell cannot mint tokens or
-edit T3 settings. `t3.exe` is not a Windows service binary, so this needs a service wrapper
-(or a scheduled task with a virtual account) plus a password-less account set-up; it is the
-next stage's first item. Until then the run-as account is the interactive user and the
-controls are the build ceiling, the query lock, the deny rules and Supervised approvals.
-Connector token issuance into an admin-protected, user-readable file is part of the same work.
+T3 and the Claude it starts now run as a dedicated local standard account, `t3agent`, created
+by the installer (`tailor/policy/ServiceAccounts.psm1`):
+
+- The password is random (40 characters from a CSPRNG), generated in memory, passed to
+  `Register-ScheduledTask` (`LogonType Password`, "run whether user is logged on or not",
+  `RunLevel Limited`) and discarded. It is never written to disk or a log; a re-install resets
+  it to a new random value.
+- Local policy, through `secedit /export` and `/configure` of the user-rights area only: "log
+  on as a batch job" granted; interactive, Remote Desktop and network logon denied. The INF
+  edit is a pure, tested function (`Update-UserRightsInf`).
+- The account is removed from Administrators if present. It stays in `BUILTIN\Users` so it
+  can execute system binaries; no T3 folder grants anything to `Users`.
+- The task `\T3CodePolicy\T3 server` starts at boot, restarts on failure, and runs a
+  generated launcher that sets the policy's `T3CODE_*` variables and `T3CODE_HOME`, clears
+  the must-be-unset variables, and restarts `t3 serve` if it exits. The launcher needs
+  machine-wide PowerShell 7 (the Store package is per user).
+- The T3 home (`%ProgramData%\T3CodePolicy\t3-home`) and the Claude home are reachable by
+  Administrators, SYSTEM and `t3agent` only. the operator's session and the Claude lanes running as
+  the operator cannot read T3's signing key, mint tokens or edit T3 settings.
+- Uninstall stops and removes the task, the account, its rights and its profile.
+
+UNVERIFIED: none of this has run elevated. Account creation, the secedit edit, the task
+registration and start, the ACLs on a real machine and the profile removal are verified only
+as `-WhatIf` previews and by tests of the pure planning functions
+(`tailor/policy/tests/ServiceAccounts.Tests.ps1`). The first elevated install is the test.
+
+Residual: Claude and the shell commands it runs are the same `t3agent` account as `t3 serve`,
+so ACLs cannot keep the agent away from the T3 home. That boundary is the compiled deny rules
+for Claude's file tools plus Supervised approvals for every shell command.
 
 ### T3-32 Claude home (Medium, Fixed)
 
@@ -487,14 +510,19 @@ in `t3-policy.json`; the server checks the Claude binary's hash before the first
 binary's hash is recorded for the connector to check before it starts `t3 serve` (a process
 cannot meaningfully verify itself).
 
-### T3-37 Connector scope (Medium, Fixed; issuance Open)
+### T3-37 Connector scope (Medium, Fixed; issuance UNVERIFIED)
 
 New scope `tailor:connector`: a token carrying it reaches exactly the five contract RPCs, and
 through `dispatchCommand` exactly the five contract command types
 (`RpcAuthorization.tailorConnectorAllows`), whatever else the token carries. The contract test
-checks the lists against `tailor/contract/connector-rpc-contract.json`. Issue it with
-`t3 auth session issue --scope tailor:connector --label connector --token-only --ttl 7d`.
-End-to-end use of the token against handlers that check scopes internally is not yet tested.
+checks the lists against `tailor/contract/connector-rpc-contract.json`.
+
+The installer issues it (`t3 auth session issue --scope tailor:connector --ttl 7d --json`,
+run against the T3 home, output captured in memory and never printed) into
+`%ProgramData%\T3CodePolicy\connector\token`, readable by Administrators, SYSTEM and
+`t3bridge` only (T3-41). `-RotateConnectorToken` issues a new one and revokes the previous
+`tailor:connector` sessions. UNVERIFIED until an elevated run; end-to-end use of the token
+against handlers that check scopes internally is not yet tested.
 
 ### T3-38 Content-Security-Policy (Medium, Fixed)
 
@@ -517,6 +545,27 @@ Web mode binds `127.0.0.1` unless `T3CODE_LAN`/`--lan` is explicitly true; a man
 longer defaults to private networks. The gate installs pnpm 12.14.0 only after checking the
 tarball against its registry SHA-512.
 
+### T3-41 Who can hold the T3 token (High, Fixed by design)
+
+Threat: the connector and every Claude lane on this PC run as the operator's account. Any file the
+connector can read, a lane can read too, and could use to drive T3 directly.
+
+Decision: a second dedicated local standard account, `t3bridge`, set up like `t3agent`
+(random password straight to Task Scheduler, never stored; interactive, RDP and network logon
+denied; removed on uninstall), is the only non-admin principal that can read
+`connector\token` and the bridge's tailor.au key in `bridge\`. the operator's user and `Users` have
+no access. The T3 bridge (the connector's T3 source, coming later in tailor-app) runs as
+`t3bridge` through its own scheduled task when `-BridgeExe` is given; its executable must sit
+in an admin-only folder and its SHA-256 is recorded. It opens no local listener and only dials
+out: the firewall blocks all inbound connections to it and all outbound ones except loopback
+and the `-TailorApiHosts` (no default host is built in).
+
+Relies on: tailor.au accepting steering commands only from the operator's interactive sign-in (plan
+stage 2), never from an agent key. Until stage 2 ships, the bridge executes nothing.
+
+Residual: an administrator on the PC can read everything. UNVERIFIED until an elevated run
+(see T3-31).
+
 ## What was verified
 
 - Locally on Windows (frozen lockfile): the contracts suite (161/161, including the contract,
@@ -525,7 +574,12 @@ tarball against its registry SHA-512.
   tests. Server `src` and contracts typecheck clean. The managed-settings merge fixtures pass.
   The installer previews with `-WhatIf` under PowerShell 7: it refuses a missing hash, a
   user-writable binary and a bad host name, and shows the exact machine-file diff.
-- Not verified: a full build, the full upstream suite, an elevated install, folder creation
-  and ACLs on a real machine, the firewall rules applied, the policy guard and binary hash on
-  a real install, the CSP in a browser, the connector token end to end, and the live egress
-  capture (T3-01).
+- The service-account planning tests pass (passwords, user-rights INF edits including
+  add-then-remove round trip, task plan, access plan with no Users or interactive user,
+  launchers). The installer previews the accounts, rights, folders and ACLs, tasks, token and
+  firewall rules with `-WhatIf` without creating anything.
+- Not verified (UNVERIFIED): anything that needs an elevated run on a real machine: the
+  accounts, secedit changes, scheduled tasks, folder creation and ACLs, token issuance, the
+  firewall rules, the policy guard and binary hash on a real install. Also not verified: a
+  full build, the full upstream suite, the CSP in a browser, the connector token end to end,
+  and the live egress capture (T3-01).

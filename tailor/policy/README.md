@@ -46,6 +46,7 @@ added. Pass `-SkipMachineManagedSettings` to leave the file alone.
 | `t3-policy.template.json` | Generic policy. No hostnames, paths, accounts or credentials; the installer adds those. |
 | `install-policy.ps1` | Run elevated with PowerShell 7.2+, per machine. Idempotent, `-WhatIf` friendly, `-Uninstall` reverses it. |
 | `ManagedSettingsMerge.psm1` | The machine-wide `managed-settings.json` merge; tests in `tests/`. |
+| `ServiceAccounts.psm1` | The service accounts, user rights, scheduled tasks and launchers; tests in `tests/`. |
 | `provider-config.md` | Model provider as configuration only (API key or Bedrock in Sydney, model pin). |
 
 What the installer writes, all under `%ProgramData%\T3CodePolicy` (folders created with a
@@ -54,9 +55,12 @@ refused):
 
 | Path | Contents |
 | --- | --- |
-| `t3-policy.json` | The template plus an `installed` block (T3 and Claude binary paths, Claude home, run-as account, installer hashes). The server reads this fixed path. |
-| `t3-settings.seed.json` | T3 settings for the connector to apply (Supervised default, update checks off, other drivers off, the Claude instance pointing at the policy home and binary). |
-| `claude-home\` | The Claude instance home. Admin-only at the root; the run-as account may read it, create subfolders, modify `.claude.json` and work inside subfolders, but cannot create or replace files at the root (`settings.json`, `remote-settings.json`). |
+| `t3-policy.json` | The template plus an `installed` block (T3 and Claude binary paths, Claude home, T3 home, account names, installer hashes). The server reads this fixed path. |
+| `t3-home\` | T3's base dir (`T3CODE_HOME`), `t3agent` modify only. Its `userdata\settings.json` is seeded once (Supervised default, update checks off, the Claude instance on the policy home and binary). |
+| `service\` | The launchers the scheduled tasks run (admin-written, the accounts read). |
+| `connector\token` | The `tailor:connector` token, `t3bridge` read only. |
+| `bridge\` | The bridge's tailor.au key, placed by an administrator, `t3bridge` read only. |
+| `claude-home\` | The Claude instance home. Admin-only at the root; `t3agent` may read it, create subfolders, modify `.claude.json` and work inside subfolders, but cannot create or replace files at the root (`settings.json`, `remote-settings.json`). |
 | `installer\` | A protected copy of the installer and template for later refreshes. |
 
 ## Installer parameters
@@ -65,17 +69,21 @@ refused):
 | --- | --- | --- | --- |
 | `-T3Exe` | yes | | Full path of the `t3.exe` built from this fork that the connector starts |
 | `-ClaudeExe` | yes | | Full path of a Claude binary used only by T3's Claude instance, in an admin-only folder (the firewall rule applies to that path) |
-| `-ExpectedSha256` | yes, except the protected copy | none | `script=<hex>,template=<hex>,module=<hex>` from the reviewed commit; the installer refuses to run without it or on a mismatch |
+| `-ExpectedSha256` | yes, except the protected copy | none | `script=<hex>,template=<hex>,module=<hex>,accounts=<hex>` from the reviewed commit; the installer refuses to run without it or on a mismatch |
 | `-ClaudeHomeName` | no | `claude-home` | Folder name of the Claude home under `%ProgramData%\T3CodePolicy` |
-| `-RunAsUser` | no | the account running the installer | Account that runs `t3 serve`; gets Modify on the Claude home only |
+| `-AgentAccount` | no | `t3agent` | Local account created to run `t3 serve` and its Claude |
+| `-BridgeAccount` | no | `t3bridge` | Local account created to run the bridge and read the connector token |
+| `-BridgeExe` | no | none | The bridge executable; registers its task (admin-only folder, hash recorded) |
+| `-TailorApiHosts` | with `-BridgeExe` | none | tailor.au API host names the bridge may reach (for example api.example.com) |
+| `-RotateConnectorToken` | no | | Issue a new connector token and revoke the previous ones |
+| `-T3Port` | no | `3773` | Loopback port of `t3 serve` |
 | `-AllowedHosts` | no | template `egress.allowedHosts` | Model endpoints the Claude binary may reach; add a gateway host if one is used |
 | `-ExtraAllowedAddresses` | no | none | Provider-published IP ranges (CIDR) to allow in addition to DNS results |
 | `-ClaudeEgress` | no | `Resolve` | `Resolve` = allow the DNS addresses of `-AllowedHosts` now; `LoopbackOnly` = allow loopback only, for use with an allowlisting proxy |
-| `-T3Home` | no | `<run-as profile>\.t3` | The T3 base dir, denied to Claude in the machine-wide file |
 | `-MachineManagedSettingsPath` | no | `C:\Program Files\ClaudeCode\managed-settings.json` | Claude Code's machine-wide admin tier |
 | `-SkipMachineManagedSettings` | no | | Do not touch the machine-wide file |
 | `-RuleGroup` | no | `T3 Code egress policy` | Firewall rule group the installer owns and replaces |
-| `-Uninstall` | no | | Remove the rules, machine variables and installed policy |
+| `-Uninstall` | no | | Remove the tasks, accounts, profiles, rights, rules, machine variables, token, installed policy and machine-file entries |
 
 Get the hashes from the reviewed commit, on any machine:
 
@@ -83,6 +91,7 @@ Get the hashes from the reviewed commit, on any machine:
 (Get-FileHash .\tailor\policy\install-policy.ps1 -Algorithm SHA256).Hash.ToLower()
 (Get-FileHash .\tailor\policy\t3-policy.template.json -Algorithm SHA256).Hash.ToLower()
 (Get-FileHash .\tailor\policy\ManagedSettingsMerge.psm1 -Algorithm SHA256).Hash.ToLower()
+(Get-FileHash .\tailor\policy\ServiceAccounts.psm1 -Algorithm SHA256).Hash.ToLower()
 ```
 
 Example (preview only):
@@ -91,7 +100,7 @@ Example (preview only):
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\tailor\policy\install-policy.ps1 `
   -T3Exe 'C:\Program Files\T3Code\t3.exe' `
   -ClaudeExe 'C:\Program Files\T3Code\claude\claude.exe' `
-  -ExpectedSha256 'script=<hex>,template=<hex>,module=<hex>' -WhatIf
+  -ExpectedSha256 'script=<hex>,template=<hex>,module=<hex>,accounts=<hex>' -WhatIf
 ```
 
 Later refreshes run the protected copy:
@@ -113,11 +122,44 @@ endpoints rotate addresses, so:
   set as `HTTPS_PROXY` on the Claude provider instance only (never on `t3 serve`). The
   proxy is not part of this PR.
 
+## Service accounts
+
+The installer creates two local standard accounts. Their passwords are random, generated in
+memory, handed straight to Task Scheduler and discarded; they are never written to disk or a
+log. Local policy (secedit, user rights only) grants them "log on as a batch job" and denies
+interactive, Remote Desktop and network logon. Uninstall removes the tasks, the accounts,
+their rights and their profiles.
+
+| Account | Runs | Can reach |
+| --- | --- | --- |
+| `t3agent` | `t3 serve` and the Claude it starts (task `\T3CodePolicy\T3 server`, at startup, restarts on failure) | The T3 home and Claude home under `%ProgramData%\T3CodePolicy`, and `t3-policy.json` (read) |
+| `t3bridge` | The T3 bridge, if `-BridgeExe` is given (task `\T3CodePolicy\T3 bridge`) | `connector\token` and `bridge\` (read) |
+
+Neither the interactive user nor `BUILTIN\Users` has any access to these folders, so the operator's
+session and every Claude lane running as the operator cannot read T3's signing key, mint tokens, edit
+T3 settings or read the connector token.
+
+## Design choice: who can hold the T3 token
+
+- **Threat.** The connector and every Claude lane on this PC run as the operator's account. Any file
+  the connector can read, a lane can read too, and could use to drive T3 directly.
+- **Decision.** A dedicated `t3bridge` account holds the `tailor:connector` token
+  (`connector\token`: Administrators, SYSTEM and `t3bridge` read; not the operator, not Users). The T3
+  bridge (the connector's T3 source, coming later in tailor-app) runs as `t3bridge`, opens no
+  local listener, and only dials out: loopback to T3 and HTTPS to the tailor.au API hosts
+  passed as `-TailorApiHosts`. Its tailor.au key sits in `bridge\`, also `t3bridge`-only. The
+  firewall blocks every inbound connection to the bridge and every outbound one except
+  loopback and those hosts.
+- **What it relies on.** tailor.au accepts steering commands only from the operator's interactive
+  sign-in (plan stage 2), never from an agent key. Until stage 2 ships, the bridge executes
+  nothing.
+- **Residual.** An administrator on the PC can read everything.
+
 ## Not done yet
 
-- **Dedicated service account.** T3 and its Claude still run as the interactive user. Moving
-  them to a password-less local service account (T3 home in that profile, so the user's shell
-  cannot mint tokens or edit T3 settings) needs a service wrapper for `t3 serve`; next stage.
-- **Connector token issuance.** Issue `--scope tailor:connector` by hand for now; the installer
-  will write it into an admin-protected file readable only by the connector's account once the
-  service account exists.
+- **Elevated verification.** Account creation, the secedit changes, the scheduled tasks, the
+  ACLs, token issuance and the firewall rules have only run as `-WhatIf` previews. The first
+  elevated run on a real machine is the test.
+- **The agent and its own shell share `t3agent`.** Claude and the commands it runs are the
+  same account as `t3 serve`, so ACLs cannot separate them. That boundary is the compiled
+  deny rules for Claude's file tools plus Supervised approvals for every shell command.

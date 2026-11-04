@@ -51,10 +51,61 @@ allowlist (`ManagedSettingsMerge.psm1`): `permissions.deny`, `permissions.disabl
 `allowManagedHooksOnly`, `allowManagedPermissionRulesOnly`, `allowManagedMcpServersOnly`,
 `deniedMcpServers`, `disableBypassPermissionsMode`, `disableAutoMode`, `cleanupPeriodDays` and
 `$schema`, all of which can only restrict. Anything else makes the installer refuse and the
-self-check fail until an administrator removes it. It refuses a malformed file, writes the undo
+self-check fail until an administrator removes it. The same allowlist applies to every
+`managed-settings.d\*.json` drop-in beside the file and to the `SOFTWARE\Policies\ClaudeCode`
+registry keys in HKLM, the administrator's HKCU and `t3agent`'s HKCU.
+
+Anthropic's organisation-wide remote (server-managed) settings are delivered to Claude Code
+sessions signed in with a Claude for Teams or Enterprise account. T3's Claude authenticates
+with an API key or Bedrock, so to our understanding they do not apply to it; this has not been
+verified on a live install, and the Claude home's `remote-settings.json` is unreadable to the
+agent either way. It refuses a malformed file, writes the undo
 record before the file, backs the old file up, writes atomically, keeps "created by us" across
 re-runs, and on uninstall removes only what it added. Pass `-SkipMachineManagedSettings` to
 leave the file alone.
+
+## Install prerequisites
+
+T3 runs only binaries an administrator controls. The installer refuses any of these that sits
+in a folder a non-administrator can write (a per-user install, Downloads, the Store build), so
+put them in place first:
+
+- **PowerShell 7, machine-wide**: the MSI from Microsoft, installed to
+  `C:\Program Files\PowerShell\7`. The Microsoft Store build is per user and is refused.
+- **A pinned copy of Claude Code** for T3 only, in an admin-owned folder, for example
+  `C:\Program Files\T3Code\claude\claude.exe`. From an elevated prompt:
+
+  ```powershell
+  $dir = 'C:\Program Files\T3Code\claude'
+  New-Item -ItemType Directory -Path $dir -Force | Out-Null      # inherits Program Files' admin-only ACL
+  Copy-Item -LiteralPath '<path to the claude.exe you reviewed>' -Destination $dir
+  Get-FileHash -LiteralPath "$dir\claude.exe" -Algorithm SHA256   # record it; the installer records it too
+  ```
+
+- **Git for Windows** installed machine-wide (for example `C:\Program Files\Git`), version
+  2.50.1 or later; pass `-GitExe 'C:\Program Files\Git\cmd\git.exe'`.
+- **Node.js**, only if T3 needs it on its PATH: an admin-owned install; pass `-NodeExe`.
+- **`t3.exe`** built from this fork, in an admin-owned folder (for example
+  `C:\Program Files\T3Code\t3.exe`).
+
+These are **pinned copies used only by T3. They never update themselves.** The operator's
+everyday Claude Code in their own user folder is untouched and keeps updating as normal for
+their other sessions. To update a pinned binary, deliberately:
+
+```powershell
+pwsh -NoProfile -File "$env:ProgramData\T3CodePolicy\installer\install-policy.ps1" -UpdatePinned Claude -From 'D:\reviewed\claude.exe' -ExpectedSha256 <sha256 of the new file>
+```
+
+`-UpdatePinned Claude|T3|Node` stops every task, removes the verified marker, checks the new
+file (plain file, the SHA-256 you give), keeps the current binary as a backup in
+`state\pinned-backup\`, writes the new one into the pinned path (CreateNew with a protected
+ACL: Administrators/SYSTEM full, Users read and execute), records the new SHA-256 in
+`t3-policy.json` and the old and new hashes in `state\pinned-updates.json`, runs the
+self-check, and starts T3 only on a full PASS. On any failure T3 stays stopped and it prints
+the rollback command (`-UpdatePinned <kind> -From <backup>`). Git is a whole install, not one
+file: upgrade the pinned Git in place with its own installer, then run
+`-UpdatePinned Git -From 'C:\Program Files\Git\cmd\git.exe'` to verify and record it; to move
+Git elsewhere, re-run the install with `-GitExe`.
 
 ## First step: the protected copy
 
@@ -152,6 +203,8 @@ handle, never by path. No folder grants anything to the interactive user, `Users
 | `-WorkspaceRoots` | no | none | More project roots besides `workspaces\`; each gets an admins + `t3agent` ACL, and its parent must be admin-only |
 | `-ConnectorTokenDays` | no | `7` | Lifetime of each connector token (2 to 30); a new one is issued daily |
 | `-RotateConnectorToken` | no | | Revoke every connector session, issue a new token, wait for the result (non-zero exit on failure) |
+| `-UpdatePinned` | no | | `Claude`, `T3`, `Node` or `Git`: deliberately update a pinned binary (see Install prerequisites) |
+| `-From` | with `-UpdatePinned` | | The new binary (Git: the pinned git.exe after an in-place upgrade); with `-UpdatePinned`, `-ExpectedSha256` is its SHA-256 |
 | `-AdoptExistingAccounts` | no | | Upgrades only: adopt existing `t3agent`/`t3bridge` accounts that an older install created, if their description is exactly this installer's and their only group is `Users` |
 | `-T3Port` | no | `3773` | Loopback port of `t3 serve` |
 | `-AllowedHosts` | no | template `egress.allowedHosts` | Model endpoints the Claude binary may reach |

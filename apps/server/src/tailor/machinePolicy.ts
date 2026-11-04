@@ -45,6 +45,8 @@ export interface TailorInstalledPolicy {
   readonly workspaceRoots: ReadonlyArray<string>;
   /** The git.exe every T3 git call runs (absolute); undefined when the policy has none. */
   readonly gitExe: string | undefined;
+  /** The admin-owned folders on T3's PATH (installer-checked). */
+  readonly serverPath: ReadonlyArray<string>;
 }
 
 export type TailorPolicyState =
@@ -63,6 +65,7 @@ export function parseTailorInstalledPolicy(raw: string): TailorInstalledPolicy |
         readonly instanceEnvironmentAllowlist?: unknown;
         readonly workspaceRoots?: unknown;
         readonly gitExe?: unknown;
+        readonly serverPath?: unknown;
       };
     };
     const installed = parsed.installed;
@@ -100,6 +103,11 @@ export function parseTailorInstalledPolicy(raw: string): TailorInstalledPolicy |
         typeof installed.gitExe === "string" && NodePath.win32.isAbsolute(installed.gitExe)
           ? installed.gitExe
           : undefined,
+      serverPath: Array.isArray(installed.serverPath)
+        ? installed.serverPath.filter(
+            (dir): dir is string => typeof dir === "string" && NodePath.win32.isAbsolute(dir),
+          )
+        : [],
     };
   } catch {
     return null;

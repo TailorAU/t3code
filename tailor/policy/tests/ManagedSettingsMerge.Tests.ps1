@@ -122,6 +122,21 @@ Assert-True (@(Get-ManagedSettingsLooseners $null).Count -eq 0) 'no file: nothin
 Assert-True (@(Get-ManagedSettingsLooseners '{ "permissions": { "deny": ["Bash"], "disableBypassPermissionsMode": "disable" }, "parentSettingsBehavior": "merge", "disableAllHooks": true, "deniedMcpServers": [] }').Count -eq 0) 'allowlisted, restrictive keys are fine'
 Assert-True (@(Get-ManagedSettingsLooseners '{ "model": "x" }') -contains 'model') 'any key off the allowlist is reported'
 Assert-True (@(Get-ManagedSettingsLooseners '{ "disableAllHooks": false }').Count -eq 1) 'disableAllHooks other than true is reported'
+
+# Registry policy values and managed-settings.d drop-ins: the same allowlist.
+Assert-True (@(Get-RegistryPolicyLooseners -Values ([ordered]@{ disableAllHooks = 1 })).Count -eq 1) 'a registry value off the allowlist (disableAllHooks must be true) is reported'
+Assert-True (@(Get-RegistryPolicyLooseners -Values ([ordered]@{ deniedMcpServers = '[]' })).Count -eq 0) 'an allowlisted registry value passes'
+Assert-True (@(Get-RegistryPolicyLooseners -Values ([ordered]@{ Settings = '{ "permissions": { "allow": ["Bash"] } }' })) -contains 'Settings/permissions.allow') 'a JSON settings value is checked key by key'
+$md = Join-Path ([IO.Path]::GetTempPath()) ('t3msd-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path (Join-Path $md 'managed-settings.d') -Force | Out-Null
+try {
+  $machineFile = Join-Path $md 'managed-settings.json'
+  Set-Content -LiteralPath $machineFile -Value '{ "permissions": { "deny": ["Bash"] }, "parentSettingsBehavior": "merge" }'
+  Set-Content -LiteralPath (Join-Path $md 'managed-settings.d\10-team.json') -Value '{ "env": { "X": "1" } }'
+  Set-Content -LiteralPath (Join-Path $md 'managed-settings.d\20-ok.json') -Value '{ "deniedMcpServers": [] }'
+  $sources = @(Get-ClaudePolicySourceLooseners -ManagedSettingsPath $machineFile | Where-Object { $_.StartsWith($md) })
+  Assert-True ($sources.Count -eq 1 -and $sources[0] -match '10-team\.json: env') "drop-ins are checked ($($sources -join '; '))"
+} finally { Remove-Item -LiteralPath $md -Recurse -Force }
 $loose = @(Get-ManagedSettingsLooseners '{ "permissions": { "allow": ["Bash"], "ask": ["Edit"], "defaultMode": "acceptEdits" }, "env": { "A": "1" }, "defaultMode": "x", "hooks": {} }')
 foreach ($k in 'permissions.allow', 'permissions.ask', 'permissions.defaultMode', 'env', 'defaultMode', 'hooks') { Assert-True ($loose -contains $k) "$k is reported" }
 $helpers = @(Get-ManagedSettingsLooseners '{ "otelHeadersHelper": "x", "awsAuthRefresh": "x", "awsCredentialExport": "x", "gcpAuthRefresh": "x", "enableAllProjectMcpServers": true, "enabledMcpjsonServers": ["a"] }')

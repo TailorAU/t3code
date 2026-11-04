@@ -192,14 +192,19 @@ try {
   $more = $false; try { [T3Policy.PipeNative]::Create($bridgePath, $bridgeOnly.GetSecurityDescriptorBinaryForm(), $false, 8).Dispose(); $more = $true } catch { }
   Assert-True (-not $more) 'with only the bridge grant (no create-instance), adding an instance fails'
 } finally { $firstBridge.Dispose() }
-Assert-True (Test-Parses (Get-PipeProbeText -ResultPath 'C:\P\probe\pipe.json')) 'the SYSTEM pipe probe parses'
+$pipeProbeText = Get-PipeProbeText -ResultPath 'C:\P\state\pipe-probe.json'
+Assert-True (Test-Parses $pipeProbeText) 'the SYSTEM pipe probe parses'
+Assert-True ($pipeProbeText.Contains('0x00110000u') -and $pipeProbeText.Contains('errorCode') -and $pipeProbeText.Contains('-eq 231')) 'the probe opens identification-only and reports ERROR_PIPE_BUSY'
+Assert-True ($pipeProbeText.Contains('CreateNew') -and $pipeProbeText.Contains('SetAccessRuleProtection(`$true'.Replace('`', ''))) 'the probe result is written CreateNew with a protected DACL'
 foreach ($bad in @(
     @('O:BAD:P(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x12019f;;;S-1-5-21-9-1001)', 'owner not the agent'),
     @("O:S-1-5-21-9-1001D:P(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x12019f;;;S-1-5-21-9-1001)(A;;0x12019b;;;BU)", 'Users granted'),
     @("O:S-1-5-21-9-1001D:P(A;;0x12019f;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x12019f;;;S-1-5-21-9-1001)", 'the bridge may create instances'),
     @("O:S-1-5-21-9-1001D:P(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x1f01ff;;;S-1-5-21-9-1001)", 'the agent has more than its grant'),
     @("O:S-1-5-21-9-1001D:P(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x100004;;;S-1-5-21-9-1001)", 'the agent cannot add instances'),
-    @("O:S-1-5-21-9-1001D:(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x12019f;;;S-1-5-21-9-1001)", 'DACL not protected'))) {
+    @("O:S-1-5-21-9-1001D:(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x12019f;;;S-1-5-21-9-1001)", 'DACL not protected'),
+    @("O:S-1-5-21-9-1001D:P(A;;0x16019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x12019f;;;S-1-5-21-9-1001)", 'the bridge may change the DACL'),
+    @("O:S-1-5-21-9-1001D:P(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x1a019b;;;SY)(A;;0x12019f;;;S-1-5-21-9-1001)", 'SYSTEM entry may change the owner'))) {
   Assert-True (@(Get-T3BridgePipeIssues -Sddl $bad[0] -AgentSid $agentT -BridgeSid $bridgeT).Count -gt 0) "pipe check catches: $($bad[1])"
 }
 Initialize-T3PipeNative
@@ -309,6 +314,22 @@ Assert-True $badArgs 'extra arguments are restricted'
 $secret = [string]::new([char[]]'not-a-real-password')
 Clear-ManagedString $secret
 Assert-True ($secret.Trim([char]0).Length -eq 0) 'the managed string copy is zeroed'
+
+# Pinned binaries: the deliberate update plan.
+$backupDir = 'C:\ProgramData\T3CodePolicy\state\pinned-backup'
+$claudePlan = Get-PinnedUpdatePlan -Kind Claude -InstalledPath 'C:\Program Files\T3Code\claude\claude.exe' -FromPath 'D:\downloads\claude.exe' -BackupDir $backupDir
+$order = @($claudePlan.Steps | ForEach-Object Action)
+Assert-True ($null -eq $claudePlan.Refused) 'a Claude update is planned'
+Assert-True (($order -join ',') -eq 'StopTasks,RemoveMarker,CheckSource,BackupCurrent,WriteNew,RecordHash,LogUpdate,Verify,StartOnPass') "the update runs in order ($($order -join ','))"
+Assert-True ($order.IndexOf('BackupCurrent') -lt $order.IndexOf('WriteNew') -and $order.IndexOf('Verify') -lt $order.IndexOf('StartOnPass')) 'backup before the swap; start only after verify'
+$gitPlan = Get-PinnedUpdatePlan -Kind Git -InstalledPath 'C:\Program Files\Git\cmd\git.exe' -FromPath 'C:\Program Files\Git\cmd\git.exe' -BackupDir $backupDir
+Assert-True ($null -eq $gitPlan.Refused -and @($gitPlan.Steps | Where-Object { $_.Action -in 'BackupCurrent', 'WriteNew' }).Count -eq 0) 'a Git update records the in-place upgrade, no copy'
+Assert-True ($null -ne (Get-PinnedUpdatePlan -Kind Git -InstalledPath 'C:\Program Files\Git\cmd\git.exe' -FromPath 'D:\PortableGit\cmd\git.exe' -BackupDir $backupDir).Refused) 'moving Git is refused (re-run the install with -GitExe)'
+Assert-True ($null -ne (Get-PinnedUpdatePlan -Kind Claude -InstalledPath 'C:\Program Files\T3Code\claude\claude.exe' -FromPath 'C:\Program Files\T3Code\claude\claude.exe' -BackupDir $backupDir).Refused) 'updating Claude from itself is refused'
+Assert-True ($null -ne (Get-PinnedUpdatePlan -Kind Node -InstalledPath $null -FromPath 'D:\node.exe' -BackupDir $backupDir).Refused) 'updating a binary that was never pinned is refused'
+Assert-True ($null -ne (Get-PinnedUpdatePlan -Kind T3 -InstalledPath 'C:\Program Files\T3Code\t3.exe' -FromPath 't3.exe' -BackupDir $backupDir).Refused) 'a relative source is refused'
+$rollbackPlan = Get-PinnedUpdatePlan -Kind T3 -InstalledPath 'C:\Program Files\T3Code\t3.exe' -FromPath "$backupDir\T3-20261105T000000Z\t3.exe" -BackupDir $backupDir
+Assert-True ($null -eq $rollbackPlan.Refused -and $rollbackPlan.FromBackup) 'a rollback from the backup folder is the same update'
 
 # Emergency revoke: the plan, in order, touching only the expected targets.
 $tasks = [ordered]@{ Server = 'T3 server'; Bridge = 'T3 bridge'; Issuer = 'T3 token issuer'; Mover = 'T3 token mover'; Rotate = 'T3 key rotation'; RotateToken = 'T3 token rotate now'; Probe = 'T3 self-check probe' }

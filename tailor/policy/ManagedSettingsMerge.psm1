@@ -191,7 +191,7 @@ function Get-ManagedSettingsLooseners {
       foreach ($inner in @($settings['permissions'].Keys)) {
         if ($script:AllowedManagedPermissionKeys -notcontains $inner) { $found.Add("permissions.$inner") }
       }
-    } elseif ($key -eq 'disableAllHooks' -and $settings[$key] -ne $true) {
+    } elseif ($key -eq 'disableAllHooks' -and -not ($settings[$key] -is [bool] -and $settings[$key])) {
       $found.Add('disableAllHooks (not true)')
     } elseif (-not $script:AllowedManagedKeys.ContainsKey($key)) {
       $found.Add($key)
@@ -200,4 +200,60 @@ function Get-ManagedSettingsLooseners {
   return $found.ToArray()
 }
 
-Export-ModuleMember -Function Get-ManagedSettingsLooseners, Merge-ManagedSettingsRecord, Test-ManagedSettingsUnchanged, Get-ManagedSettingsMerge, Get-ManagedSettingsRemoval, Write-ManagedSettingsAtomically, Get-ManagedSettingsBackupPath, ConvertFrom-ManagedSettingsText
+<#
+  The same allowlist for a registry policy key (HKLM or HKCU \SOFTWARE\Policies\ClaudeCode):
+  a value whose data is a JSON object is checked as a settings file; any other value is
+  checked by its name. $Values: name -> data. Pure.
+#>
+function Get-RegistryPolicyLooseners {
+  param([Parameter(Mandatory)][System.Collections.IDictionary] $Values)
+  $found = [System.Collections.Generic.List[string]]::new()
+  foreach ($name in @($Values.Keys)) {
+    $data = $Values[$name]
+    $text = [string]$data
+    $parsed = $null
+    if ($text.TrimStart().StartsWith('{')) { try { $parsed = $text | ConvertFrom-Json -AsHashtable -ErrorAction Stop } catch { $parsed = $null } }
+    if ($parsed -is [System.Collections.IDictionary]) {
+      foreach ($item in (Get-ManagedSettingsLooseners $text)) { $found.Add("$name/$item") }
+    } else {
+      $single = @{ $name = $data } | ConvertTo-Json -Depth 5
+      foreach ($item in (Get-ManagedSettingsLooseners $single)) { $found.Add($item) }
+    }
+  }
+  return $found.ToArray()
+}
+
+<#
+  Every Claude Code policy source on this machine checked against the allowlist: the machine
+  file, every managed-settings.d\*.json drop-in beside it, and the registry policy keys
+  (HKLM, the administrator's HKCU, and the agent account's HKCU when its hive is loaded).
+  Returns "source: key" strings; empty means nothing loosens the lock. Reads only.
+#>
+function Get-ClaudePolicySourceLooseners {
+  param([Parameter(Mandatory)][string] $ManagedSettingsPath, [string] $AgentSid)
+  $found = [System.Collections.Generic.List[string]]::new()
+  if (Test-Path -LiteralPath $ManagedSettingsPath) {
+    foreach ($item in (Get-ManagedSettingsLooseners ([IO.File]::ReadAllText($ManagedSettingsPath)))) { $found.Add("${ManagedSettingsPath}: $item") }
+  }
+  $dropIns = Join-Path (Split-Path -Parent $ManagedSettingsPath) 'managed-settings.d'
+  if (Test-Path -LiteralPath $dropIns) {
+    foreach ($file in Get-ChildItem -LiteralPath $dropIns -Force) {
+      if ($file.PSIsContainer -or $file.Extension -ne '.json') { $found.Add("$($file.FullName): unexpected entry"); continue }
+      try { $items = Get-ManagedSettingsLooseners ([IO.File]::ReadAllText($file.FullName)) } catch { $items = @('not valid JSON') }
+      foreach ($item in $items) { $found.Add("$($file.FullName): $item") }
+    }
+  }
+  $keys = @('HKLM:\SOFTWARE\Policies\ClaudeCode', 'HKCU:\SOFTWARE\Policies\ClaudeCode')
+  if ($AgentSid) { $keys += "Registry::HKEY_USERS\$AgentSid\SOFTWARE\Policies\ClaudeCode" }
+  foreach ($key in $keys) {
+    if (-not (Test-Path -LiteralPath $key)) { continue }
+    $item = Get-Item -LiteralPath $key
+    $values = [ordered]@{}
+    foreach ($name in $item.Property) { $values[$name] = $item.GetValue($name) }
+    foreach ($entry in (Get-RegistryPolicyLooseners -Values $values)) { $found.Add("${key}: $entry") }
+    foreach ($sub in @(Get-ChildItem -LiteralPath $key -ErrorAction SilentlyContinue)) { $found.Add("${key}: subkey $($sub.PSChildName)") }
+  }
+  return $found.ToArray()
+}
+
+Export-ModuleMember -Function Get-ClaudePolicySourceLooseners, Get-RegistryPolicyLooseners, Get-ManagedSettingsLooseners, Merge-ManagedSettingsRecord, Test-ManagedSettingsUnchanged, Get-ManagedSettingsMerge, Get-ManagedSettingsRemoval, Write-ManagedSettingsAtomically, Get-ManagedSettingsBackupPath, ConvertFrom-ManagedSettingsText

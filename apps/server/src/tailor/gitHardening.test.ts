@@ -14,6 +14,12 @@ import {
 } from "./gitHardening.ts";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeOS from "node:os";
+import * as HostProcess from "@t3tools/shared/HostProcess";
+import {
+  CommandResolutionCache,
+  resolveSpawnCommand,
+  SpawnExecutableResolution,
+} from "@t3tools/shared/shell";
 import * as TailorGitSpawner from "./gitSpawner.ts";
 
 const configOf = (env: Record<string, string | undefined>) => {
@@ -327,4 +333,38 @@ describe("Tailor git hardening", () => {
     NodeFS.symlinkSync(NodePath.join(repo, ".git"), NodePath.join(linked, ".git"), "junction");
     assert.isDefined(TailorGitSpawner.checkGitDirFile(linked, policy), "a .git junction");
   });
+
+  it.effect("accepts a real resolveSpawnCommand .cmd launch, and only from the policy's PATH", () =>
+    Effect.gen(function* () {
+      const folder = "C:\\Program Files\\Tool (x86)\\bin";
+      const program = `${folder}\\tool.cmd`;
+      const resolved = yield* resolveSpawnCommand("tool", ["--flag", "a & b"], {}).pipe(
+        Effect.provideService(HostProcess.Platform, "win32"),
+        Effect.provideService(CommandResolutionCache, new Map()),
+        Effect.provideService(HostProcess.Environment, { PATH: folder, PATHEXT: ".COM;.EXE;.BAT;.CMD" }),
+        Effect.provideService(SpawnExecutableResolution, () => program),
+      );
+      assert.isTrue(resolved.shell);
+      assert.strictEqual(TailorGitSpawner.firstShellToken(resolved.command), program);
+      const command = ChildProcess.make(resolved.command, [...resolved.args], { shell: resolved.shell });
+      const base: TailorGitSpawner.SpawnPolicy = {
+        platform: "win32",
+        gitExe: undefined,
+        workspaceRoots: undefined,
+        isFile: (path) => path === program,
+        isLink: () => false,
+        readText: () => undefined,
+        realPath: () => undefined,
+      };
+      const allowed = TailorGitSpawner.tailorCommand(command, base);
+      assert.isTrue("command" in allowed);
+      if ("command" in allowed && allowed.command._tag === "StandardCommand") {
+        assert.strictEqual(allowed.command.options.env?.NoDefaultCurrentDirectoryInExePath, "1");
+        assert.strictEqual(allowed.command.command, resolved.command);
+      }
+      // With the policy installed the program's folder must be one of its admin-owned PATH folders.
+      assert.isTrue("command" in TailorGitSpawner.tailorCommand(command, { ...base, serverPath: [folder] }));
+      assert.isTrue("refused" in TailorGitSpawner.tailorCommand(command, { ...base, serverPath: ["C:\\Windows\\System32"] }));
+    }),
+  );
 });

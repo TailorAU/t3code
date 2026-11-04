@@ -94,6 +94,8 @@ Severity: Critical, High, Medium, Low, Info. Status: Fixed (in this PR), Mitigat
 | T3-76 | The bridge pipe as built could not add instances; descriptor read as owner | High | Fixed |
 | T3-77 | Task Scheduler added read access for each task's own account | High | Fixed (`TASK_DONT_ADD_PRINCIPAL_ACE`) |
 | T3-78 | Delta review 3: rotation proof, libuv note, `.git` links, kill counting, bridge attestation, PATH, four-tuple, managed-tier allowlist, race coverage | Medium | Fixed (UNVERIFIED elevated where noted) |
+| T3-79 | Lows from review 4: policy drop-ins and registry, probe result forgery, `.cmd` launches, probe SQOS and busy, missing-account kill, shell profiles, pipe WRITE_DAC, stricter task results | Low | Fixed (UNVERIFIED elevated where noted) |
+| T3-80 | No deliberate update path for the pinned binaries | Medium | Fixed (`-UpdatePinned`; UNVERIFIED elevated) |
 
 ## Findings
 
@@ -1026,12 +1028,47 @@ fails on a task whose last result is a failure.
 - The orchestrator's under-lock recheck is covered again: a plan-limited caller's write is
   refused when the user raises the interaction mode after the check.
 
+### T3-79 Lows from review 4 (Low, Fixed; UNVERIFIED elevated where noted)
+
+- Every Claude policy source is checked against the allowlist: the machine file, each
+  `managed-settings.d\*.json` drop-in, and `SOFTWARE\Policies\ClaudeCode` in HKLM, the
+  administrator's HKCU and `t3agent`'s HKCU (a JSON value key by key, other values by name).
+  Remote organisation settings: see the policy README (not expected to apply to API-key or
+  Bedrock auth; not verified live).
+- The SYSTEM pipe probe writes its result into the admin-only `state\` folder with CreateNew
+  and a protected Administrators/SYSTEM DACL, owned by SYSTEM; the self-check checks owner and
+  DACL. It opens the pipe with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`, and
+  `ERROR_PIPE_BUSY` is a FAIL.
+- The shell gate parses the program out of `resolveSpawnCommand`'s caret-escaped command line
+  correctly (a real `.cmd` launch passes), requires it to be in one of the policy's
+  admin-owned PATH folders when the policy is installed, and gives the shell child the same
+  environment hardening. Test with real `resolveSpawnCommand` output.
+- `Stop-AccountProcesses` returns a found/stopped pair for a missing account too.
+- Claude may not edit `~/bin`, `~/.bashrc`, `~/.bash_profile`, `~/.bash_login`, `~/.profile` or
+  `~/.inputrc`; the self-check requires Git Bash's `etc` folder and profile files to be
+  admin-only.
+- The pipe check also refuses WRITE_DAC or WRITE_OWNER for t3bridge and SYSTEM.
+- Once a verified marker exists, the self-check accepts only success or running for the T3
+  server task and only success for the probe tasks.
+
+### T3-80 Updating pinned binaries (Medium, Fixed; UNVERIFIED elevated)
+
+The pinned Claude, `t3.exe`, node and git are used only by T3 and never update themselves.
+`-UpdatePinned Claude|T3|Node -From <file> [-ExpectedSha256 <hex>]` stops T3, removes the
+marker, checks the source (plain file, expected hash), keeps the current binary as a backup in
+`state\pinned-backup\`, writes the new one (CreateNew, protected DACL) and moves it into the
+pinned path, records the new hash and the old one, runs the self-check and starts T3 only on a
+PASS; on failure T3 stays stopped and the rollback command is printed. Git is upgraded in place
+by its own installer and then verified and recorded with `-UpdatePinned Git`. Tests: the
+planner's order and refusals.
+
 ## What was verified
 
 - Locally on Windows (frozen lockfile), after the delta review: the contracts suite (161/161)
-  and the gate's server tests, 770 passed plus 1 upstream skip: `src/tailor`, `src/mcp` (every
-  upstream MCP test, including the restored interaction-mode race) and `http.test.ts` 366/366
-  in 38 files, and the other gate files 404 passed plus 1 skip (git hardening including a real
+  and the gate's server tests, 771 passed plus 1 upstream skip: `src/mcp` 293/293 (every
+  upstream MCP test, including the restored interaction-mode race), `src/tailor`, `http.test.ts`
+  and the text-generation tests 91/91, and the other gate files 387 passed plus 1 skip (a real
+  `resolveSpawnCommand` `.cmd` launch through the shell gate, git hardening including a real
   planted-`git.exe` spawn, refusal with nothing spawned, `.git` link and nested-submodule
   checks, worktree checks with the policy installed,
   workspace paths, CSP and the frame-only HTML rule with its cache headers, signing-key

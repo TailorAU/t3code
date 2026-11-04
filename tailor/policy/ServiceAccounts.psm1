@@ -719,7 +719,9 @@ public static Microsoft.Win32.SafeHandles.SafePipeHandle Create(string path, byt
 }
 /// Owner and DACL of an existing pipe, read through a READ_CONTROL handle (SDDL).
 public static string ReadSddl(string path) {
-  using (var handle = CreateFileW(path, 0x00020000u, 0, IntPtr.Zero, 3, 0, IntPtr.Zero)) {
+  // READ_CONTROL, opened as a client with SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION so
+  // the pipe's server can identify the reader but never act as it.
+  using (var handle = CreateFileW(path, 0x00020000u, 0, IntPtr.Zero, 3, 0x00110000u, IntPtr.Zero)) {
     if (handle.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), path);
     IntPtr owner, group, dacl, sacl, sd;
     uint result = GetSecurityInfo(handle, 1, 0x1 | 0x4, out owner, out group, out dacl, out sacl, out sd);
@@ -759,8 +761,9 @@ function New-T3BridgePipeSecurity {
 }
 
 <#
-  Checks a pipe's SDDL against the plan: owner t3agent; protected; t3bridge and SYSTEM
-  read/write without create-instance; t3agent create-instance only; nobody else. Pure.
+  Checks a pipe's SDDL against the plan: owner t3agent; protected DACL; t3agent exactly
+  read/write + create-instance (0x12019f); t3bridge and SYSTEM read/write, without
+  create-instance, WRITE_DAC or WRITE_OWNER; nobody else. Pure.
 #>
 function Get-T3BridgePipeIssues {
   param([Parameter(Mandatory)][string] $Sddl, [Parameter(Mandatory)][string] $AgentSid, [Parameter(Mandatory)][string] $BridgeSid)
@@ -779,6 +782,7 @@ function Get-T3BridgePipeIssues {
       if ($mask -ne 0x12019f) { $issues.Add("the agent account has 0x$('{0:x}' -f $mask), not exactly read/write + create-instance (0x12019f)") }
     } elseif ($sid -eq $BridgeSid -or $sid -eq 'S-1-5-18') {
       if (($mask -band $createInstance) -ne 0) { $issues.Add("$sid may create pipe instances") }
+      if (($mask -band (0x40000 -bor 0x80000)) -ne 0) { $issues.Add("$sid may change the pipe's DACL or owner") }
       if ($sid -eq $BridgeSid -and ($mask -band 0x3) -ne 0x3) { $issues.Add('the bridge account cannot read and write the pipe') }
     } else {
       $issues.Add("$sid has access (0x$('{0:x}' -f $mask))")
@@ -907,12 +911,74 @@ $($script:PipeNativeSource)
 '@
 `$path = ([string][char]92) * 2 + '.' + [char]92 + 'pipe' + [char]92 + $(& $q $script:BridgePipeName)
 `$result = [ordered]@{ present = `$false }
-try { `$result.sddl = [T3Policy.PipeNative]::ReadSddl(`$path); `$result.present = `$true } catch { `$result.error = `$_.Exception.Message }
+try { `$result.sddl = [T3Policy.PipeNative]::ReadSddl(`$path); `$result.present = `$true }
+catch {
+  `$code = `$_.Exception.InnerException.NativeErrorCode
+  `$result.error = `$_.Exception.Message
+  `$result.errorCode = `$code
+  # 231 = ERROR_PIPE_BUSY: the pipe exists but no instance is listening, which is a failure.
+  `$result.busy = (`$code -eq 231)
+}
 `$result.at = [DateTime]::UtcNow.ToString('o')
 `$out = $(& $q $ResultPath)
 if (Test-Path -LiteralPath `$out) { [IO.File]::Delete(`$out) }
-[IO.File]::WriteAllText(`$out, (`$result | ConvertTo-Json))
+`$security = [Security.AccessControl.FileSecurity]::new()
+`$security.SetAccessRuleProtection(`$true, `$false)
+`$security.SetOwner([Security.Principal.SecurityIdentifier]::new('S-1-5-18'))
+foreach (`$sid in 'S-1-5-32-544', 'S-1-5-18') {
+  `$security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new(`$sid), 'FullControl', 'Allow'))
+}
+`$bytes = [Text.UTF8Encoding]::new(`$false).GetBytes((`$result | ConvertTo-Json))
+`$stream = [IO.FileSystemAclExtensions]::Create([IO.FileInfo]::new(`$out), [IO.FileMode]::CreateNew,
+  [Security.AccessControl.FileSystemRights]'Write, Synchronize', [IO.FileShare]::None, 4096, [IO.FileOptions]::None, `$security)
+try { `$stream.Write(`$bytes, 0, `$bytes.Length) } finally { `$stream.Dispose() }
 "@
+}
+
+# ---------- pinned binaries (pure planning) ----------
+
+<#
+  The deliberate update of a pinned binary (install-policy.ps1 -UpdatePinned). The pinned
+  copies are used only by T3 and never update themselves.
+
+    Claude, T3, Node: -From is the new single-file binary; it is copied over the pinned path
+                      (the old one kept as a backup in state\pinned-backup\).
+    Git:              Git is a whole install, not one file. -From must be the pinned git.exe
+                      itself, after an administrator upgraded that admin-owned install in
+                      place; the new hash is recorded (no copy, no backup).
+
+  Returns @{ Refused = <reason or $null>; Steps = <ordered steps> }. Pure.
+#>
+function Get-PinnedUpdatePlan {
+  param(
+    [Parameter(Mandatory)][ValidateSet('Claude', 'Git', 'Node', 'T3')][string] $Kind,
+    [AllowNull()][string] $InstalledPath,
+    [Parameter(Mandatory)][string] $FromPath,
+    [Parameter(Mandatory)][string] $BackupDir
+  )
+  $refuse = { param($why) [pscustomobject]@{ Refused = $why; Steps = @() } }
+  if (-not $InstalledPath) { return & $refuse "No pinned $Kind is recorded in t3-policy.json; install with it first." }
+  if (-not [IO.Path]::IsPathRooted($FromPath)) { return & $refuse '-From must be a full path.' }
+  $same = [string]::Equals([IO.Path]::GetFullPath($FromPath).TrimEnd('\'), [IO.Path]::GetFullPath($InstalledPath).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)
+  if ($Kind -eq 'Git' -and -not $same) {
+    return & $refuse "Git is a whole install: upgrade the pinned Git in place ($InstalledPath) with its own installer, then run -UpdatePinned Git -From $InstalledPath. To move Git, re-run the install with -GitExe."
+  }
+  if ($Kind -ne 'Git' -and $same) { return & $refuse "-From is the pinned $Kind itself; give the new binary." }
+  $fromBackup = $FromPath.StartsWith($BackupDir, [StringComparison]::OrdinalIgnoreCase)
+  $step = { param($action, $detail) [pscustomobject]@{ Action = $action; Detail = $detail } }
+  $steps = @(
+    (& $step 'StopTasks' 'stop every T3 task'),
+    (& $step 'RemoveMarker' 'remove the verified marker: nothing starts until verification passes'),
+    (& $step 'CheckSource' 'the source is a plain file (no link), its SHA-256 matches -ExpectedSha256 if given; Git: admin-owned folder and version'))
+  if ($Kind -ne 'Git') {
+    $steps += & $step 'BackupCurrent' "move the current $Kind into $BackupDir (kept for a rollback)"
+    $steps += & $step 'WriteNew' 'write the new binary next to the pinned path (CreateNew, protected DACL: Administrators/SYSTEM full, Users read and execute), then move it into place'
+  }
+  $steps += & $step 'RecordHash' 'record the new SHA-256 in t3-policy.json'
+  $steps += & $step 'LogUpdate' 'append the old and new SHA-256 to state\pinned-updates.json'
+  $steps += & $step 'Verify' 'run verify-install.ps1'
+  $steps += & $step 'StartOnPass' 'start the tasks only on a full PASS; otherwise leave T3 stopped and print the rollback'
+  return [pscustomobject]@{ Refused = $null; Steps = $steps; FromBackup = $fromBackup }
 }
 
 # ---------- self-check helpers (pure) ----------
@@ -1286,7 +1352,7 @@ Export-ModuleMember -Function New-ServiceAccountPasswordChars, Get-ServiceAccoun
   Get-MarkerCheckText, Get-T3LauncherText, Get-BridgeLauncherText, Get-TokenIssuerText, Get-TokenMoverText,
   Get-KeyRotationText, Get-EmergencyRevokePlan, Test-SigningKeyFresh, Get-LastRevokeTime,
   Initialize-T3PipeNative, Get-T3BridgePipePath, New-T3BridgePipeSecurity, Get-T3BridgePipeIssues, Connect-T3BridgePipe,
-  Get-BridgePipeShimText, Get-PipeProbeText, ConvertFrom-UserRightsInf, Compare-UserRightsSnapshot,
+  Get-BridgePipeShimText, Get-PipeProbeText, Get-PinnedUpdatePlan, ConvertFrom-UserRightsInf, Compare-UserRightsSnapshot,
   Compare-PreInstallSnapshot, Get-TaskSecurityIssues, Get-AgentProbeText, Test-AgentProbeResult,
   Test-GitVersionAtLeast, Clear-ManagedString,
   Get-AccountGroups, Set-ServiceAccount, Invoke-SeceditUserRights, Register-ServiceTask, Remove-ServiceTask,

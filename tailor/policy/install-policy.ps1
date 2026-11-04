@@ -117,7 +117,13 @@ param(
   # Upgrades from an install that did not record account ownership: adopt existing
   # t3agent/t3bridge accounts once, only if their description is exactly this installer's and
   # they are in no group but Users.
-  [switch] $AdoptExistingAccounts
+  [switch] $AdoptExistingAccounts,
+  # Deliberate update of a pinned binary (they never update themselves): stop T3, swap the
+  # binary (backup kept), record its hash, verify, start only on PASS. With -UpdatePinned,
+  # -ExpectedSha256 is the NEW binary's SHA-256 (64 hex digits) and the protected copy is
+  # checked against the hashes recorded at install.
+  [ValidateSet('Claude', 'Git', 'Node', 'T3')][string] $UpdatePinned,
+  [string] $From
 )
 
 Set-StrictMode -Version 2.0
@@ -530,8 +536,14 @@ foreach ($key in $InstallerFiles.Keys) {
 }
 $hashText = ($hashes.Keys | ForEach-Object { "$_=$($hashes[$_])" }) -join ','
 Write-Host "Installer SHA-256: $hashText"
+$fromSha256 = $null
+if ($UpdatePinned) {
+  if (-not $From) { throw '-UpdatePinned needs -From (the new binary; for Git, the pinned git.exe after an in-place upgrade).' }
+  if ($ExpectedSha256 -match '^[0-9a-fA-F]{64}$') { $fromSha256 = $ExpectedSha256.ToLowerInvariant(); $ExpectedSha256 = $null }
+  elseif ($ExpectedSha256) { throw 'With -UpdatePinned, -ExpectedSha256 is the new binary''s SHA-256 (64 hex digits).' }
+}
 if (-not $ExpectedSha256) {
-  if (-not $EmergencyRevoke) { throw 'Pass -ExpectedSha256 from the reviewed commit (README.md, First step). Nothing was changed.' }
+  if (-not $EmergencyRevoke -and -not $UpdatePinned) { throw 'Pass -ExpectedSha256 from the reviewed commit (README.md, First step). Nothing was changed.' }
   # Emergency revoke: the hashes recorded at install, from the admin-only policy file.
   Assert-AdminControlled $InstalledPath -SkipParent
   $ExpectedSha256 = [string](Get-Content -LiteralPath $InstalledPath -Raw | ConvertFrom-Json).installed.installerSha256
@@ -638,7 +650,7 @@ function Invoke-TaskAndWait([string] $name, [int] $timeoutSeconds = 180) {
 # Stops every process running as the account (by owner SID), without removing the account.
 function Stop-AccountProcesses([string] $name) {
   $user = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
-  if ($null -eq $user) { Write-Host "  no account $name"; return 0 }
+  if ($null -eq $user) { Write-Host "  no account $name"; return [pscustomobject]@{ Found = 0; Stopped = 0 } }
   $found = 0; $stopped = 0
   foreach ($process in Get-CimInstance Win32_Process) {
     $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction SilentlyContinue
@@ -684,6 +696,104 @@ function Get-MachineSnapshot {
     managedSettingsDirExisted = (Test-Path -LiteralPath (Split-Path -Parent $MachineManagedSettingsPath))
     rights = $rights
   }
+}
+
+# ---------- update a pinned binary ----------
+if ($UpdatePinned) {
+  if ($null -eq $previousInstalled) { throw 'No installed policy: install first. Nothing was changed.' }
+  $pinnedKeys = @{ Claude = @('claudeExe', 'claudeExeSha256'); Git = @('gitExe', 'gitExeSha256'); Node = @('nodeExe', 'nodeExeSha256'); T3 = @('t3Exe', 't3ExeSha256') }
+  $pathKey = $pinnedKeys[$UpdatePinned][0]; $hashKey = $pinnedKeys[$UpdatePinned][1]
+  $pinned = if ($previousInstalled.PSObject.Properties[$pathKey]) { [string]$previousInstalled.$pathKey } else { $null }
+  $backupRoot = Join-Path $StateDir 'pinned-backup'
+  $update = Get-PinnedUpdatePlan -Kind $UpdatePinned -InstalledPath $pinned -FromPath $From -BackupDir $backupRoot
+  if ($update.Refused) { throw "$($update.Refused) Nothing was changed." }
+  $oldHash = if ($previousInstalled.PSObject.Properties[$hashKey]) { [string]$previousInstalled.$hashKey } else { $null }
+  $backupPath = Join-Path (Join-Path $backupRoot ("$UpdatePinned-" + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ'))) (Split-Path -Leaf $pinned)
+  $newHash = $null
+  $rollback = "pwsh -NoProfile -File `"$InstallerDir\install-policy.ps1`" -UpdatePinned $UpdatePinned -From `"$backupPath`""
+  try {
+    foreach ($step in $update.Steps) {
+      Write-Host "  $($step.Action): $($step.Detail)"
+      switch ($step.Action) {
+        'StopTasks' {
+          foreach ($task in $Tasks.Values) {
+            if (Get-ScheduledTask -TaskName $task -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue) { Stop-ScheduledTask -TaskName $task -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue }
+          }
+        }
+        'RemoveMarker' { if (Test-Path -LiteralPath $MarkerPath) { [IO.File]::Delete($MarkerPath) } }
+        'CheckSource' {
+          $source = Get-Item -LiteralPath $From -Force
+          if ($source.PSIsContainer -or ($source.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "$From is not a plain file." }
+          $newHash = Get-FileSha256 $From
+          if ($fromSha256 -and $newHash -ne $fromSha256) { throw "$From has SHA-256 $newHash, not the expected $fromSha256." }
+          if ($UpdatePinned -eq 'Git') {
+            Assert-AdminControlled $From
+            $version = (& $From --version)
+            if (-not (Test-GitVersionAtLeast -VersionText $version -Minimum $MinimumGitVersion)) { throw "$version is older than $MinimumGitVersion." }
+          }
+          [void](Assert-NotReparse $pinned)
+          Assert-AdminControlled (Split-Path -Parent $pinned) -SkipParent
+        }
+        'BackupCurrent' {
+          Ensure-PlannedDirectory ([pscustomobject]@{ Name = 'pinned-backup'; Path = $backupRoot; Grants = @() })
+          New-Item -ItemType Directory -Path (Split-Path -Parent $backupPath) -Force | Out-Null
+          Copy-Item -LiteralPath $pinned -Destination $backupPath
+          if ((Get-FileSha256 $backupPath) -ne (Get-FileSha256 $pinned)) { throw 'The backup copy does not match the pinned binary.' }
+          Write-Host "    backup: $backupPath"
+        }
+        'WriteNew' {
+          $staged = "$pinned.t3new"
+          if (Test-Path -LiteralPath $staged) { [void](Assert-NotReparse $staged); [IO.File]::Delete($staged) }
+          $security = [Security.AccessControl.FileSecurity]::new()
+          $security.SetAccessRuleProtection($true, $false)
+          $security.SetOwner($SidAdministrators)
+          foreach ($g in @(@('S-1-5-32-544', 'FullControl'), @('S-1-5-18', 'FullControl'), @('S-1-5-32-545', 'ReadAndExecute, Synchronize'))) {
+            $security.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($g[0]), [Security.AccessControl.FileSystemRights]$g[1], 'Allow'))
+          }
+          $bytes = [IO.File]::ReadAllBytes($From)
+          if ((Get-BytesSha256 $bytes) -ne $newHash) { throw "$From changed while it was being read." }
+          $stream = [IO.FileSystemAclExtensions]::Create([IO.FileInfo]::new($staged), [IO.FileMode]::CreateNew,
+            [Security.AccessControl.FileSystemRights]'Write, Synchronize', [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $security)
+          try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+          [IO.File]::Move($staged, $pinned, $true)
+          if ((Get-FileSha256 $pinned) -ne $newHash) { throw 'The pinned binary does not have the new SHA-256 after the copy.' }
+        }
+        'RecordHash' {
+          $doc = Get-Content -LiteralPath $InstalledPath -Raw | ConvertFrom-Json
+          $doc.installed.$hashKey = $newHash
+          $agent = Get-LocalUser -Name $AgentAccount -ErrorAction SilentlyContinue
+          $bridge = Get-LocalUser -Name $BridgeAccount -ErrorAction SilentlyContinue
+          if ($agent) { $SidMap.agent = $agent.SID.Value }
+          if ($bridge) { $SidMap.bridge = $bridge.SID.Value }
+          Write-ProtectedFile $InstalledPath (Get-Utf8Bytes (($doc | ConvertTo-Json -Depth 12) + "`n")) (New-FileEntry @{ agent = 'ReadAndExecute, Synchronize'; bridge = 'ReadAndExecute, Synchronize' })
+        }
+        'LogUpdate' {
+          $logPath = Join-Path $StateDir 'pinned-updates.json'
+          $log = @()
+          if (Test-Path -LiteralPath $logPath) { [void](Assert-NotReparse $logPath); $log = @(Get-Content -LiteralPath $logPath -Raw | ConvertFrom-Json) }
+          $log += [ordered]@{ at = [DateTime]::UtcNow.ToString('o'); kind = $UpdatePinned; path = $pinned; oldSha256 = $oldHash; newSha256 = $newHash; backup = $(if ($UpdatePinned -eq 'Git') { $null } else { $backupPath }) }
+          Write-ProtectedFile $logPath (Get-Utf8Bytes ((ConvertTo-Json -InputObject @($log) -Depth 4) + "`n"))
+        }
+        'Verify' {
+          if (-not (& $verifyBlock -AlreadyLoaded)) { throw 'verify-install.ps1 FAILED after the update.' }
+        }
+        'StartOnPass' {
+          foreach ($task in @($Tasks.Server, $Tasks.Mover)) { Start-ScheduledTask -TaskName $task -TaskPath '\T3CodePolicy\' }
+          if ($previousInstalled.PSObject.Properties['bridgeExe']) {
+            Write-Host '    the bridge starts once the pipe is checked: re-run verify-install.ps1 -RequirePipe, then start the T3 bridge task'
+          }
+        }
+      }
+    }
+  } catch {
+    Write-Warning "UPDATE FAILED: $($_.Exception.Message)"
+    Write-Warning 'T3 is stopped and the verified marker is removed: nothing starts until a verified install.'
+    if ($UpdatePinned -ne 'Git' -and (Test-Path -LiteralPath $backupPath)) { Write-Warning "To roll back: $rollback" }
+    elseif ($UpdatePinned -eq 'Git') { Write-Warning 'To roll back Git: reinstall the previous Git version in place, then run -UpdatePinned Git -From the pinned git.exe.' }
+    exit 1
+  }
+  Write-Host "Updated the pinned $UpdatePinned to SHA-256 $newHash; verified; T3 started."
+  return
 }
 
 # ---------- emergency revoke ----------
@@ -903,14 +1013,11 @@ if (-not (Test-GitVersionAtLeast -VersionText $gitVersion -Minimum $MinimumGitVe
 }
 # Settings in the machine tier that loosen T3's lock for every session, or a Claude policy in
 # the registry, would win over T3's own lock: refuse until an administrator removes them.
-if (-not $SkipMachineManagedSettings -and (Test-Path -LiteralPath $MachineManagedSettingsPath)) {
-  $looseners = Get-ManagedSettingsLooseners ([IO.File]::ReadAllText($MachineManagedSettingsPath))
-  if ($looseners.Count -gt 0) {
-    throw "$MachineManagedSettingsPath sets $($looseners -join ', '), which loosen the lock for every Claude session including T3's. Remove them deliberately and re-run. Nothing was changed."
-  }
-}
-if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Policies\ClaudeCode') {
-  throw 'HKLM\SOFTWARE\Policies\ClaudeCode exists: a registry Claude policy would apply alongside T3''s. Remove it deliberately and re-run. Nothing was changed.'
+$existingAgent = Get-LocalUser -Name $AgentAccount -ErrorAction SilentlyContinue
+$looseners = Get-ClaudePolicySourceLooseners -ManagedSettingsPath $MachineManagedSettingsPath `
+  -AgentSid $(if ($existingAgent) { $existingAgent.SID.Value } else { '' })
+if ($looseners.Count -gt 0) {
+  throw "Claude policy settings outside the allowlist apply to every Claude session, T3's included:`n  $($looseners -join "`n  ")`nRemove them deliberately and re-run. Nothing was changed."
 }
 $pwshCandidate = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)) 'PowerShell\7\pwsh.exe'
 if (-not (Test-Path -LiteralPath $pwshCandidate)) {
@@ -1102,6 +1209,8 @@ $installed = [ordered]@{
   minimumGitVersion = $MinimumGitVersion
   bridgePipe = (Get-T3BridgePipePath)
   serverPath = @($ServerPath)
+  nodeExe = $NodeExe
+  nodeExeSha256 = $(if ($NodeExe) { Get-FileSha256 $NodeExe } else { $null })
   t3Port = $T3Port
   instanceEnvironmentAllowlist = @($policy.claudeInstance.environmentAllowlist)
   installerSha256 = $hashText
@@ -1159,7 +1268,7 @@ $probeTests = [ordered]@{
 }
 Write-ProtectedFile $probe (Get-Utf8Bytes (Get-AgentProbeText -ResultPath $probeResult -Tests $probeTests)) $readAgent
 $pipeProbe = Join-Path $ServiceDir 'probe-pipe.ps1'
-Write-ProtectedFile $pipeProbe (Get-Utf8Bytes (Get-PipeProbeText -ResultPath (Join-Path $ProbeDir 'pipe.json'))) (New-FileEntry @{})
+Write-ProtectedFile $pipeProbe (Get-Utf8Bytes (Get-PipeProbeText -ResultPath (Join-Path $StateDir 'pipe-probe.json'))) (New-FileEntry @{})
 Write-ProtectedFile $mover (Get-Utf8Bytes (Get-TokenMoverText -DropPath $DropPath -TokenPath $TokenPath -AgentSid $agentId -BridgeSid $bridgeId)) (New-FileEntry @{})
 if ($BridgeExe) {
   Write-ProtectedFile $bridgeLauncher (Get-Utf8Bytes (Get-BridgeLauncherText -BridgeExe $BridgeExe -TokenPath $TokenPath -KeyPath $BridgeKeyPath `

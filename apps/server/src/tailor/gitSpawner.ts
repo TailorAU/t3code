@@ -6,9 +6,10 @@
  * - On Windows a bare command name is resolved to an absolute path from PATH's absolute
  *   entries only, so a planted `git.exe` in a repository is never the one found. A name found
  *   nowhere is REFUSED: nothing is spawned and no substitute path is used.
- * - A `shell: true` command (Windows `.cmd`/`.bat` launches, already resolved and quoted by
- *   `resolveSpawnCommand`) runs only if its first token is an absolute path to an existing
- *   file; anything else is refused.
+ * - A `shell: true` command (Windows `.cmd`/`.bat` launches, resolved and caret-quoted by
+ *   `resolveSpawnCommand`) runs only if its program (the first token, unescaped) is an absolute
+ *   path to an existing file, and with the policy installed it must sit in one of the policy's
+ *   admin-owned PATH folders; anything else is refused. It gets the child-env hardening too.
  * - With the machine policy installed, `git` is always the policy's absolute `gitExe`; a policy
  *   without one refuses every git call.
  * - Every git command gets the hardening (gitHardening.ts).
@@ -44,6 +45,8 @@ export interface SpawnPolicy {
   readonly gitExe: string | null | undefined;
   /** Workspace roots when the policy is installed. */
   readonly workspaceRoots: ReadonlyArray<string> | undefined;
+  /** The policy's admin-owned PATH folders; undefined without a policy. */
+  readonly serverPath?: ReadonlyArray<string> | undefined;
   readonly isFile: (path: string) => boolean;
   /** True for a symbolic link, junction or other reparse point (not followed). */
   readonly isLink: (path: string) => boolean;
@@ -60,6 +63,7 @@ export function currentSpawnPolicy(): SpawnPolicy {
     platform: process.platform,
     gitExe: state._tag === "installed" ? (state.policy.gitExe ?? null) : undefined,
     workspaceRoots: state._tag === "installed" ? state.policy.workspaceRoots : undefined,
+    serverPath: state._tag === "installed" ? state.policy.serverPath : undefined,
     isFile: (path) => {
       try {
         return NodeFS.statSync(path).isFile();
@@ -124,23 +128,31 @@ export function resolveFromPath(
   return undefined;
 }
 
-/** The first token of a cmd.exe command line as resolveSpawnCommand quotes it (carets undone). */
+/**
+ * The program of a cmd.exe command line as resolveSpawnCommand builds it: each argument is
+ * wrapped in quotes and every cmd meta character, the quotes and spaces included, is
+ * caret-escaped (`^"C:\Program^ Files\x.cmd^"`). Carets are undone, an unescaped space ends
+ * the token unless inside plain quotes, and the surrounding quotes are dropped.
+ */
 export function firstShellToken(commandLine: string): string {
-  const trimmed = commandLine.trimStart();
-  if (trimmed.startsWith('"')) {
-    let token = "";
-    for (let index = 1; index < trimmed.length; index++) {
-      const char = trimmed[index]!;
-      if (char === "^" && index + 1 < trimmed.length) {
-        token += trimmed[++index];
-        continue;
-      }
-      if (char === '"') return token;
-      token += char;
+  const line = commandLine.trimStart();
+  let token = "";
+  let inQuote = false;
+  for (let index = 0; index < line.length; index++) {
+    const char = line[index]!;
+    if (char === "^" && index + 1 < line.length) {
+      token += line[++index];
+      continue;
     }
-    return token;
+    if (char === '"') {
+      inQuote = !inQuote;
+      token += char;
+      continue;
+    }
+    if (/\s/.test(char) && !inQuote) break;
+    token += char;
   }
-  return trimmed.split(/\s+/, 1)[0] ?? "";
+  return token.replace(/^"/, "").replace(/"$/, "").replace(/\\"/g, '"');
 }
 
 /** Checks the `.git` of the tree a git command runs in. Returns a refusal reason, or undefined. */
@@ -225,7 +237,20 @@ export function tailorCommand(
     if (!NodePath.win32.isAbsolute(program) || !policy.isFile(program)) {
       return { refused: `A shell command must start with an existing absolute program path (${program}).` };
     }
-    return { command };
+    if (policy.serverPath !== undefined) {
+      const folder = NodePath.win32.dirname(program).toLowerCase().replace(/\\+$/, "");
+      const allowed = policy.serverPath.some(
+        (dir) => NodePath.win32.resolve(dir).toLowerCase().replace(/\\+$/, "") === folder,
+      );
+      if (!allowed) return { refused: `${program} is not in one of the policy's admin-owned PATH folders.` };
+    }
+    return {
+      command: ChildProcess.make(command.command, [...command.args], {
+        ...command.options,
+        env: { ...env, NoDefaultCurrentDirectoryInExePath: "1" },
+        extendEnv: false,
+      }) as Command,
+    };
   }
   const isGit = isGitExecutable(command.command);
   let executable = command.command;

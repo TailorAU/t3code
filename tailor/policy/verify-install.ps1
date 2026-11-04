@@ -89,6 +89,8 @@ public static bool TryGet(string path, out Info info) {
 }
 
 $results = [System.Collections.Generic.List[object]]::new()
+# Once a verified marker exists (a re-check after install), the tasks must have run cleanly.
+$markerExisted = Test-Path -LiteralPath $MarkerPath
 function Add-Check([string] $name, [bool] $ok, [string] $detail = '') {
   $results.Add([pscustomobject]@{ Check = $name; Result = $(if ($ok) { 'PASS' } else { 'FAIL' }); Detail = $detail })
 }
@@ -340,7 +342,10 @@ foreach ($t in $taskPlan) {
     if (@($sdIssues).Count -gt 0) { throw (@($sdIssues) -join '; ') }
     # Last result: 0, still running, never run yet, or stopped by the installer.
     $last = [int64](Get-ScheduledTaskInfo -TaskName $t.Name -TaskPath '\T3CodePolicy\').LastTaskResult
-    if (@(0, 0x41301, 0x41303, 0x41306) -notcontains $last) { throw "last result 0x$('{0:x}' -f $last)" }
+    $acceptable = @(0, 0x41301, 0x41303, 0x41306)
+    if ($markerExisted -and $t.Name -eq $installed.tasks.Server) { $acceptable = @(0, 0x41301) }
+    if ($markerExisted -and ($t.Name -eq $installed.tasks.Probe -or $t.Name -eq $installed.tasks.PipeProbe)) { $acceptable = @(0) }
+    if ($acceptable -notcontains $last) { throw "last result 0x$('{0:x}' -f $last)" }
     "as $($p.UserId), $($p.LogonType), LeastPrivilege, one action, only admins may change or run it, last result 0x$('{0:x}' -f $last)"
   }
 }
@@ -372,14 +377,21 @@ Invoke-Check 'agent-probe' {
 
 # ---------- the bridge pipe, read as SYSTEM ----------
 Invoke-Check 'bridge-pipe' {
-  $pipeResult = Join-Path $PolicyDir 'probe\pipe.json'
+  $pipeResult = Join-Path $PolicyDir 'state\pipe-probe.json'
   if (Test-Path -LiteralPath $pipeResult) { [IO.File]::Delete($pipeResult) }
   $code = Invoke-TaskAndWait $installed.tasks.PipeProbe
   if ($code -ne 0) { throw "the pipe probe task did not finish successfully (result: $code)" }
-  if ((Get-Acl -LiteralPath $pipeResult).GetOwner([Security.Principal.SecurityIdentifier]).Value -notin 'S-1-5-18', 'S-1-5-32-544') { throw 'the pipe probe result is not SYSTEM''s' }
+  # Written by SYSTEM with CreateNew into the admin-only state folder: owner SYSTEM, a
+  # protected DACL for Administrators and SYSTEM only.
+  [void](Get-Item -LiteralPath $pipeResult -Force)
+  $resultAcl = Get-ActualRules $pipeResult
+  if ($resultAcl.Owner -ne 'S-1-5-18') { throw "the pipe probe result is owned by $($resultAcl.Owner), not SYSTEM" }
+  if (-not $resultAcl.Protected) { throw 'the pipe probe result inherits its ACL' }
+  foreach ($rule in $resultAcl.Rules) { if ($rule.Allow -and @('S-1-5-32-544', 'S-1-5-18') -notcontains $rule.Sid) { throw "$($rule.Sid) has access to the pipe probe result" } }
   $pipe = Get-Content -LiteralPath $pipeResult -Raw | ConvertFrom-Json
   [IO.File]::Delete($pipeResult)
   if (-not $pipe.present) {
+    if ($pipe.PSObject.Properties['busy'] -and $pipe.busy) { throw 'the bridge pipe exists but no instance is listening (ERROR_PIPE_BUSY)' }
     if ($RequirePipe) { throw "the bridge pipe is not up ($($pipe.error))" }
     return 'not up (T3 not started yet); checked again once T3 runs'
   }
@@ -417,12 +429,10 @@ Invoke-Check 'firewall' {
 
 # ---------- machine managed settings ----------
 Invoke-Check 'managed-loosening' {
-  if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Policies\ClaudeCode') { throw 'HKLM\SOFTWARE\Policies\ClaudeCode exists' }
   $path = if ($installed.PSObject.Properties['machineManagedSettings']) { $installed.machineManagedSettings.path } else { 'C:\Program Files\ClaudeCode\managed-settings.json' }
-  if (-not (Test-Path -LiteralPath $path)) { return 'no machine managed tier; no registry policy' }
-  $found = Get-ManagedSettingsLooseners ([IO.File]::ReadAllText($path))
-  if (@($found).Count -gt 0) { throw "the machine managed tier sets $(@($found) -join ', ')" }
-  'no allow/ask rules, default mode, env or hooks in the machine tier; no registry policy'
+  $found = Get-ClaudePolicySourceLooseners -ManagedSettingsPath $path -AgentSid $agentSid
+  if (@($found).Count -gt 0) { throw (@($found) -join '; ') }
+  'the machine file, managed-settings.d drop-ins and the HKLM/HKCU policy keys hold only allowlisted keys'
 }
 
 Invoke-Check 'managed' {
@@ -442,6 +452,7 @@ Invoke-Check 'hashes' {
   $pairs = @(@($installed.t3Exe, $installed.t3ExeSha256), @($installed.claudeExe, $installed.claudeExeSha256))
   if ($installed.PSObject.Properties['bridgeExe']) { $pairs += , @($installed.bridgeExe, $installed.bridgeExeSha256) }
   $pairs += , @($installed.gitExe, $installed.gitExeSha256)
+  if ($installed.PSObject.Properties['nodeExe'] -and $installed.nodeExe) { $pairs += , @($installed.nodeExe, $installed.nodeExeSha256) }
   foreach ($pair in $pairs) {
     Assert-AdminOnlyWrite $pair[0]
     if ((Get-Sha $pair[0]) -ne $pair[1]) { throw "$($pair[0]) differs from the installed hash" }
@@ -458,6 +469,16 @@ Invoke-Check 'git-hooks' {
   if (-not (Test-Path -LiteralPath $global -PathType Leaf) -or (Get-Item -LiteralPath $global -Force).Length -ne 0) { throw "$global is missing or not empty" }
   Assert-AdminOnlyWrite $global
   $gitExe = $installed.gitExe
+  # Git Bash reads profile files from <git>\etc: they must be admin-only too.
+  $gitRoot = Split-Path -Parent (Split-Path -Parent $gitExe)
+  $gitEtc = Join-Path $gitRoot 'etc'
+  if (Test-Path -LiteralPath $gitEtc) {
+    Assert-AdminOnlyWrite $gitEtc
+    foreach ($profileFile in 'profile', 'bash.bashrc', 'inputrc', 'gitconfig') {
+      $candidate = Join-Path $gitEtc $profileFile
+      if (Test-Path -LiteralPath $candidate) { Assert-AdminOnlyWrite $candidate }
+    }
+  }
   $version = (& $gitExe --version)
   if (-not (Test-GitVersionAtLeast -VersionText $version -Minimum $installed.minimumGitVersion)) { throw "$version is older than $($installed.minimumGitVersion)" }
   $repo = Join-Path ([IO.Path]::GetTempPath()) ('t3verify-git-' + [guid]::NewGuid().ToString('N'))

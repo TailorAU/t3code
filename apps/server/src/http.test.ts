@@ -101,6 +101,37 @@ describe("MCP app asset responses", () => {
   );
 });
 
+// Tailor fork: agent HTML is a download unless the browser asks for it as a frame.
+describe("agent HTML responses", () => {
+  it.effect("answer a request without Sec-Fetch-Dest frame with an attachment", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-agent-html-" });
+      const file = path.join(directory, "page.html");
+      yield* fs.writeFileString(file, "<script>fetch('https://example.com')</script>");
+      for (const fetchDest of [undefined, "document", "empty"]) {
+        const response = HttpServerResponse.toWeb(
+          yield* assetFileResponse({
+            path: file,
+            mimeType: "text/html",
+            ...(fetchDest === undefined ? {} : { fetchDest }),
+          }),
+        );
+        expect(response.headers.get("content-disposition")).toMatch(/^attachment/);
+        expect(response.headers.get("content-type")).toBe("application/octet-stream");
+        expect(response.headers.get("cache-control")).toBe("no-store");
+        expect(response.headers.get("vary")).toBe("Sec-Fetch-Dest");
+      }
+      const framed = HttpServerResponse.toWeb(
+        yield* assetFileResponse({ path: file, mimeType: "text/html", fetchDest: "iframe" }),
+      );
+      expect(framed.headers.get("content-disposition")).toBeNull();
+      expect(framed.headers.get("content-security-policy")).toBe(HTML_CONTENT_SECURITY_POLICY);
+    }).pipe(Effect.provide(layerFileResponse)),
+  );
+});
+
 describe("browser API CORS", () => {
   it("accepts protocol negotiation with authenticated browser headers", async () => {
     const layerRoute = Layer.effectDiscard(
@@ -811,12 +842,16 @@ describe("assetResponseHeaders", () => {
         expect(headers["Content-Disposition"], `${path} ${fetchDest}`).toMatch(/^attachment/);
         expect(headers["Content-Type"]).toBe("application/octet-stream");
         expect(headers["Content-Security-Policy"]).toBe("default-src 'none'; sandbox");
+        expect(headers["Cache-Control"]).toBe("no-store");
+        expect(headers.Vary).toBe("Sec-Fetch-Dest");
       }
     }
     for (const fetchDest of ["iframe", "frame", "IFrame"]) {
       expect(assetResponseHeaders("/attachments/page.html", { fetchDest })).toMatchObject({
         "Content-Type": "text/html; charset=utf-8",
         "Content-Security-Policy": HTML_CONTENT_SECURITY_POLICY,
+        "Cache-Control": "no-store",
+        Vary: "Sec-Fetch-Dest",
       });
     }
     expect(assetResponseHeaders("/attachments/a.png")["Content-Disposition"]).toBeUndefined();

@@ -1004,10 +1004,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         : command.type === "thread.metadata.update"
           ? (command.worktreePath ?? null)
           : null;
-    if (worktreePath === null || Option.isNone(tailorServerConfig)) return undefined;
+    if (worktreePath === null) return undefined;
+    // Without a ServerConfig (some test layers) the managed worktree root is unknown: only the
+    // project root is allowed then.
     const rules = TailorMachinePolicy.tailorPathRulesIfInstalled(
       process.platform,
-      tailorServerConfig.value.worktreesDir,
+      Option.isSome(tailorServerConfig) ? tailorServerConfig.value.worktreesDir : "<no managed worktree root>",
     );
     if (rules === undefined) return undefined;
     let projectId: ProjectId | undefined;

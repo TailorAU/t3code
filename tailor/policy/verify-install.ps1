@@ -37,7 +37,9 @@ param(
   # Used by install-policy.ps1, which has already loaded the modules from verified bytes.
   [switch] $AlreadyLoaded,
   # Report only; leave any marker as it is.
-  [switch] $NoMarker
+  [switch] $NoMarker,
+  # Fail when the bridge pipe is not up (the installer runs this once T3 has started).
+  [switch] $RequirePipe
 )
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
@@ -116,8 +118,14 @@ if (-not (Test-Path -LiteralPath $InstalledPath)) {
   Write-Host "FAIL  installed: $InstalledPath not found; run install-policy.ps1 first."
   return $false
 }
-# Standalone, it runs only from the protected copy (the installer passes -AlreadyLoaded).
+# Standalone, it runs only from the protected copy, started with -NoProfile (the installer
+# passes -AlreadyLoaded and has checked both).
 if (-not $AlreadyLoaded) {
+  $hostArgs = @([Environment]::GetCommandLineArgs() | ForEach-Object { $_.ToLowerInvariant() })
+  if (-not ($hostArgs | Where-Object { $_ -in '-noprofile', '-nop', '/noprofile' })) {
+    Write-Host 'FAIL  host: start verify-install.ps1 with pwsh -NoProfile -File.'
+    return $false
+  }
   $here = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { '' }
   if (-not [string]::Equals($here.TrimEnd('\'), $InstallerDir, [StringComparison]::OrdinalIgnoreCase)) {
     Write-Host "FAIL  protected copy: run verify-install.ps1 from $InstallerDir."
@@ -240,7 +248,9 @@ foreach ($root in @($installed.workspaceRoots)) {
     $stack = [System.Collections.Generic.Stack[string]]::new(); $stack.Push($root); $count = 0
     while ($stack.Count -gt 0) {
       $path = $stack.Pop(); $count++
-      foreach ($rule in (Get-ActualRules $path).Rules) {
+      $acl = Get-ActualRules $path
+      if ($allowed -notcontains $acl.Owner) { throw "$path is owned by $($acl.Owner)" }
+      foreach ($rule in $acl.Rules) {
         if ($rule.Allow -and $allowed -notcontains $rule.Sid) { throw "$($rule.Sid) has access to $path" }
       }
       $item = Get-Item -LiteralPath $path -Force
@@ -248,7 +258,7 @@ foreach ($root in @($installed.workspaceRoots)) {
         foreach ($child in Get-ChildItem -LiteralPath $path -Force) { $stack.Push($child.FullName) }
       }
     }
-    "$count entries: Administrators, SYSTEM and the agent account only (links not followed)"
+    "$count entries: owned by and open to Administrators, SYSTEM and the agent account only (links not followed)"
   }
 }
 
@@ -282,7 +292,11 @@ foreach ($account in @(@{ Name = $installed.agentAccount; Sid = $agentSid }, @{ 
 
 Invoke-Check 'rights-diff' {
   if (-not (Test-Path -LiteralPath $PreInstallPath)) { throw 'no pre-install snapshot (state\pre-install.json)' }
-  $before = (Get-Content -LiteralPath $PreInstallPath -Raw | ConvertFrom-Json).rights
+  $snapshot = Get-Content -LiteralPath $PreInstallPath -Raw | ConvertFrom-Json
+  if ($snapshot.PSObject.Properties['baselineKnown'] -and -not $snapshot.baselineKnown) {
+    return 'unknown baseline (snapshot taken at an upgrade): only our four rights are checked, under account:*'
+  }
+  $before = $snapshot.rights
   $issues = Compare-UserRightsSnapshot -BeforeText $before -AfterText $rightsText -AllowedSids @($agentSid, $bridgeSid)
   if (@($issues).Count -gt 0) { throw (@($issues) -join '; ') }
   'since before the install, only the four service-account rights changed, for the two accounts'
@@ -344,9 +358,12 @@ Invoke-Check 'agent-probe' {
     'create-in-connector' = 'denied'; 'create-in-installer' = 'denied'
   }
   if (Test-Path -LiteralPath $TokenPath) { $expected['read-token'] = 'denied' }
-  $issues = Test-AgentProbeResult -Result $result -Expected $expected -AgentSid $agentSid
+  if (Test-Path -LiteralPath (Join-Path $PolicyDir 'bridge\tailor-api-key')) { $expected['read-bridge-key'] = 'denied' }
+  foreach ($name in 'write-t3-launcher', 'write-issuer', 'write-pipe-shim') { $expected[$name] = 'denied' }
+  $issues = Test-AgentProbeResult -Result $result -Expected $expected -AgentSid $agentSid -BridgeSid $bridgeSid -RequirePipe:$RequirePipe
   if (@($issues).Count -gt 0) { throw (@($issues) -join '; ') }
-  "as the agent: privileges $(@($result.privileges) -join ', '); no privileged group; $($expected.Count) access tests as expected"
+  $pipeNote = if ($result.pipe.present) { 'bridge pipe owned by the agent, DACL as planned, no second first instance' } else { 'bridge pipe not up (T3 not started yet)' }
+  "$pipeNote; as the agent: privileges $(@($result.privileges) -join ', '); no privileged group; $($expected.Count) access tests as expected"
 }
 
 # ---------- firewall ----------
@@ -384,7 +401,7 @@ Invoke-Check 'managed' {
 }
 
 # ---------- hashes ----------
-$serviceFiles = @('start-t3.ps1', 'issue-token.ps1', 'move-token.ps1', 'rotate-keys.ps1', 'probe-agent.ps1', 't3-settings.seed.json') | ForEach-Object { Join-Path $service $_ }
+$serviceFiles = @('start-t3.ps1', 'bridge-pipe.ps1', 'issue-token.ps1', 'move-token.ps1', 'rotate-keys.ps1', 'probe-agent.ps1', 't3-settings.seed.json') | ForEach-Object { Join-Path $service $_ }
 if ($installed.PSObject.Properties['bridgeExe']) { $serviceFiles += Join-Path $service 'start-bridge.ps1' }
 Invoke-Check 'hashes' {
   $pairs = @(@($installed.t3Exe, $installed.t3ExeSha256), @($installed.claudeExe, $installed.claudeExeSha256))
@@ -512,6 +529,8 @@ Manual first-run checks (a person does these; they cannot be scripted from here)
        Get-Content "$TokenPath"      -> must fail: access denied
        Get-ChildItem "$PolicyDir"    -> must fail: access denied
   2. runas /user:$($installed.agentAccount) cmd   -> must fail: logon type not granted
+     As the interactive user, with T3 running:
+       [IO.Pipes.NamedPipeClientStream]::new('.', 't3code-bridge').Connect(2000)  -> must fail: access denied
   3. In T3, pick Full access or Auto-accept edits: the thread still asks before every edit
      and command (the build ceiling is Supervised).
   4. Deny variants, with the machine managed-settings file present. In a T3 thread, send each

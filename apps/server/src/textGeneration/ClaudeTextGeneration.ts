@@ -39,17 +39,18 @@ import {
 const CLAUDE_TIMEOUT_MS = 180_000;
 /**
  * Tailor fork: the review-guide investigation runs in dontAsk mode, where every allowed call
- * runs without a prompt, so it gets read-only tools only: no Bash (upstream allowed
- * `git diff/log/show`, which bypassed Supervised), Read scoped to the repository, and the
- * compiled deny rules on top. Grep and Glob follow the Read rules.
+ * runs without a prompt, so it gets one read-only tool: Read, scoped to the repository
+ * (`Read(./**)`), with the compiled deny rules on top. No Bash (upstream allowed
+ * `git diff/log/show`, which bypassed Supervised), and no Grep or Glob, whose path scoping
+ * cannot be proven here.
  */
 export const TAILOR_CLAUDE_INVESTIGATION_ARGS = [
   "--tools",
-  "Read,Grep,Glob",
+  "Read",
   "--allowedTools",
-  "Read(./**),Grep,Glob",
+  "Read(./**)",
   "--disallowedTools",
-  "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch",
+  "Bash,Grep,Glob,Edit,Write,NotebookEdit,WebFetch,WebSearch",
 ] as const;
 
 /** The `claude -p` tool arguments: none, or the read-only investigation set. */

@@ -43,6 +43,8 @@ export interface TailorInstalledPolicy {
   readonly instanceEnvironmentAllowlist: ReadonlyArray<string>;
   /** Project roots the installer created for t3agent; projects must be inside one. */
   readonly workspaceRoots: ReadonlyArray<string>;
+  /** The git.exe every T3 git call runs (absolute); undefined when the policy has none. */
+  readonly gitExe: string | undefined;
 }
 
 export type TailorPolicyState =
@@ -60,6 +62,7 @@ export function parseTailorInstalledPolicy(raw: string): TailorInstalledPolicy |
         readonly claudeExeSha256?: unknown;
         readonly instanceEnvironmentAllowlist?: unknown;
         readonly workspaceRoots?: unknown;
+        readonly gitExe?: unknown;
       };
     };
     const installed = parsed.installed;
@@ -93,6 +96,10 @@ export function parseTailorInstalledPolicy(raw: string): TailorInstalledPolicy |
             (root): root is string => typeof root === "string" && root.length > 0,
           )
         : [],
+      gitExe:
+        typeof installed.gitExe === "string" && NodePath.win32.isAbsolute(installed.gitExe)
+          ? installed.gitExe
+          : undefined,
     };
   } catch {
     return null;
@@ -106,6 +113,14 @@ let cachedProgramData: string | null | undefined;
  * fixed system path. Environment variables (ProgramData, SystemRoot) are not used: a user
  * can change those for their own processes. Undefined when it cannot be read.
  */
+/**
+ * Test seam: tests point the known folder at a temp folder holding a test policy. Production
+ * code never calls it; the value only ever comes from the registry otherwise.
+ */
+export function setProgramDataFolderForTests(folder: string | undefined): void {
+  cachedProgramData = folder === undefined ? undefined : folder;
+}
+
 export function windowsProgramDataFolder(): string | undefined {
   if (cachedProgramData !== undefined) return cachedProgramData ?? undefined;
   try {

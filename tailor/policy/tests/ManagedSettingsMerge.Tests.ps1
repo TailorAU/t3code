@@ -122,6 +122,8 @@ Assert-True (@(Get-ManagedSettingsLooseners $null).Count -eq 0) 'no file: nothin
 Assert-True (@(Get-ManagedSettingsLooseners '{ "permissions": { "deny": ["Bash"] }, "model": "x" }').Count -eq 0) 'deny rules and other keys are fine'
 $loose = @(Get-ManagedSettingsLooseners '{ "permissions": { "allow": ["Bash"], "ask": ["Edit"], "defaultMode": "acceptEdits" }, "env": { "A": "1" }, "defaultMode": "x", "hooks": {} }')
 foreach ($k in 'permissions.allow', 'permissions.ask', 'permissions.defaultMode', 'env', 'defaultMode', 'hooks') { Assert-True ($loose -contains $k) "$k is reported" }
+$helpers = @(Get-ManagedSettingsLooseners '{ "otelHeadersHelper": "x", "awsAuthRefresh": "x", "awsCredentialExport": "x", "gcpAuthRefresh": "x", "enableAllProjectMcpServers": true, "enabledMcpjsonServers": ["a"] }')
+Assert-True ($helpers.Count -eq 6) 'credential helpers and project MCP server switches are reported'
 
 if ($failures.Count -gt 0) {
   $failures | ForEach-Object { Write-Host "FAIL: $_" }

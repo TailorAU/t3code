@@ -79,7 +79,8 @@ function baseThread(input: {
       instanceId: input.instanceId,
       model: input.model,
     },
-    runtimeMode: "full-access" as const,
+    // Tailor fork: under the Supervised build ceiling no stored thread is above approval-required.
+    runtimeMode: "approval-required" as const,
     interactionMode: "default" as const,
     branch: null,
     worktreePath: null,

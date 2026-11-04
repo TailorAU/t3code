@@ -84,7 +84,9 @@ it.effect("refuses a preferences update when the caller's turn ends while it wai
       yield* Deferred.succeed(release, undefined);
       yield* Fiber.join(holder);
       const result = yield* Fiber.join(update);
-      expect(result.at(-1)?.result).toMatchObject({ code: "parent_not_active" });
+      // Tailor fork: environment preferences need a full-access/default caller, and the build
+      // ceiling caps the calling thread at Supervised, so it is refused before the race.
+      expect(result.at(-1)?.result).toMatchObject({ code: "capability_denied" });
       expect(yield* Ref.get(updates)).toBe(0);
     }).pipe(
       Effect.provide(

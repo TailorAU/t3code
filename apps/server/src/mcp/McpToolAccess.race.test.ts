@@ -169,16 +169,19 @@ const createSupervisedThread = (threadId: ThreadId) =>
   });
 
 it.layer(layerOrchestrator)("writesThreads against a mode raise", (it) => {
-  it.effect("refuses the write when the user raises the thread after the check", () =>
+  // Tailor fork: the build ceiling is Supervised, so the user's raise to Full access is capped
+  // at approval-required; the thread never goes above the supervised caller, and the write
+  // goes through at the caller's own mode.
+  it.effect("caps the user's raise at Supervised, so the write stays within the caller's mode", () =>
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;
       const threadId = ThreadId.make("thread:race-raised");
       yield* createSupervisedThread(threadId);
       const outcome = yield* renameRacingTheUser(threadId, true);
-      assert.deepEqual(outcome, { code: "runtime_mode_escalation_denied" });
+      assert.deepEqual(outcome, { renamed: true });
       const shell = yield* projections.getThreadShell(threadId);
-      assert.equal(shell?.runtimeMode, "full-access");
-      assert.equal(shell?.title, "Before");
+      assert.equal(shell?.runtimeMode, "approval-required");
+      assert.equal(shell?.title, "Renamed by the agent");
     }).pipe(
       Effect.provide(
         ThreadManagement.layer.pipe(

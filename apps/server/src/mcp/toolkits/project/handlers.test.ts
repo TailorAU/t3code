@@ -37,6 +37,7 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import * as ProjectHandlers from "./handlers.ts";
 import { ProjectToolkit } from "./tools.ts";
+import * as TailorMachinePolicy from "../../../tailor/machinePolicy.ts";
 
 const clientLaunchHarness = (input: {
   readonly runtimeModeCeiling: RuntimeMode;
@@ -208,7 +209,8 @@ it.effect(
         title: "Fix",
         webOrigin: "https://box.example.ts.net",
       });
-      expect(aboveCeiling.launched[0]?.runtimeMode).toBe("auto-accept-edits");
+      // Tailor fork: every launch is capped at the Supervised build ceiling.
+      expect(aboveCeiling.launched[0]?.runtimeMode).toBe("approval-required");
       expect(aboveCeiling.result).toMatchObject({
         link: `https://box.example.ts.net/environment/${encodeURIComponent(aboveCeiling.launched[0]?.threadId ?? "")}`,
       });
@@ -217,7 +219,9 @@ it.effect(
         title: "Fix",
         runtimeMode: "auto",
       });
-      expect(requested.launched[0]?.runtimeMode).toBe("auto");
+      // Tailor fork: asking for auto is above the (Supervised-capped) ceiling.
+      expect(requested.result).toMatchObject({ code: "runtime_mode_escalation_denied" });
+      expect(requested.launched).toHaveLength(0);
 
       const escalated = yield* launchWith("auto-accept-edits", "auto-accept-edits", {
         title: "Fix",
@@ -288,11 +292,13 @@ it.effect("a launch steps an inherited mode down to the provider's, and refuses 
       return { result: result.at(-1)?.result, launched };
     });
 
+    // Tailor fork: the inherited auto ceiling is capped at Supervised before any step-down.
     const inherited = yield* launchPi();
-    expect(inherited.launched[0]?.runtimeMode).toBe("auto-accept-edits");
+    expect(inherited.launched[0]?.runtimeMode).toBe("approval-required");
 
+    // Tailor fork: auto is above the Supervised-capped ceiling, refused before the provider check.
     const requested = yield* launchPi("auto");
-    expect(requested.result).toMatchObject({ code: "invalid_request" });
+    expect(requested.result).toMatchObject({ code: "runtime_mode_escalation_denied" });
     expect(requested.launched).toHaveLength(0);
 
     const offered = yield* launchPi("approval-required");
@@ -453,6 +459,73 @@ it.effect("a launch binds only an existing checkout that is one of the project's
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
+// Tailor fork: with the machine policy installed, a git worktree outside the project (and
+// outside T3's worktree folder) is refused even though git lists it.
+it.effect.skipIf(process.platform !== "win32")(
+  "with the policy installed, a launch refuses a listed worktree outside the project",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-launch-policy-" });
+      const repo = path.join(root, "workspaces", "repo");
+      const worktree = path.join(root, "feature");
+      const programData = path.join(root, "ProgramData");
+      yield* fileSystem.makeDirectory(repo, { recursive: true });
+      yield* fileSystem.makeDirectory(path.join(programData, "T3CodePolicy"), { recursive: true });
+      yield* fileSystem.writeFileString(
+        path.join(programData, "T3CodePolicy", "t3-policy.json"),
+        JSON.stringify({
+          installed: {
+            claudeConfigDir: path.join(programData, "T3CodePolicy", "claude-home"),
+            claudeExe: "C:\\Program Files\\T3Code\\claude\\claude.exe",
+            workspaceRoots: [path.join(root, "workspaces")],
+          },
+        }),
+      );
+      yield* Effect.acquireRelease(
+        Effect.sync(() => TailorMachinePolicy.setProgramDataFolderForTests(programData)),
+        () => Effect.sync(() => TailorMachinePolicy.setProgramDataFolderForTests(undefined)),
+      );
+
+      const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
+      const { projectId, dependencies } = clientLaunchHarness({
+        runtimeModeCeiling: "approval-required",
+        launched,
+        workspaceRoot: repo,
+      });
+      const git = yield* GitVcsDriver.GitVcsDriver.pipe(Effect.provide(dependencies));
+      for (const args of [
+        ["init", "-b", "main"],
+        ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init"],
+        ["worktree", "add", "-b", "feature", worktree],
+      ]) {
+        yield* git.execute({ operation: "test.setupRepo", cwd: repo, args });
+      }
+      const toolkit = yield* ProjectToolkit.pipe(
+        Effect.provide(
+          McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(dependencies)),
+        ),
+      );
+      const launchInto = (worktreePath: string) =>
+        toolkit
+          .handle("t3_thread_launch", {
+            title: "Fix",
+            projectId,
+            workspaceStrategy: { type: "existing_worktree", worktreePath },
+          })
+          .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
+
+      const outside = (yield* launchInto(worktree)).at(-1)?.result;
+      expect(outside).toMatchObject({ code: "invalid_request" });
+      expect(JSON.stringify(outside)).toContain("worktree must be inside");
+      expect((yield* launchInto(repo)).at(-1)?.result).toMatchObject({ projectId });
+      expect(launched.map((launch) => launch.workspaceStrategy)).toEqual([
+        { type: "existing_worktree", worktreePath: repo },
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.effect("a launch into a new worktree creates nothing when its base ref has no commit", () =>
   Effect.gen(function* () {
     const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
@@ -589,7 +662,7 @@ it.effect("a client launches with the fallback for an exhausted default", () =>
   }),
 );
 
-it.effect("deleting a project through MCP also discards its clone record", () =>
+it.effect("deleting a project through MCP is refused under the Supervised ceiling", () =>
   Effect.gen(function* () {
     const discarded: Array<ProjectId> = [];
     const harness = clientLaunchHarness({ runtimeModeCeiling: "full-access", launched: [] });
@@ -625,10 +698,13 @@ it.effect("deleting a project through MCP also discards its clone record", () =>
       ),
     );
 
-    yield* toolkit
+    const result = yield* toolkit
       .handle("t3_project_delete", { projectId: harness.projectId })
       .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
 
-    expect(discarded).toEqual([harness.projectId]);
+    // Tailor fork: deleting a project needs a full-access caller; the build ceiling caps the
+    // client at Supervised, so nothing is deleted or discarded.
+    expect(result.at(-1)?.result).toMatchObject({ code: "capability_denied" });
+    expect(discarded).toEqual([]);
   }),
 );

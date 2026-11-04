@@ -73,7 +73,7 @@ jobs:
           CI: "1"
         run: ../../node_modules/.bin/vp test run --config ../../vite.config.ts --dir .
 
-      - name: Connector scopes, mode clamp, Claude lock, git hardening, paths, CSP, MCP access, registry, telemetry
+      - name: Connector scopes, mode clamp, Claude lock, git hardening, paths, CSP, MCP, registry, telemetry
         shell: bash
         working-directory: apps/server
         env:
@@ -91,6 +91,7 @@ jobs:
           src/provider/ProviderInstanceRegistryHydration.test.ts
           src/provider/ProviderRegistry.test.ts
           src/http.test.ts
+          src/mcp
 
       - name: Machine managed-settings merge fixtures
         shell: pwsh

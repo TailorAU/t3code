@@ -383,7 +383,7 @@ it.layer(Layer.provideMerge(layerTools, layerOrchestration))("work a link starts
     }),
   );
 
-  it.effect("is not fenced when the link has full access, but still says where it came from", () =>
+  it.effect("is not fenced when the link has full access (still capped at Supervised), and says where it came from", () =>
     Effect.gen(function* () {
       const projections = yield* ProjectionStore.ProjectionStoreV2;
       const users = yield* usersOwnThread;
@@ -400,12 +400,15 @@ it.layer(Layer.provideMerge(layerTools, layerOrchestration))("work a link starts
         title: "Renamed from the desk",
       });
       assert.equal(renamed.isError, false, JSON.stringify(renamed.content));
+      // Tailor fork: project changes need a full-access caller, and the build ceiling caps
+      // every caller at Supervised, so even a full-access link is refused here.
       for (const [name, args] of [
         ["t3_project_update", { projectId, title: "The desk's now" }],
         ["t3_project_create", { title: "t3code", workspaceRoot: "/p/t3code" }],
       ] as const) {
         const changed = yield* call(trusted, name, args);
-        assert.equal(changed.isError, false, `${name}: ${JSON.stringify(changed.content)}`);
+        assert.equal(changed.isError, true, `${name}: ${JSON.stringify(changed.content)}`);
+        assert.include(JSON.stringify(changed.content), "capability_denied");
       }
     }),
   );

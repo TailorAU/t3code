@@ -84,9 +84,11 @@ pwsh -NoProfile -File "$dest\install-policy.ps1" -WhatIf `
   -T3Exe 'C:\Program Files\T3Code\t3.exe' -ClaudeExe 'C:\Program Files\T3Code\claude\claude.exe'
 ```
 
-Always start the scripts with `pwsh -NoProfile -File`: no profile runs elevated. The scripts
-also pin `PSModulePath` to PowerShell's own folder and System32 and import the Windows modules
-they use by full path, so nothing on a user-writable module path can shadow a cmdlet.
+Always start the scripts with `pwsh -NoProfile -File`: no profile runs elevated, and both
+scripts refuse to run otherwise. They also pin `PSModulePath` to PowerShell's own folder and
+System32, import the Windows modules they use by full path, and refuse if a command they rely
+on is not the real one from its module (a function or alias standing in). Every generated
+script pins `PSModulePath` as its first statement.
 
 The script reads each file once, checks its hash, and loads the modules, the template and the
 self-check from those bytes (`New-Module -ScriptBlock`), never by reading the paths again. A
@@ -118,7 +120,6 @@ handle, never by path. No folder grants anything to the interactive user, `Users
 | `service\` | admins; both accounts read | Launchers, the T3 settings seed, the token issuer and mover, and `verified.json` (the marker). |
 | `git-hooks\` | admins; `t3agent` read | Empty. `core.hooksPath` for every git command T3 runs. |
 | `git-config\` | admins; `t3agent` read | `gitconfig`, empty: `GIT_CONFIG_GLOBAL` for every git command T3 runs. |
-| `run\` | admins; `t3agent` modify; `t3bridge` read | `t3-server.json`: the PID of the `t3 serve` the launcher started (bridge contract). |
 | `probe\` | admins; `t3agent` create only | The self-check probe's result, read and deleted by the self-check. |
 | `t3-home\` | admins; `t3agent` modify | T3's base dir. On first start the launcher (as `t3agent`) copies the seed into `userdata\settings.json`. No admin code runs here. |
 | `claude-home\` | admins; `t3agent` see below | Claude home. `t3agent` may read it, create subfolders, modify `.claude.json` and work inside subfolders, but cannot create or replace files at the root. |
@@ -138,12 +139,12 @@ handle, never by path. No folder grants anything to the interactive user, `Users
 | `-AgentAccount` | no | `t3agent` | Local account created to run `t3 serve`, its Claude and the token issuer |
 | `-BridgeAccount` | no | `t3bridge` | Local account created to run the bridge and read the connector token |
 | `-BridgeExe` | no | none | The bridge executable; registers its task (admin-only folder, hash recorded) |
-| `-BridgeChecksServer` | with `-BridgeExe` | | Confirms the bridge build checks the T3 listener before every connection (bridge contract) |
 | `-GitExe` | no | `git` on PATH | The git the self-check uses (admin-only folder, at least 2.50.1, hash recorded) |
 | `-TailorApiHosts` | with `-BridgeExe` | none | tailor.au API host names the bridge may reach (for example api.example.com) |
 | `-WorkspaceRoots` | no | none | More project roots besides `workspaces\`; each gets an admins + `t3agent` ACL, and its parent must be admin-only |
 | `-ConnectorTokenDays` | no | `7` | Lifetime of each connector token (2 to 30); a new one is issued daily |
-| `-RotateConnectorToken` | no | | Issue a new connector token now |
+| `-RotateConnectorToken` | no | | Revoke every connector session, issue a new token, wait for the result (non-zero exit on failure) |
+| `-AdoptExistingAccounts` | no | | Upgrades only: adopt existing `t3agent`/`t3bridge` accounts that an older install created, if their description is exactly this installer's and their only group is `Users` |
 | `-T3Port` | no | `3773` | Loopback port of `t3 serve` |
 | `-AllowedHosts` | no | template `egress.allowedHosts` | Model endpoints the Claude binary may reach |
 | `-ExtraAllowedAddresses` | no | none | Provider-published IP ranges (CIDR) to allow in addition to DNS results |
@@ -159,12 +160,17 @@ handle, never by path. No folder grants anything to the interactive user, `Users
 No administrator code runs inside the T3 home. The token is issued and rotated with no admin
 step:
 
+All tasks are registered with an explicit security descriptor: Administrators and SYSTEM
+only; nobody else, the run-as account included, can read, run, change or stop them.
+
 1. `\T3CodePolicy\T3 token issuer` runs as `t3agent` daily (and once after install). It claims
    `connector-drop\token` (create only), issues a `tailor:connector` token with T3's own CLI
    against the T3 home (retrying once), writes it there, and revokes every connector session
    but the new one and the one before it, which the bridge still holds until the mover runs.
    `-RotateConnectorToken` runs the same script through `T3 token rotate now` with
-   `-RevokeAllPrevious`: every previous connector session is revoked at once. The token is
+   `-RevokeAllPrevious`: every previous connector session is revoked first, then a new token is
+   issued; if an unmoved token blocks the drop folder it fails loudly, and the installer waits
+   for the result and exits non-zero on a failure. The token is
    never printed.
 2. `\T3CodePolicy\T3 token mover` runs as SYSTEM every ten minutes, from fixed code in
    `service\`. It deletes anything else in the drop folder, then takes the drop file only if
@@ -203,8 +209,21 @@ without `-ExpectedSha256` it checks the files against the hashes recorded at ins
 
 Nothing starts until you run the install again (from the protected copy, with
 `-ExpectedSha256`). That re-enables the tasks, verifies (the self-check fails unless T3's
-signing key was written after the last revoke), and only then starts T3 and issues a fresh
-connector token. Uninstall also rotates the keys first and then deletes the T3 home with them.
+signing key was written after the last revoke's start time, which is recorded before the keys
+rotate), and only then starts T3 and issues a fresh connector token. Uninstall also rotates
+the keys first and then deletes the T3 home with them.
+
+**What revoke covers.** It invalidates leaked T3 credentials: every bearer token, browser
+session, websocket ticket, MCP token, share link and pairing link, and stops everything
+until a verified reinstall. It does **not** recover a compromised `t3agent` (the agent
+account, or anything that ran as it, could have changed the T3 home or the workspaces): for
+that, `-Uninstall`, wipe the workspaces you do not trust, and install fresh. It does not
+rotate credentials held outside T3; rotate these by hand:
+
+- the bridge's tailor.au key (`bridge\tailor-api-key`), at tailor.au;
+- the model credential on the Claude provider instance (API key, or the Bedrock credential),
+  at the provider;
+- any repository credential you gave `t3agent`.
 
 ## Getting code in and out
 
@@ -290,6 +309,9 @@ denies interactive, Remote Desktop and network logon. An existing account in any
 Management Users and so on) makes the installer refuse. Groups are read by SID through ADSI;
 any error reading them fails closed. The installer creates the accounts itself and records
 their SIDs before anything else; it refuses an account of the same name it did not create.
+An install from before this ownership record can adopt its accounts once with
+`-AdoptExistingAccounts`, only if each has exactly this installer's description and no group
+but `Users`.
 
 Both accounts stay in `BUILTIN\Users`: `Program Files` and `System32` grant read and execute
 through `Users`, so without it the accounts could not start PowerShell, `t3` or Claude. Nothing
@@ -302,23 +324,39 @@ under `T3CodePolicy` grants `Users` anything.
 
 ## Bridge contract: the bridge authenticates the server
 
-The bridge must not send the token to whatever listens on the T3 port: while T3 is stopped,
-any account (the operator's lanes included) can bind `127.0.0.1:3773`. So:
+The bridge reaches T3 only through the named pipe `\\.\pipe\t3code-bridge`, never loopback
+TCP: while T3 is stopped any account can bind the T3 port, and a PID check before connecting
+leaves a gap. The T3 launcher (as `t3agent`) starts the pipe shim `service\bridge-pipe.ps1`
+next to `t3 serve`:
 
-- the T3 launcher (as `t3agent`) starts `t3 serve` and writes its PID to `run\t3-server.json`
-  (`run\`: `t3agent` modify, `t3bridge` read, nobody else);
-- before every connection, the bridge reads that file, checks it is a plain file owned by
-  `t3agent` (`T3_BRIDGE_SERVER_OWNER_SID`), and checks that the only listener on the T3 port
-  is that PID (`GetExtendedTcpTable` / `Get-NetTCPConnection`), and sends the token only then.
-  A non-admin account cannot read another account's process image or owner, so the published
-  PID is what ties the listener to `t3agent`;
-- the bridge launcher runs the same check before it starts the bridge (`Test-T3ServerListener`),
-  and passes `T3_BRIDGE_SERVER_PID_FILE` and `T3_BRIDGE_SERVER_OWNER_SID` to it.
+- the first instance is created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so it fails if anyone
+  already holds the name; the shim then refuses to run and the launcher logs
+  `BRIDGE PIPE REFUSED` loudly;
+- its security descriptor: owner `t3agent`; protected DACL with `t3bridge` read/write, SYSTEM
+  read/write, `t3agent` (the owner) create-instance only; nobody else, not `Users`, not the
+  interactive user, not Administrators. The first instance's descriptor is the pipe's: a later
+  instance cannot change the owner or the DACL (checked by the self-check probe);
+- `PIPE_REJECT_REMOTE_CLIENTS`;
+- the next instance is listening before a connected one is handed off, so the name is never
+  free while T3 runs;
+- each connection is relayed to T3's loopback listener only after the shim checks, on that
+  very connection, that the accepting process is the `t3 serve` the launcher started
+  (`t3agent` can see its own processes).
 
-`-BridgeExe` is refused unless `-BridgeChecksServer` is also given: the operator confirms that
-the bridge build implements the per-connection check above. A named pipe with an ACL
-(`t3agent` server, `t3bridge` client) would be stronger and is the planned follow-up; it needs
-a pipe listener in T3's server.
+The connector token is still required over the pipe: the pipe is defence in depth, not
+authentication by itself. The bridge (tailor-app builds it) must, for every connection:
+
+1. open the pipe with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` (the server may
+   identify the bridge, never act as it);
+2. read the pipe's owner through its own handle (`GetSecurityInfo`, `READ_CONTROL`) and require
+   it to be `t3agent`'s SID, from `T3_BRIDGE_SERVER_OWNER_SID` (taken from the admin-written
+   policy); require `GetNamedPipeServerSessionId` to be 0 (the service session);
+3. only then send anything; otherwise close the handle without sending a byte;
+4. never fall back to TCP. The bridge launcher gives it no TCP address, and the firewall allows
+   it only the tailor.au API hosts.
+
+`Connect-T3BridgePipe` in `ServiceAccounts.psm1` is the reference client (tested). The bridge
+task starts only after the installer has seen the pipe up with the planned owner and DACL.
 
 ## Design choice: who can hold the T3 token
 
@@ -327,8 +365,9 @@ a pipe listener in T3's server.
 - **Decision.** A dedicated `t3bridge` account holds the `tailor:connector` token
   (`connector\token`: Administrators, SYSTEM and `t3bridge` read; not the operator, not Users,
   not `t3agent`). The T3 bridge (the connector's T3 source, coming later in tailor-app) runs as
-  `t3bridge`, opens no local listener, and only dials out: loopback to T3 and HTTPS to the
-  tailor.au API hosts passed as `-TailorApiHosts`. Its tailor.au key sits in `bridge\`, also
+  `t3bridge`, opens no local listener, reaches T3 only through the bridge pipe (bridge
+  contract), and dials out only over HTTPS to the tailor.au API hosts passed as
+  `-TailorApiHosts`. Its tailor.au key sits in `bridge\`, also
   `t3bridge`-only.
 - **What it relies on.** tailor.au accepts steering commands only from the operator's
   interactive sign-in (plan stage 2), never from an agent key. Until stage 2 ships, the bridge
@@ -361,9 +400,8 @@ admins only.
   through COM, the handle-based ACL reset, the token issuer and mover, the firewall rules, the
   self-check and the marker) has only been parse-checked and unit-tested. The first elevated
   run on a real machine is the test.
-- **The bridge's own server check.** The launcher checks the T3 listener before starting the
-  bridge; the per-connection check is the bridge's (tailor-app), and a named pipe with an ACL
-  is the stronger follow-up.
+- **The bridge's own pipe check.** T3's side of the pipe, the reference client and the
+  self-check are here; the bridge (tailor-app) must implement the client contract.
 - **The agent and its own shell share `t3agent`.** Claude and the commands it runs are the
   same account as `t3 serve`, so ACLs cannot separate them. Hence the Supervised ceiling
   (SECURITY-REVIEW.md, T3-42).

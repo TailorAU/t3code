@@ -81,8 +81,15 @@ Severity: Critical, High, Medium, Low, Info. Status: Fixed (in this PR), Mitigat
 | T3-63 | Mover read the size from the path; drop folder not swept; no issue retry | Low | Fixed |
 | T3-64 | Profiles and user module paths in elevated runs | Low | Fixed (`pwsh -NoProfile`, pinned `PSModulePath`) |
 | T3-65 | Uninstall and account ownership gaps; the password's managed copy | Low | Fixed (UNVERIFIED elevated) |
-| T3-66 | The bridge could send the token to an impostor listener | High | Fixed in the launcher and gated (`-BridgeChecksServer`); the bridge's own per-connection check is in the bridge repo (Open) |
+| T3-66 | The bridge could send the token to an impostor listener | High | Fixed (named pipe owned by t3agent; T3 side and reference client); the bridge's own client is Open |
 | T3-67 | Self-check missed first-run checks | Medium | Fixed (automated where possible, the rest printed as exact steps) |
+| T3-68 | A revoke could never be verified (key compared with the revoke's end) | High | Fixed (start time) |
+| T3-69 | `-RotateConnectorToken` could succeed without revoking anything | High | Fixed |
+| T3-70 | Bare command names resolved in the working directory (planted `git.exe`) | High | Fixed |
+| T3-71 | A worktree's `.git` file could point git anywhere | High | Fixed |
+| T3-72 | Revoke left pairing links; one kill pass; scope not stated | Medium | Fixed |
+| T3-73 | Delta review: investigation tools, git knobs, managed-tier helpers, HTML caching, tasks' own accounts, workspace owners, upgrade baselines, host checks, account adoption | Medium | Fixed (UNVERIFIED elevated where noted) |
+| T3-74 | Upstream MCP tests outside the gate failed under the Supervised ceiling | Low | Fixed (rewritten; `src/mcp` in the gate) |
 
 ## Findings
 
@@ -856,16 +863,38 @@ uninstall prints the diff against it. The managed string copy of each password i
 overwritten in place after registration, as the BSTR is zeroed. Tests: the snapshot and
 rights comparisons in `ServiceAccounts.Tests.ps1`.
 
-### T3-66 Bridge authenticates the server (High; launcher Fixed, bridge Open)
+### T3-66 Bridge authenticates the server (High; T3 side Fixed, bridge client Open)
 
-While T3 is down any account can bind the T3 port and receive the token. The T3 launcher
-(as `t3agent`) now publishes the server PID in `run\t3-server.json` (`t3agent` modify,
-`t3bridge` read, nobody else), and the bridge launcher starts the bridge only when that file
-is owned by `t3agent` and the only listener on the T3 port is that PID. The bridge must repeat
-the check before every connection (README, "Bridge contract"); `-BridgeExe` is refused
-without `-BridgeChecksServer`. Open: the bridge's own check (tailor-app) and, stronger, a
-named pipe with an ACL, which needs a pipe listener in T3's server. Residual: PID reuse
-between the check and the connection.
+While T3 is down any account can bind the T3 port, and a PID check before connecting leaves a
+check-then-connect gap. The bridge now reaches T3 only over the named pipe
+`\\.\pipe\t3code-bridge`, created by a shim the T3 launcher runs as `t3agent`
+(`service\bridge-pipe.ps1`): `FILE_FLAG_FIRST_PIPE_INSTANCE` (creation fails if the name is
+taken, and the shim refuses loudly), owner `t3agent`, a protected DACL with `t3bridge`
+read/write, SYSTEM read/write and `t3agent` create-instance only, `PIPE_REJECT_REMOTE_CLIENTS`,
+and a listening instance at all times. The shim relays each connection to T3's loopback port
+only after checking, on that established connection, that the accepting process is the
+`t3 serve` the launcher started. The bridge client opens with `SECURITY_SQOS_PRESENT |
+SECURITY_IDENTIFICATION`, checks the owner SID through its own handle and
+`GetNamedPipeServerSessionId == 0`, sends nothing otherwise, and never falls back to TCP
+(`Connect-T3BridgePipe` is the reference). The firewall gives the bridge the tailor.au API
+hosts only. The token is still required over the pipe.
+
+Why a PowerShell/.NET shim: Node cannot set a pipe's DACL or `FILE_FLAG_FIRST_PIPE_INSTANCE`
+on its own listener, and adding a native module to T3 would be a new build-time dependency.
+The shim calls `CreateNamedPipeW` directly (small P/Invoke, every flag explicit) and runs as
+`t3agent`, so the pipe's owner is T3's own account; it is installed, hashed and covered by the
+verified marker like the launchers.
+
+Possible extra check (not a replacement): the reviewer notes that `t3bridge` may be able to
+see other processes' user SIDs through `WTSEnumerateProcessesEx`; the bridge could also check
+that `GetNamedPipeServerProcessId` belongs to `t3agent` that way. The owner SID check is the
+real one.
+
+Tests: the descriptor builder and its judgement, the client refusing a pipe owned by another
+SID and a server outside session 0, `FILE_FLAG_FIRST_PIPE_INSTANCE` failing for a second first
+instance, the shim's instance ordering (`ServiceAccounts.Tests.ps1`). The self-check probe (as
+`t3agent`) reads the live pipe's descriptor, tries a second first instance and an instance
+claiming another owner. Open: the bridge's own client (tailor-app).
 
 ### T3-67 First-run checks (Medium, Fixed; UNVERIFIED elevated)
 
@@ -876,31 +905,100 @@ an elevated administrator can read the token. Deny variants, fail-closed tests, 
 Bash approvals, and egress are printed as exact manual steps. Built-in read-only Bash
 auto-approval in default mode is to be recorded by that manual step.
 
+### T3-68 Revoke recovery (High, Fixed)
+
+The self-check compared the signing key's write time with the revoke log's time, written
+after the rotation, so a reinstall after a good revoke could never pass. The revoke now
+records its start time before the keys rotate (`RecordRevokeStart`) and the check compares
+with that start. Test: the whole revoke, reinstall and verify sequence simulated on the
+planner, plus a stale key still failing (`ServiceAccounts.Tests.ps1`).
+
+### T3-69 Connector token rotation (High, Fixed)
+
+With an unmoved token in the drop folder the rotate-now task exited with success before
+revoking anything. In `-RevokeAllPrevious` mode it now revokes every connector session first,
+and fails with exit code 2 if the drop is occupied; the installer waits for the task and exits
+non-zero on any failure.
+
+### T3-70 Planted executables (High, Fixed)
+
+Windows (and libuv) look for a bare program name in the working directory first, so a
+`git.exe` at a repository root would run. The spawner decorator now rewrites every bare
+command name on Windows to an absolute path from PATH's absolute entries only (a name found
+nowhere becomes a path that cannot exist), and with the policy installed `git` is always the
+policy's absolute `gitExe` (a policy without one refuses git). `NoDefaultCurrentDirectoryInExePath=1`
+is set for the server process and every child (cmd.exe honours it for shell commands). The
+Claude binary is already the policy's absolute path. Tests: `gitHardening.test.ts`, including a
+real spawn in a folder holding a renamed `whoami.exe` as `git.exe`.
+
+### T3-71 Worktree `.git` files (High, Fixed)
+
+Claude may not edit `**/.git` (the file of a linked worktree or submodule) or `~/.ssh/**`.
+Before any git command, the decorator finds the tree's `.git`; if it is a file, its `gitdir:`
+must resolve (real path) to `<repository>/.git/worktrees/<name>` or `.git/modules/<name>`, and
+with the policy installed that repository must be in a workspace root or the T3 home;
+otherwise the command is refused. Test: `gitHardening.test.ts`.
+
+### T3-72 Revoke completeness (Medium, Fixed)
+
+`t3 auth rotate-signing-keys` also revokes every pairing link. The revoke stops the accounts'
+processes in rounds until none is left (or fails after ten), empties the probe folder, and
+the README says plainly that revoke covers leaked T3 credentials, not a compromised `t3agent`
+(uninstall and wipe), and lists the credentials to rotate by hand (the bridge's tailor.au key,
+the model credential, any repository credential).
+
+### T3-73 Delta review fixes (Medium, Fixed; UNVERIFIED elevated where noted)
+
+- The review-guide investigation gets `Read(./**)` only: Grep and Glob are dropped, because
+  their path scoping could not be proven.
+- Git also gets `core.askPass=` and `core.gitProxy=none`, and loses `SSH_ASKPASS` and
+  `GIT_PROXY_COMMAND`; `merge.<driver>.driver` and `include.path` are covered by the config
+  denial (as filters are).
+- The machine managed tier is also refused with `otelHeadersHelper`, `awsAuthRefresh`,
+  `awsCredentialExport`, `gcpAuthRefresh`, `enableAllProjectMcpServers` or
+  `enabledMcpjsonServers`.
+- Agent HTML responses carry `Vary: Sec-Fetch-Dest` and `Cache-Control: no-store`.
+- Every task is registered with the descriptor `D:P(A;;FA;;;BA)(A;;FA;;;SY)`: its own account
+  can neither read, run nor change it; the self-check fails on any other entry (UNVERIFIED).
+- The workspace walk also checks every entry's owner.
+- An upgrade without a pre-install snapshot records an "unknown baseline"; the rights diff then
+  checks only our four rights.
+- The probe also checks that `t3agent` cannot read the bridge key or write the launchers.
+- Both scripts refuse to run without `-NoProfile` or when a command they rely on is not the real
+  one from its module; every generated script pins `PSModulePath` first.
+- `-AdoptExistingAccounts` adopts, once, accounts from an install that predates the ownership
+  record, only with exactly this installer's description and no group but `Users`.
+
+### T3-74 Upstream MCP tests (Low, Fixed)
+
+`src/mcp` is in the gate now. Tests that expected full-access or auto callers were rewritten to
+assert the Supervised ceiling; the Codex replay integration test was deleted (it replays a
+Codex transcript recorded at full access: the build has no Codex driver and no full access).
+Tests with the policy installed (a stubbed ProgramData known folder) cover the orchestrator
+and MCP worktree checks.
+
 ## What was verified
 
-- Locally on Windows (frozen lockfile), round 4: the contracts suite (161/161) and the gate's
-  server tests (545 passed, 1 upstream skip; 19 files, including git hardening, workspace
-  paths, CSP and the frame-only HTML rule, signing-key rotation, the investigation argv and
-  `http.test.ts`). Server `src` and contracts typecheck clean. `t3 auth rotate-signing-keys`
-  ran from source against a throwaway base dir and replaced all four keys.
-- The PowerShell tests pass: managed settings (`parentSettingsBehavior`, rerun records, the
-  verify comparison, loosening keys) and the service-account module (task XML and extra
-  arguments, ACL plan and comparison including the probe and run folders, group refusal,
-  launchers with the module-path pin and the published server PID, the bridge listener check,
-  issuer retry and revoke-all, mover bounded read and sweep, the marker check, the revoke plan,
-  key freshness, user-rights and pre-install diffs, task security descriptors, the agent probe
-  and its judgement, the git version floor, wiping the managed password copy, and the
-  installer refusing to run outside the protected copy). Both scripts parse; the modules and
-  the self-check load from bytes; the pinned module imports and ADSI group reads work on this
-  PC; the self-check refuses to run unelevated.
-- Upstream MCP suites outside the gate (`src/mcp`) have failures that come from the
-  Supervised ceiling (tests that expect full-access or auto callers); they are not in the gate.
-- Not verified (UNVERIFIED): anything that needs an elevated run on a real machine: accounts
-  and their recorded ownership, secedit, COM task registration and security descriptors,
+- Locally on Windows (frozen lockfile), after the delta review: the contracts suite (161/161)
+  and the gate's server tests: `src/mcp` 292/292 (27 files, every upstream MCP test now in the
+  gate), and the rest 475 passed plus 1 upstream skip (19 files: git hardening including a real
+  planted-`git.exe` spawn and `.git` file checks, worktree checks with the policy installed,
+  workspace paths, CSP and the frame-only HTML rule with its cache headers, signing-key
+  rotation, the investigation argv, `http.test.ts`). Server `src` and contracts typecheck
+  clean. `t3 auth rotate-signing-keys` ran from source against a throwaway base dir: four keys
+  replaced, sessions and pairing links revoked.
+- The PowerShell tests pass: managed settings (including all loosening keys) and the
+  service-account module (task XML, ACL plan, launchers with the module-path pin first, the
+  bridge pipe descriptor and judgement, the reference client refusing another owner and a
+  non-service session, `FILE_FLAG_FIRST_PIPE_INSTANCE`, the shim's instance ordering, issuer
+  rotate-now ordering, the revoke plan and the revoke -> reinstall -> verify sequence, rights
+  and pre-install diffs, strict task descriptors, the probe, the git version floor, and the
+  installer refusing to run outside the protected copy). Both scripts parse.
+- Not verified (UNVERIFIED): anything that needs an elevated run on a real machine: accounts,
+  adoption and ownership records, secedit, COM task registration with explicit descriptors,
   folder ACLs and the handle reset, the token issuer, mover and rotate-now task, the probe
-  task, the emergency revoke, the firewall rules, the self-check's PASS path and marker,
-  uninstall and its diff, and the policy guard and binary hash on a real install. The
-  `-WhatIf` preview needs the protected copy, so it was not run here. Also not verified: a
-  full build, the full upstream suite, the CSPs and the frame-only rule in a browser, the
-  connector token end to end, the bridge's own server check, and the live egress capture
-  (T3-01).
+  task, the bridge pipe as t3agent in session 0, the emergency revoke, the firewall rules, the
+  self-check's PASS path and marker, uninstall and its diff, and the policy guard and binary
+  hash on a real install. Also not verified: a full build, the full upstream suite outside the
+  gate, the CSPs and the frame-only rule in a browser, the connector token end to end, the
+  bridge's own pipe client, and the live egress capture (T3-01).

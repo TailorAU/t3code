@@ -176,7 +176,8 @@ function Get-ManagedSettingsLooseners {
       if ($settings['permissions'].Contains($key)) { $found.Add("permissions.$key") }
     }
   }
-  foreach ($key in 'defaultMode', 'env', 'apiKeyHelper', 'hooks') {
+  foreach ($key in 'defaultMode', 'env', 'apiKeyHelper', 'hooks', 'otelHeadersHelper', 'awsAuthRefresh',
+      'awsCredentialExport', 'gcpAuthRefresh', 'enableAllProjectMcpServers', 'enabledMcpjsonServers') {
     if ($settings.Contains($key)) { $found.Add($key) }
   }
   return $found.ToArray()

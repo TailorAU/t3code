@@ -255,7 +255,7 @@ const rotateSigningKeysCommand = Command.make("rotate-signing-keys", {
   ...authLocationFlags,
 }).pipe(
   Command.withDescription(
-    "Replace every token-signing key and revoke every session: all issued tokens stop working.",
+    "Replace every token-signing key and revoke every session and pairing link: all issued tokens stop working.",
   ),
   Command.withHandler((flags) =>
     Effect.gen(function* () {
@@ -269,7 +269,13 @@ const rotateSigningKeysCommand = Command.make("rotate-signing-keys", {
         for (const session of sessions) {
           if (yield* environmentAuth.revokeSession(session.sessionId)) revoked++;
         }
-        return { rotated, revoked };
+        // Pairing links are credentials too: revoke every one.
+        const links = yield* environmentAuth.listPairingLinks();
+        let linksRevoked = 0;
+        for (const link of links) {
+          if (yield* environmentAuth.revokePairingLink(link.id)) linksRevoked++;
+        }
+        return { rotated, revoked, linksRevoked };
       }).pipe(
         Effect.provide(
           EnvironmentAuth.layerRuntime.pipe(
@@ -279,7 +285,7 @@ const rotateSigningKeysCommand = Command.make("rotate-signing-keys", {
         ),
       );
       yield* Console.log(
-        `Rotated ${result.rotated.length} signing keys (${result.rotated.join(", ")}); revoked ${result.revoked} sessions.\n`,
+        `Rotated ${result.rotated.length} signing keys (${result.rotated.join(", ")}); revoked ${result.revoked} sessions and ${result.linksRevoked} pairing links.\n`,
       );
     }),
   ),

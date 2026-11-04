@@ -81,10 +81,6 @@ param(
   # The T3 bridge executable. Without it the bridge account and the token are still created,
   # but no bridge task is registered.
   [string] $BridgeExe,
-  # Required with -BridgeExe: the operator confirms the bridge build checks, before every
-  # connection, that the loopback listener is the T3 server t3agent started (README, "Bridge
-  # contract"). The launcher checks it before starting the bridge as well.
-  [switch] $BridgeChecksServer,
   # The git.exe the self-check uses (admin-only folder; its version must be at least
   # $MinimumGitVersion). Defaults to the git on PATH.
   [string] $GitExe,
@@ -111,7 +107,11 @@ param(
   # Emergency revoke: stop everything, rotate T3's signing keys (every token and session
   # becomes invalid), delete the connector token, leave the tasks disabled and the verified
   # marker removed. Nothing starts until the operator runs the install again.
-  [switch] $EmergencyRevoke
+  [switch] $EmergencyRevoke,
+  # Upgrades from an install that did not record account ownership: adopt existing
+  # t3agent/t3bridge accounts once, only if their description is exactly this installer's and
+  # they are in no group but Users.
+  [switch] $AdoptExistingAccounts
 )
 
 Set-StrictMode -Version 2.0
@@ -141,8 +141,6 @@ $BridgeDir = Join-Path $PolicyDir 'bridge'
 $HooksDir = Join-Path $PolicyDir 'git-hooks'
 $GitConfigDir = Join-Path $PolicyDir 'git-config'
 $GitGlobalConfig = Join-Path $GitConfigDir 'gitconfig'
-$RunDir = Join-Path $PolicyDir 'run'
-$ServerPidFile = Join-Path $RunDir 't3-server.json'
 $ProbeDir = Join-Path $PolicyDir 'probe'
 $DefaultWorkspaces = Join-Path $PolicyDir 'workspaces'
 $TokenPath = Join-Path $ConnectorDir 'token'
@@ -490,6 +488,23 @@ function Remove-TreeNoFollow([string] $path) {
 
 # ---------- main ----------
 Assert-Elevated
+# Started with -NoProfile, and the commands this script relies on are the real cmdlets from
+# their modules: no profile, function or alias stands in for them.
+$hostArgs = @([Environment]::GetCommandLineArgs() | ForEach-Object { $_.ToLowerInvariant() })
+if (-not ($hostArgs | Where-Object { $_ -in '-noprofile', '-nop', '/noprofile' })) {
+  throw 'Start this script with pwsh -NoProfile -File (README.md). Nothing was changed.'
+}
+foreach ($required in @(
+    @('Get-Acl', 'Microsoft.PowerShell.Security'), @('Get-FileHash', 'Microsoft.PowerShell.Utility'),
+    @('Get-ChildItem', 'Microsoft.PowerShell.Management'), @('Remove-Item', 'Microsoft.PowerShell.Management'),
+    @('Copy-Item', 'Microsoft.PowerShell.Management'), @('Get-LocalUser', 'Microsoft.PowerShell.LocalAccounts'),
+    @('New-LocalUser', 'Microsoft.PowerShell.LocalAccounts'), @('Get-ScheduledTask', 'ScheduledTasks'),
+    @('New-NetFirewallRule', 'NetSecurity'), @('Import-Module', 'Microsoft.PowerShell.Core'))) {
+  $found = @(Get-Command -Name $required[0] -All -ErrorAction SilentlyContinue)
+  if ($found.Count -ne 1 -or $found[0].CommandType -notin 'Cmdlet', 'Function' -or $found[0].ModuleName -ne $required[1]) {
+    throw "$($required[0]) is not the real command from $($required[1]) (found: $(($found | ForEach-Object { "$($_.CommandType) $($_.Source)" }) -join ', ')). Nothing was changed."
+  }
+}
 $scriptPath = $MyInvocation.MyCommand.Path
 $here = Split-Path -Parent $scriptPath
 
@@ -665,7 +680,7 @@ function Get-MachineSnapshot {
 if ($EmergencyRevoke) {
   Write-Host 'EMERGENCY REVOKE'
   $plan = Get-EmergencyRevokePlan -Tasks $Tasks -Accounts @($AgentAccount, $BridgeAccount) -MarkerPath $MarkerPath `
-    -TokenPath $TokenPath -DropDir $DropDir -RevokeLogPath $RevokeLogPath
+    -TokenPath $TokenPath -DropDir $DropDir -RevokeLogPath $RevokeLogPath -ProbeDir $ProbeDir
   $done = [System.Collections.Generic.List[string]]::new()
   $failed = [System.Collections.Generic.List[string]]::new()
   $rotated = $false
@@ -681,13 +696,32 @@ if ($EmergencyRevoke) {
           } else { $line += ' (not registered)' }
         }
         'StopTask' { Stop-ScheduledTask -TaskName $step.Target -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue }
-        'KillProcesses' { $line += " ($(Stop-AccountProcesses $step.Target) stopped)" }
+        'KillProcesses' {
+          # Until none is left: a task restart or a child could otherwise slip through.
+          $total = 0
+          for ($round = 1; $round -le 10; $round++) {
+            $stopped = Stop-AccountProcesses $step.Target
+            $total += $stopped
+            if ($stopped -eq 0) { break }
+            Start-Sleep -Milliseconds 500
+          }
+          if ($stopped -ne 0) { throw "processes of $($step.Target) kept coming back after 10 rounds" }
+          $line += " ($total stopped; none left)"
+        }
+        'RecordRevokeStart' {
+          $log = @()
+          if (Test-Path -LiteralPath $step.Target) { [void](Assert-NotReparse $step.Target); $log = @(Get-Content -LiteralPath $step.Target -Raw | ConvertFrom-Json) }
+          $revokeStart = [DateTime]::UtcNow.ToString('o')
+          $log += [ordered]@{ startedAt = $revokeStart; at = $null; keysRotated = $false; by = [Security.Principal.WindowsIdentity]::GetCurrent().Name }
+          Write-ProtectedFile $step.Target (Get-Utf8Bytes ((ConvertTo-Json -InputObject @($log) -Depth 4) + "`n"))
+          $line += " ($revokeStart)"
+        }
         'RotateKeys' {
           $result = Invoke-TaskAndWait $step.Target
           Disable-ScheduledTask -TaskName $step.Target -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue | Out-Null
           if ($result -ne 0) { throw "the key rotation task did not succeed (result: $(if ($null -eq $result) { 'did not run or finish' } else { $result }))" }
           $rotated = $true
-          $line += ' (every signing key replaced, every session revoked)'
+          $line += ' (every signing key replaced, every session and pairing link revoked)'
         }
         'DeleteFile' {
           foreach ($file in @($step.Target, "$($step.Target).new")) {
@@ -705,7 +739,12 @@ if ($EmergencyRevoke) {
         'AppendRevokeLog' {
           $log = @()
           if (Test-Path -LiteralPath $step.Target) { [void](Assert-NotReparse $step.Target); $log = @(Get-Content -LiteralPath $step.Target -Raw | ConvertFrom-Json) }
-          $log += [ordered]@{ at = [DateTime]::UtcNow.ToString('o'); keysRotated = $rotated; by = [Security.Principal.WindowsIdentity]::GetCurrent().Name }
+          $last = if ($log.Count -gt 0) { $log[-1] } else { $null }
+          if ($null -ne $last -and $last.PSObject.Properties['startedAt'] -and $null -eq $last.at) {
+            $last.at = [DateTime]::UtcNow.ToString('o'); $last.keysRotated = $rotated
+          } else {
+            $log += [ordered]@{ startedAt = [DateTime]::UtcNow.ToString('o'); at = [DateTime]::UtcNow.ToString('o'); keysRotated = $rotated; by = [Security.Principal.WindowsIdentity]::GetCurrent().Name }
+          }
           Write-ProtectedFile $step.Target (Get-Utf8Bytes ((ConvertTo-Json -InputObject @($log) -Depth 4) + "`n"))
         }
       }
@@ -783,7 +822,7 @@ if ($Uninstall) {
       @(Get-ChildItem -LiteralPath $managedDir -Force).Count -eq 0 -and $PSCmdlet.ShouldProcess($managedDir, 'Remove the folder this installer created (empty)')) {
     [IO.Directory]::Delete($managedDir, $false)
   }
-  foreach ($dir in $ServiceDir, $ConnectorDir, $DropDir, $BridgeDir, $HooksDir, $GitConfigDir, $RunDir, $ProbeDir, $T3Home, $ClaudeConfigDir) { Remove-TreeNoFollow $dir }
+  foreach ($dir in $ServiceDir, $ConnectorDir, $DropDir, $BridgeDir, $HooksDir, $GitConfigDir, $ProbeDir, $T3Home, $ClaudeConfigDir) { Remove-TreeNoFollow $dir }
   foreach ($file in $InstalledPath) { if ((Test-Path -LiteralPath $file) -and $PSCmdlet.ShouldProcess($file, 'Remove')) { [IO.File]::Delete($file) } }
   # Workspaces hold the operator's code: they are kept, minus the removed accounts' entries.
   $workspaceRoots = @($DefaultWorkspaces)
@@ -822,9 +861,8 @@ if ($Uninstall) {
 $T3Exe = Resolve-Executable 'T3Exe' $T3Exe
 $ClaudeExe = Resolve-Executable 'ClaudeExe' $ClaudeExe
 if ($BridgeExe) {
-  if (-not $BridgeChecksServer) {
-    throw '-BridgeExe needs -BridgeChecksServer: the bridge must check the T3 listener before every connection (README, "Bridge contract"). Nothing was changed.'
-  }
+  # The bridge reaches T3 only through the bridge pipe (README, "Bridge contract"); its task
+  # starts only after the pipe is up and checked (step 9).
   $BridgeExe = Resolve-Executable 'BridgeExe' $BridgeExe
   if ($TailorApiHosts.Count -eq 0) { throw '-BridgeExe needs -TailorApiHosts (the tailor.au API host names it may reach).' }
 }
@@ -903,8 +941,9 @@ $rules = @(
 )
 if ($BridgeExe) {
   Write-Host 'Resolving tailor.au API hosts:'
-  $bridgeAllowed = @($Loopback) + @(Resolve-AllowedHosts $TailorApiHosts)
-  $rules += @{ Name = "T3Policy-$generation-bridge-out"; DisplayName = 'T3 bridge: block outbound except loopback and the tailor.au API'; Program = $BridgeExe; Direction = 'Outbound'; RemoteAddress = (Get-BlockedAddresses $bridgeAllowed) }
+  # No loopback: the bridge talks to T3 over the pipe only.
+  $bridgeAllowed = @(Resolve-AllowedHosts $TailorApiHosts)
+  $rules += @{ Name = "T3Policy-$generation-bridge-out"; DisplayName = 'T3 bridge: block outbound except the tailor.au API'; Program = $BridgeExe; Direction = 'Outbound'; RemoteAddress = (Get-BlockedAddresses $bridgeAllowed) }
   $rules += @{ Name = "T3Policy-$generation-bridge-in"; DisplayName = 'T3 bridge: block all inbound'; Program = $BridgeExe; Direction = 'Inbound'; RemoteAddress = (Get-BlockedAddresses @()) }
 }
 $previousRules = @(Get-NetFirewallRule -Group $RuleGroup -ErrorAction SilentlyContinue)
@@ -924,8 +963,13 @@ foreach ($entry in $aclPlan | Where-Object { $_.Name -in 'policy', 'state' }) { 
 $undo = Read-UndoRecord
 if (-not $undo.Contains('createdAccounts')) { $undo['createdAccounts'] = [ordered]@{} }
 if (-not (Test-Path -LiteralPath $PreInstallPath) -and -not $WhatIfPreference) {
-  # First install only: the machine as it was, for the self-check and the uninstall diff.
-  Write-ProtectedFile $PreInstallPath (Get-Utf8Bytes (((Get-MachineSnapshot) | ConvertTo-Json -Depth 6) + "`n"))
+  # First install: the machine as it was, for the self-check and the uninstall diff. An
+  # upgrade of an install that never took one records the machine now, marked as an unknown
+  # baseline: the self-check then checks only our four rights.
+  $snapshot = Get-MachineSnapshot
+  $snapshot['baselineKnown'] = ($null -eq $previousInstalled)
+  if (-not $snapshot.baselineKnown) { $snapshot.rights = $null }
+  Write-ProtectedFile $PreInstallPath (Get-Utf8Bytes (($snapshot | ConvertTo-Json -Depth 6) + "`n"))
 }
 if (-not $undo.Contains('createdManagedSettingsDir')) {
   $undo['createdManagedSettingsDir'] = -not (Test-Path -LiteralPath (Split-Path -Parent $MachineManagedSettingsPath))
@@ -941,6 +985,15 @@ function Set-OurAccount([string] $name, [string] $description) {
     $recorded = 'pending'
   } elseif ($recorded -eq 'pending') {
     $recorded = $existing.SID.Value
+  } elseif ($null -eq $recorded -and $AdoptExistingAccounts) {
+    # One-time adoption for upgrades: exactly our description, and no group but Users.
+    $groups = Get-AccountGroups -Name $name
+    if ($existing.Description -ne $description -or @($groups).Count -ne 1 -or @($groups)[0].Sid -ne 'S-1-5-32-545') {
+      throw "Refusing to adopt $name : its description or groups are not exactly this installer's. Nothing was changed."
+    }
+    $recorded = $existing.SID.Value
+    $undo.createdAccounts[$name] = $recorded; Save-UndoRecord $undo
+    Write-Host "  adopted the existing account $name (recorded as this installer's)"
   }
   $password = Set-ServiceAccount -Name $name -Description $description -CreatedSid $(if ($null -eq $existing) { $null } else { $recorded }) -WhatIf:$WhatIfPreference
   $now = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
@@ -1022,7 +1075,7 @@ $installed = [ordered]@{
   gitExe = $GitExe
   gitExeSha256 = Get-FileSha256 $GitExe
   minimumGitVersion = $MinimumGitVersion
-  serverPidFile = $ServerPidFile
+  bridgePipe = (Get-T3BridgePipePath)
   t3Port = $T3Port
   instanceEnvironmentAllowlist = @($policy.claudeInstance.environmentAllowlist)
   installerSha256 = $hashText
@@ -1047,13 +1100,16 @@ $seedPath = Join-Path $ServiceDir 't3-settings.seed.json'
 Write-ProtectedFile $seedPath (Get-Utf8Bytes (($seed | ConvertTo-Json -Depth 10) + "`n")) $readAgent
 
 $t3Launcher = Join-Path $ServiceDir 'start-t3.ps1'
+$pipeShim = Join-Path $ServiceDir 'bridge-pipe.ps1'
 $issuer = Join-Path $ServiceDir 'issue-token.ps1'
 $mover = Join-Path $ServiceDir 'move-token.ps1'
 $bridgeLauncher = Join-Path $ServiceDir 'start-bridge.ps1'
 $agentId = if ($SidMap.agent) { $SidMap.agent } else { 'S-1-0-0' }
 $bridgeId = if ($SidMap.bridge) { $SidMap.bridge } else { 'S-1-0-0' }
+Write-ProtectedFile $pipeShim (Get-Utf8Bytes (Get-BridgePipeShimText -AgentSid $agentId -BridgeSid $bridgeId -T3Port $T3Port)) $readAgent
 Write-ProtectedFile $t3Launcher (Get-Utf8Bytes (Get-T3LauncherText -T3Exe $T3Exe -T3Home $T3Home -Environment $serverVariables -MustBeUnset $mustBeUnset `
-      -MarkerPath $MarkerPath -RequiredFiles @($T3Exe, $ClaudeExe, $InstalledPath, $t3Launcher, $seedPath) -SettingsSeedPath $seedPath -ServerPidFile $ServerPidFile)) $readAgent
+      -MarkerPath $MarkerPath -RequiredFiles @($T3Exe, $ClaudeExe, $InstalledPath, $t3Launcher, $seedPath, $pipeShim) -SettingsSeedPath $seedPath `
+      -PipeShimPath $pipeShim -PwshPath $PwshPath)) $readAgent
 Write-ProtectedFile $issuer (Get-Utf8Bytes (Get-TokenIssuerText -T3Exe $T3Exe -T3Home $T3Home -DropPath $DropPath -Ttl "$($ConnectorTokenDays)d" `
       -MustBeUnset $mustBeUnset -MarkerPath $MarkerPath -RequiredFiles @($T3Exe, $InstalledPath, $issuer))) $readAgent
 Write-ProtectedFile $RotateScript (Get-Utf8Bytes (Get-KeyRotationText -T3Exe $T3Exe -T3Home $T3Home -PolicyPath $InstalledPath -MustBeUnset $mustBeUnset)) $readAgent
@@ -1070,13 +1126,16 @@ $probeTests = [ordered]@{
   'write-git-config' = @{ Path = $GitGlobalConfig; Mode = 'WriteFile' }
   'create-in-connector' = @{ Path = $ConnectorDir; Mode = 'CreateIn' }
   'create-in-installer' = @{ Path = $InstallerDir; Mode = 'CreateIn' }
+  'read-bridge-key' = @{ Path = $BridgeKeyPath; Mode = 'Read' }
+  'write-t3-launcher' = @{ Path = $t3Launcher; Mode = 'WriteFile' }
+  'write-issuer' = @{ Path = $issuer; Mode = 'WriteFile' }
+  'write-pipe-shim' = @{ Path = $pipeShim; Mode = 'WriteFile' }
 }
 Write-ProtectedFile $probe (Get-Utf8Bytes (Get-AgentProbeText -ResultPath $probeResult -Tests $probeTests)) $readAgent
 Write-ProtectedFile $mover (Get-Utf8Bytes (Get-TokenMoverText -DropPath $DropPath -TokenPath $TokenPath -AgentSid $agentId -BridgeSid $bridgeId)) (New-FileEntry @{})
 if ($BridgeExe) {
   Write-ProtectedFile $bridgeLauncher (Get-Utf8Bytes (Get-BridgeLauncherText -BridgeExe $BridgeExe -TokenPath $TokenPath -KeyPath $BridgeKeyPath `
-        -T3Url "http://127.0.0.1:$T3Port" -MustBeUnset $mustBeUnset -MarkerPath $MarkerPath -RequiredFiles @($BridgeExe, $bridgeLauncher) `
-        -ServerPidFile $ServerPidFile -AgentSid $agentId -T3Port $T3Port)) (New-FileEntry @{ bridge = 'ReadAndExecute, Synchronize' })
+        -MustBeUnset $mustBeUnset -MarkerPath $MarkerPath -RequiredFiles @($BridgeExe, $bridgeLauncher) -AgentSid $agentId)) (New-FileEntry @{ bridge = 'ReadAndExecute, Synchronize' })
 }
 
 # ---------- 6. tasks ----------
@@ -1127,11 +1186,28 @@ if (-not $passed) {
   Write-Warning 'Self-check FAILED: nothing was started. Fix the failed checks and run verify-install.ps1 again (it starts nothing; re-run this installer to start).'
   exit 1
 }
-foreach ($task in @($Tasks.Server) + $(if ($BridgeExe) { @($Tasks.Bridge) } else { @() }) + @($Tasks.Mover)) {
+foreach ($task in @($Tasks.Server, $Tasks.Mover)) {
   if ($PSCmdlet.ShouldProcess("\T3CodePolicy\$task", 'Start now')) { Start-ScheduledTask -TaskName $task -TaskPath '\T3CodePolicy\' }
 }
+# The bridge starts only once T3's pipe is up with the planned owner and DACL (probe as t3agent).
+if ($BridgeExe) {
+  Write-Host 'Waiting for the T3 bridge pipe, then checking it...'
+  $pipeUp = $false
+  for ($i = 0; $i -lt 30 -and -not $pipeUp; $i++) { Start-Sleep -Seconds 2; $pipeUp = [IO.Directory]::GetFiles(([string][char]92) * 2 + '.' + [char]92 + 'pipe' + [char]92) -contains (Get-T3BridgePipePath) }
+  $pipePassed = $pipeUp -and (& $verifyBlock -AlreadyLoaded -NoMarker -RequirePipe)
+  if (-not $pipePassed) {
+    Write-Warning 'The bridge pipe is missing or not as planned: the bridge was NOT started. Check the T3 server task, then re-run the installer.'
+    exit 1
+  }
+  if ($PSCmdlet.ShouldProcess("\T3CodePolicy\$($Tasks.Bridge)", 'Start now')) { Start-ScheduledTask -TaskName $Tasks.Bridge -TaskPath '\T3CodePolicy\' }
+}
 if ($RotateConnectorToken -and $PSCmdlet.ShouldProcess("\T3CodePolicy\$($Tasks.RotateToken)", 'Issue a connector token now and revoke every previous connector session')) {
-  Start-ScheduledTask -TaskName $Tasks.RotateToken -TaskPath '\T3CodePolicy\'
+  $rotation = Invoke-TaskAndWait $Tasks.RotateToken
+  if ($rotation -ne 0) {
+    Write-Warning "Connector token rotation FAILED (result: $(if ($null -eq $rotation) { 'did not run or finish' } else { $rotation })). Previous sessions may already be revoked; see the task's history, then run -RotateConnectorToken again."
+    exit 1
+  }
+  Write-Host '  connector token rotated: every previous connector session revoked; the mover places the new token within ten minutes'
 } elseif ((-not (Test-Path -LiteralPath $TokenPath)) -and $PSCmdlet.ShouldProcess("\T3CodePolicy\$($Tasks.Issuer)", 'Issue a connector token now (moved into connector\ within ten minutes)')) {
   Start-ScheduledTask -TaskName $Tasks.Issuer -TaskPath '\T3CodePolicy\'
 }

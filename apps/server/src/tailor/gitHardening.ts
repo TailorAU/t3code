@@ -13,7 +13,9 @@
  * - `commit.gpgSign=false` and `tag.gpgSign=false`, so no signing program runs;
  * - `GIT_CONFIG_GLOBAL` = an empty admin-owned file and `GIT_CONFIG_NOSYSTEM=1`, so no global
  *   or system config (includes, filters, aliases, helpers) is read;
- * - `GIT_EXTERNAL_DIFF`, `GIT_SSH`, `GIT_SSH_COMMAND` and `GIT_ASKPASS` removed;
+ * - `core.askPass=` (empty) and `core.gitProxy=none`, so no prompt or proxy program runs;
+ * - `GIT_EXTERNAL_DIFF`, `GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `SSH_ASKPASS` and
+ *   `GIT_PROXY_COMMAND` removed;
  * - and for diff-producing commands (diff, log, show, format-patch, whatchanged, blame,
  *   diff-tree, stash show), `--no-ext-diff --no-textconv`.
  *
@@ -21,8 +23,8 @@
  * fails ("cannot spawn"), so it is not an off switch. `--no-ext-diff` is. Likewise
  * `core.sshCommand=` (empty) would break every ssh remote, so it is set to plain `ssh`.
  *
- * `filter.<driver>.clean/smudge/process` cannot be switched off for every driver name with
- * `-c`. The control is that no config can define one: global and system config are off, a
+ * `filter.<driver>.clean/smudge/process`, `merge.<driver>.driver` and `include.path` cannot be
+ * switched off for every name with `-c`. The control is that no config can define one: global and system config are off, a
  * clone never carries repository config, and Claude may not edit anything under `.git/`,
  * `~/.gitconfig`, `~/.config/git/`, `.gitattributes` or `.gitmodules` (claudeDenyRules.ts);
  * the agent's own shell commands are Supervised.
@@ -49,7 +51,14 @@ const DIFF_PRODUCING_SUB_SUBCOMMANDS: Readonly<Record<string, ReadonlySet<string
   stash: new Set(["show"]),
 };
 
-const REMOVED_GIT_ENVIRONMENT = ["GIT_EXTERNAL_DIFF", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS"];
+const REMOVED_GIT_ENVIRONMENT = [
+  "GIT_EXTERNAL_DIFF",
+  "GIT_SSH",
+  "GIT_SSH_COMMAND",
+  "GIT_ASKPASS",
+  "SSH_ASKPASS",
+  "GIT_PROXY_COMMAND",
+];
 
 /** The empty hooks folder the installer creates; a path that cannot exist if it is unknown. */
 export function tailorGitHooksDirectory(platform: string = process.platform): string {
@@ -86,6 +95,8 @@ export function tailorGitConfig(hooksDirectory: string): ReadonlyArray<readonly 
     ["protocol.ext.allow", "never"],
     ["protocol.file.allow", "user"],
     ["credential.helper", ""],
+    ["core.askPass", ""],
+    ["core.gitProxy", "none"],
     ["core.sshCommand", "ssh"],
     ["commit.gpgSign", "false"],
     ["tag.gpgSign", "false"],
@@ -131,6 +142,9 @@ export function applyTailorGitHardening(env: NodeJS.ProcessEnv = process.env): v
     else env[key] = value;
   }
   for (const name of REMOVED_GIT_ENVIRONMENT) delete env[name];
+  // Windows: never resolve a bare command name in the working directory (cmd.exe, CreateProcess
+  // search and libuv honour this), so a planted git.exe in a repository is not run.
+  if (process.platform === "win32") env.NoDefaultCurrentDirectoryInExePath = "1";
 }
 
 export function isGitExecutable(command: string): boolean {

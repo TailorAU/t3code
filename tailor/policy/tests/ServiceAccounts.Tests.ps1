@@ -98,10 +98,11 @@ function Test-Parses([string] $text) { $errors = $null; [void][Management.Automa
 $launcher = Get-T3LauncherText -T3Exe 'C:\Program Files\T3Code\t3.exe' -T3Home 'C:\ProgramData\T3CodePolicy\t3-home' `
   -Environment ([ordered]@{ T3CODE_HOST = '127.0.0.1'; T3CODE_LAN = 'false' }) -MustBeUnset @('HTTPS_PROXY', 'NODE_OPTIONS') `
   -MarkerPath 'C:\ProgramData\T3CodePolicy\service\verified.json' -RequiredFiles @('C:\Program Files\T3Code\t3.exe') -SettingsSeedPath 'C:\ProgramData\T3CodePolicy\service\t3-settings.seed.json' `
-  -ServerPidFile 'C:\ProgramData\T3CodePolicy\run\t3-server.json'
+  -PipeShimPath 'C:\ProgramData\T3CodePolicy\service\bridge-pipe.ps1' -PwshPath 'C:\Program Files\PowerShell\7\pwsh.exe'
 Assert-True (Test-Parses $launcher) 'the T3 launcher parses'
-Assert-True ($launcher.IndexOf('PSModulePath') -lt $launcher.IndexOf('while')) 'the launcher pins its module path'
-Assert-True ($launcher.Contains('t3-server.json') -and $launcher.IndexOf('-PassThru') -lt $launcher.IndexOf('WriteAllText($pidFile')) 'the launcher publishes the server PID it started'
+$firstCode = @($launcher -split "`n" | Where-Object { $_.Trim() -and -not $_.TrimStart().StartsWith('#') })[0]
+Assert-True ($firstCode.StartsWith('$env:PSModulePath')) 'the module-path pin is the launcher''s first statement'
+Assert-True ($launcher.Contains('bridge-pipe.ps1') -and $launcher.IndexOf("'serve'") -lt $launcher.IndexOf('bridge-pipe.ps1')) 'the launcher starts the bridge pipe shim after t3 serve'
 Assert-True ($launcher.Contains("`$env:T3CODE_HOST = '127.0.0.1'")) 'launcher sets the policy environment'
 Assert-True ($launcher.Contains("Remove-Item -LiteralPath 'Env:HTTPS_PROXY'")) 'launcher clears proxy variables'
 Assert-True ($launcher.Contains("`$env:T3CODE_HOME = 'C:\ProgramData\T3CodePolicy\t3-home'")) 'launcher pins the T3 home'
@@ -109,23 +110,24 @@ $loop = $launcher.IndexOf('while')
 Assert-True ($launcher.IndexOf('Test-T3Verified', $loop) -gt $loop -and $launcher.IndexOf('Test-T3Verified', $loop) -lt $launcher.IndexOf('Start-Process')) 'launcher checks the marker before every start'
 Assert-True ($launcher.Contains('t3-settings.seed.json')) 'the launcher (t3agent) seeds T3 settings, not the installer'
 $refused = $false
-try { [void](Get-T3LauncherText -T3Exe 'x.exe' -T3Home 'h' -Environment ([ordered]@{ 'PATH' = 'x' }) -MustBeUnset @() -MarkerPath 'm' -RequiredFiles @('x') -ServerPidFile 'p') } catch { $refused = $true }
+try { [void](Get-T3LauncherText -T3Exe 'x.exe' -T3Home 'h' -Environment ([ordered]@{ 'PATH' = 'x' }) -MustBeUnset @() -MarkerPath 'm' -RequiredFiles @('x') -PipeShimPath 's' -PwshPath 'p') } catch { $refused = $true }
 Assert-True $refused 'launcher refuses non-T3CODE variables'
-$quoted = Get-T3LauncherText -T3Exe "C:\it's\t3.exe" -T3Home 'h' -Environment ([ordered]@{}) -MustBeUnset @() -MarkerPath 'm' -RequiredFiles @("C:\it's\t3.exe") -ServerPidFile 'p'
+$quoted = Get-T3LauncherText -T3Exe "C:\it's\t3.exe" -T3Home 'h' -Environment ([ordered]@{}) -MustBeUnset @() -MarkerPath 'm' -RequiredFiles @("C:\it's\t3.exe") -PipeShimPath 's' -PwshPath 'p'
 Assert-True ($quoted.Contains("'C:\it''s\t3.exe'") -and (Test-Parses $quoted)) 'launcher quotes paths safely'
 $bridge = Get-BridgeLauncherText -BridgeExe 'C:\Program Files\T3Bridge\bridge.exe' -TokenPath 'C:\ProgramData\T3CodePolicy\connector\token' `
-  -KeyPath 'C:\ProgramData\T3CodePolicy\bridge\tailor-api-key' -T3Url 'http://127.0.0.1:3773' -MustBeUnset @('HTTPS_PROXY') -MarkerPath 'm' -RequiredFiles @('b') `
-  -ServerPidFile 'C:\ProgramData\T3CodePolicy\run\t3-server.json' -AgentSid 'S-1-5-21-9-1001' -T3Port 3773
+  -KeyPath 'C:\ProgramData\T3CodePolicy\bridge\tailor-api-key' -MustBeUnset @('HTTPS_PROXY') -MarkerPath 'm' -RequiredFiles @('b') -AgentSid 'S-1-5-21-9-1001'
 Assert-True ($bridge.Contains("`$env:T3_BRIDGE_TOKEN_FILE = 'C:\ProgramData\T3CodePolicy\connector\token'") -and (Test-Parses $bridge)) 'bridge gets the token path, not the token'
-$bridgeLoop = $bridge.IndexOf('while')
-Assert-True ($bridge.IndexOf('Test-T3ServerListener', $bridgeLoop) -gt $bridgeLoop -and $bridge.IndexOf('Test-T3ServerListener', $bridgeLoop) -lt $bridge.IndexOf('bridge.exe', $bridgeLoop)) 'the bridge starts only after the listener check'
-Assert-True ($bridge.Contains('-LocalPort 3773') -and $bridge.Contains("'S-1-5-21-9-1001'") -and $bridge.Contains('T3_BRIDGE_SERVER_PID_FILE')) 'the listener check uses the port, the agent SID and the PID file'
+Assert-True ($bridge.Contains('t3code-bridge') -and $bridge.Contains("T3_BRIDGE_SERVER_OWNER_SID = 'S-1-5-21-9-1001'")) 'the bridge gets the pipe and the owner it must find on it'
+Assert-True (-not ($bridge -match '127\.0\.0\.1|T3_BRIDGE_T3_URL|LocalPort')) 'the bridge is given no TCP address to fall back to'
 $issuer = Get-TokenIssuerText -T3Exe 't3.exe' -T3Home 'h' -DropPath 'C:\ProgramData\T3CodePolicy\connector-drop\token' -Ttl '7d' -MustBeUnset @() -MarkerPath 'm' -RequiredFiles @('t3.exe')
 Assert-True (Test-Parses $issuer) 'the issuer parses'
 Assert-True ($issuer.IndexOf('CreateNew') -lt $issuer.IndexOf('session issue')) 'the issuer claims the drop file before issuing'
 Assert-True ($issuer.Contains('RevokeAllPrevious') -and $issuer.Contains('-Skip $keep') -and $issuer -notmatch 'Write-(Host|Output)[^\n]*issued') 'daily keeps one previous token, -RevokeAllPrevious keeps none, and the token is never printed'
 Assert-True ($issuer.Contains('$attempt -le 2') -or $issuer.Contains('`$attempt -le 2')) 'issuing is retried once'
 Assert-True ($issuer.Contains('sessionId -ne $newSession')) 'the new session is never revoked'
+$rotateFirst = $issuer.IndexOf('if (`$RevokeAllPrevious) {'.Replace('`', ''))
+Assert-True ($rotateFirst -gt 0 -and $rotateFirst -lt $issuer.IndexOf('CreateNew')) 'rotate-now revokes every previous session before it tries to claim the drop'
+Assert-True ($issuer.Contains('exit 2')) 'rotate-now fails loudly when an unmoved token blocks the drop'
 $mover = Get-TokenMoverText -DropPath 'C:\d\token' -TokenPath 'C:\c\token' -AgentSid 'S-1-5-21-9-1001' -BridgeSid 'S-1-5-21-9-1002'
 Assert-True (Test-Parses $mover) 'the mover parses'
 Assert-True ($mover.Contains('ReparsePoint') -and $mover.Contains('hardlink') -and $mover.Contains("'S-1-5-21-9-1001'")) 'the mover refuses links and foreign owners'
@@ -154,17 +156,69 @@ try {
 $plan2 = Get-T3FolderAclPlan -PolicyDir 'C:\P' -ClaudeHomeName 'claude-home'
 $by2 = @{}; foreach ($e in $plan2) { $by2[$e.Name] = $e }
 Assert-True ($null -ne $by2['probe'] -and @($by2['probe'].Grants | Where-Object { $_.Principal -eq 'agent' -and $_.Rights -match 'Read' -and $_.Rights -notmatch 'ReadPermissions' }).Count -eq 0) 'the agent cannot read the probe folder'
-Assert-True (@($by2['run'].Grants | Where-Object Principal -eq 'bridge').Count -eq 1 -and @($by2['run'].Grants | Where-Object { $_.Principal -eq 'bridge' -and $_.Rights -match 'Modify|Write' }).Count -eq 0) 'the bridge reads the run folder only'
+Assert-True ($null -eq $by2['run']) 'no run folder: the bridge authenticates T3 through the pipe'
 Assert-True (@($by2['git-config'].Grants | Where-Object { $_.Principal -eq 'agent' -and $_.Rights -match 'Modify|Write' }).Count -eq 0) 'the agent cannot change the global git config'
 
-# Listener ownership (bridge).
-Assert-True ($null -eq (Test-ListenerOwnership -ListenerPids @(4242) -PublishedPid 4242)) 'the published T3 PID holding the port passes'
-Assert-True ($null -ne (Test-ListenerOwnership -ListenerPids @(999) -PublishedPid 4242)) 'another process on the port fails'
-Assert-True ($null -ne (Test-ListenerOwnership -ListenerPids @(4242, 999) -PublishedPid 4242)) 'a second listener fails'
-Assert-True ($null -ne (Test-ListenerOwnership -ListenerPids @() -PublishedPid 4242)) 'nothing listening fails'
-Assert-True ($null -ne (Test-ListenerOwnership -ListenerPids @(4242) -PublishedPid $null)) 'no published PID fails'
-$listenerText = Get-ListenerCheckText -ServerPidFile 'C:\P\run\t3-server.json' -AgentSid 'S-1-5-21-9-1001' -T3Port 3773
-Assert-True (Test-Parses $listenerText) 'the listener check parses'
+# Bridge pipe: descriptor, judgement, the reference client, FIRST_PIPE_INSTANCE.
+$agentT = 'S-1-5-21-9-1001'; $bridgeT = 'S-1-5-21-9-1002'
+$pipeSecurity = New-T3BridgePipeSecurity -OwnerSid $agentT -BridgeSid $bridgeT
+$pipeSddl = $pipeSecurity.GetSecurityDescriptorSddlForm('Owner, Access')
+Assert-True (@(Get-T3BridgePipeIssues -Sddl $pipeSddl -AgentSid $agentT -BridgeSid $bridgeT).Count -eq 0) "the planned pipe descriptor passes ($pipeSddl)"
+Assert-True ($pipeSecurity.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq $agentT -and $pipeSecurity.AreAccessRulesProtected) 'owner t3agent, protected DACL'
+foreach ($bad in @(
+    @('O:BAD:P(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x100004;;;S-1-5-21-9-1001)', 'owner not the agent'),
+    @("O:S-1-5-21-9-1001D:P(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x100004;;;S-1-5-21-9-1001)(A;;0x12019b;;;BU)", 'Users granted'),
+    @("O:S-1-5-21-9-1001D:P(A;;0x12019f;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x100004;;;S-1-5-21-9-1001)", 'the bridge may create instances'),
+    @("O:S-1-5-21-9-1001D:P(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x12019f;;;S-1-5-21-9-1001)", 'the agent has more than create-instance'),
+    @("O:S-1-5-21-9-1001D:(A;;0x12019b;;;S-1-5-21-9-1002)(A;;0x12019b;;;SY)(A;;0x100004;;;S-1-5-21-9-1001)", 'DACL not protected'))) {
+  Assert-True (@(Get-T3BridgePipeIssues -Sddl $bad[0] -AgentSid $agentT -BridgeSid $bridgeT).Count -gt 0) "pipe check catches: $($bad[1])"
+}
+Initialize-T3PipeNative
+$me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$testName = 't3test-' + [guid]::NewGuid().ToString('N')
+$testPath = Get-T3BridgePipePath $testName
+# A pipe the test user owns, with the test user as the "bridge".
+$testSecurity = [System.IO.Pipes.PipeSecurity]::new()
+$testSecurity.SetAccessRuleProtection($true, $false)
+$testSecurity.SetOwner([Security.Principal.SecurityIdentifier]::new($me))
+$testSecurity.AddAccessRule([System.IO.Pipes.PipeAccessRule]::new([Security.Principal.SecurityIdentifier]::new($me), 'ReadWrite, CreateNewInstance', 'Allow'))
+$handle = [T3Policy.PipeNative]::Create($testPath, $testSecurity.GetSecurityDescriptorBinaryForm(), $true, 4)
+$server = [System.IO.Pipes.NamedPipeServerStream]::new([System.IO.Pipes.PipeDirection]::InOut, $true, $false, $handle)
+try {
+  $second = $false
+  try { [T3Policy.PipeNative]::Create($testPath, $testSecurity.GetSecurityDescriptorBinaryForm(), $true, 4).Dispose(); $second = $true } catch { }
+  Assert-True (-not $second) 'FILE_FLAG_FIRST_PIPE_INSTANCE: a second first instance of the name fails'
+  $wait = $server.WaitForConnectionAsync()
+  $refusedOwner = $null
+  try { (Connect-T3BridgePipe -ExpectedOwnerSid 'S-1-5-21-9-7777' -Name $testName -TimeoutMs 2000 -RequireServiceSession $false).Dispose() } catch { $refusedOwner = $_.Exception.Message }
+  Assert-True ($refusedOwner -match 'Refusing the T3 pipe: owned by') "the client refuses a pipe owned by another SID ($refusedOwner)"
+  $server.Dispose()
+  $handle = [T3Policy.PipeNative]::Create($testPath, $testSecurity.GetSecurityDescriptorBinaryForm(), $true, 4)
+  $server = [System.IO.Pipes.NamedPipeServerStream]::new([System.IO.Pipes.PipeDirection]::InOut, $true, $false, $handle)
+  $wait = $server.WaitForConnectionAsync()
+  $refusedSession = $null
+  try { (Connect-T3BridgePipe -ExpectedOwnerSid $me -Name $testName -TimeoutMs 2000).Dispose() } catch { $refusedSession = $_.Exception.Message }
+  Assert-True ($refusedSession -match 'session') "the client refuses a server outside session 0 ($refusedSession)"
+  $server.Dispose()
+  $handle = [T3Policy.PipeNative]::Create($testPath, $testSecurity.GetSecurityDescriptorBinaryForm(), $true, 4)
+  $server = [System.IO.Pipes.NamedPipeServerStream]::new([System.IO.Pipes.PipeDirection]::InOut, $true, $false, $handle)
+  $wait = $server.WaitForConnectionAsync()
+  $client = Connect-T3BridgePipe -ExpectedOwnerSid $me -Name $testName -TimeoutMs 2000 -RequireServiceSession $false
+  Assert-True ($client.IsConnected) 'the client connects to a pipe owned by the expected SID'
+  $client.Dispose()
+  $server.Dispose()
+  $handle = [T3Policy.PipeNative]::Create($testPath, $testSecurity.GetSecurityDescriptorBinaryForm(), $true, 4)
+  $server = [System.IO.Pipes.NamedPipeServerStream]::new([System.IO.Pipes.PipeDirection]::InOut, $true, $false, $handle)
+  $wait = $server.WaitForConnectionAsync()
+  $sddlRead = [T3Policy.PipeNative]::ReadSddl($testPath)
+  Assert-True ($sddlRead.StartsWith("O:$me")) "the descriptor reads back through a handle ($sddlRead)"
+} finally { $server.Dispose() }
+$shim = Get-BridgePipeShimText -AgentSid $agentT -BridgeSid $bridgeT -T3Port 3773
+Assert-True (Test-Parses $shim) 'the pipe shim parses'
+Assert-True ($shim.Contains('Create(`$path, `$descriptor, `$true'.Replace('`', '')) -and $shim.Contains('exit 3')) 'the shim creates the first instance with FIRST_PIPE_INSTANCE and refuses if it exists'
+$waitAt = $shim.IndexOf('WaitForConnectionAsync'); $nextAt = $shim.IndexOf('Create($path, $descriptor, $false', $waitAt); $relayAt = $shim.IndexOf('TcpClient', $waitAt)
+Assert-True ($nextAt -gt $waitAt -and $nextAt -lt $relayAt) 'the next instance listens before the connected one is handed off'
+Assert-True ($shim.Contains('-RemotePort $local -State Established') -and $shim.Contains('-ne $ServerPid')) 'the shim checks the accepting process of its own connection'
 
 # User rights: only our SIDs added to our four rights.
 $sidA = 'S-1-5-21-9-1001'; $sidB = 'S-1-5-21-9-1002'
@@ -191,7 +245,8 @@ foreach ($want in 'T3CODE_X', 'T3CODE_Y', 'task \T3CodePolicy', 'task folder', '
 }
 
 # Task security descriptors: only admins may change, start or stop.
-Assert-True (@(Get-TaskSecurityIssues -Sddl 'D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;AU)').Count -eq 0) 'admins full, others read: fine'
+Assert-True (@(Get-TaskSecurityIssues -Sddl 'D:P(A;;FA;;;BA)(A;;FA;;;SY)').Count -eq 0) 'admins and SYSTEM only: fine'
+Assert-True (@(Get-TaskSecurityIssues -Sddl 'D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;AU)').Count -eq 1) 'anyone else, even read-only: reported'
 Assert-True (@(Get-TaskSecurityIssues -Sddl 'D:(A;;FA;;;BA)(A;;FRFX;;;AU)').Count -eq 1) 'others may run it: reported'
 Assert-True (@(Get-TaskSecurityIssues -Sddl 'D:(A;;GA;;;BU)').Count -eq 1) 'users full: reported'
 
@@ -229,7 +284,7 @@ Assert-True ($secret.Trim([char]0).Length -eq 0) 'the managed string copy is zer
 # Emergency revoke: the plan, in order, touching only the expected targets.
 $tasks = [ordered]@{ Server = 'T3 server'; Bridge = 'T3 bridge'; Issuer = 'T3 token issuer'; Mover = 'T3 token mover'; Rotate = 'T3 key rotation'; RotateToken = 'T3 token rotate now'; Probe = 'T3 self-check probe' }
 $revoke = Get-EmergencyRevokePlan -Tasks $tasks -Accounts @('t3agent', 't3bridge') -MarkerPath 'C:\P\service\verified.json' `
-  -TokenPath 'C:\P\connector\token' -DropDir 'C:\P\connector-drop' -RevokeLogPath 'C:\P\state\revoke-log.json'
+  -TokenPath 'C:\P\connector\token' -DropDir 'C:\P\connector-drop' -RevokeLogPath 'C:\P\state\revoke-log.json' -ProbeDir 'C:\P\probe'
 $actions = @($revoke | ForEach-Object Action)
 $indexOf = { param($action, $target) for ($n = 0; $n -lt $revoke.Count; $n++) { if ($revoke[$n].Action -eq $action -and ($null -eq $target -or $revoke[$n].Target -eq $target)) { return $n } }; return -1 }
 Assert-True ($actions[0] -eq 'RemoveMarker') 'the marker goes first, so nothing restarts during the revoke'
@@ -238,6 +293,22 @@ foreach ($name in 'T3 server', 'T3 bridge', 'T3 token issuer', 'T3 token mover',
   Assert-True ((& $indexOf 'DisableTask' $name) -lt (& $indexOf 'RotateKeys' $null)) "$name is disabled before the keys rotate"
 }
 Assert-True ((& $indexOf 'KillProcesses' 't3agent') -lt (& $indexOf 'RotateKeys' 'T3 key rotation')) 'processes are stopped before the rotation'
+Assert-True ((& $indexOf 'RecordRevokeStart' $null) -gt (& $indexOf 'KillProcesses' 't3bridge') -and (& $indexOf 'RecordRevokeStart' $null) -lt (& $indexOf 'RotateKeys' $null)) 'the revoke start is recorded before the keys rotate'
+# The whole sequence, revoke -> reinstall -> verify, on the planner: each step happens one
+# second after the last; the key is written at RotateKeys; the log as the installer writes it.
+$clock = [DateTime]::new(2026, 11, 5, 4, 0, 0, [DateTimeKind]::Utc); $log = @(); $keyWritten = $null
+foreach ($st in $revoke) {
+  $clock = $clock.AddSeconds(1)
+  switch ($st.Action) {
+    'RecordRevokeStart' { $log += [ordered]@{ startedAt = $clock.ToString('o'); at = $null } }
+    'RotateKeys' { $keyWritten = $clock }
+    'AppendRevokeLog' { $log[-1].at = $clock.ToString('o') }
+  }
+}
+$logJson = ConvertTo-Json -InputObject @($log) -Depth 3
+Assert-True (Test-SigningKeyFresh -KeyWrittenUtc $keyWritten -LastRevokeUtc (Get-LastRevokeTime -LogText $logJson)).Ok 'after a successful revoke, the reinstall verifies (key newer than the revoke start)'
+$stale = $clock.AddMinutes(-10)
+Assert-True (-not (Test-SigningKeyFresh -KeyWrittenUtc $stale -LastRevokeUtc (Get-LastRevokeTime -LogText $logJson)).Ok) 'a key from before the revoke still fails'
 Assert-True ((& $indexOf 'KillProcesses' 't3bridge') -ge 0) 'bridge processes are stopped'
 Assert-True ((& $indexOf 'DeleteFile' 'C:\P\connector\token') -gt (& $indexOf 'RotateKeys' $null)) 'the token is deleted'
 Assert-True ((& $indexOf 'EmptyFolder' 'C:\P\connector-drop') -ge 0) 'the drop folder is emptied'
@@ -266,6 +337,8 @@ $logText = (@(@{ at = '2026-11-05T01:00:00.0000000Z' }, @{ at = '2026-11-05T03:0
 Assert-True ((Get-LastRevokeTime -LogText $logText) -eq [DateTime]::new(2026, 11, 5, 3, 0, 0, [DateTimeKind]::Utc)) 'the latest revoke counts'
 $single = (ConvertTo-Json -InputObject @(@{ at = '2026-11-05T01:00:00.0000000Z' }))
 Assert-True ((Get-LastRevokeTime -LogText $single) -eq $t0) 'a one-entry log is read'
+$started = (ConvertTo-Json -InputObject @(@{ startedAt = '2026-11-05T01:00:00.0000000Z'; at = '2026-11-05T01:05:00.0000000Z' }))
+Assert-True ((Get-LastRevokeTime -LogText $started) -eq $t0) 'the start time counts, not the end'
 
 # The installer refuses to run from anywhere but the protected copy (here: the repository).
 $installer = Join-Path $PSScriptRoot '..' 'install-policy.ps1'

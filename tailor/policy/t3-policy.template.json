@@ -121,7 +121,7 @@
   },
   "disabledDrivers": [],
   "connectorToken": {
-    "$comment": "Issued by the 'T3 token issuer' task, which runs as t3agent with T3's own CLI against the T3 home every day, into %ProgramData%\\T3CodePolicy\\connector-drop (t3agent may create the file but not read, list or delete it). The 'T3 token mover' task (SYSTEM, fixed code) moves it into connector\token with a t3bridge-only ACL set at creation. The issuer keeps the two newest connector sessions and revokes the rest. tailor:connector reaches only the five contract RPCs and five dispatch commands (RpcAuthorization.tailorConnectorAllows). install-policy.ps1 -ConnectorTokenDays sets the lifetime.",
+    "$comment": "Issued by the 'T3 token issuer' task, which runs as t3agent with T3's own CLI against the T3 home every day, into %ProgramData%\\T3CodePolicy\\connector-drop (t3agent may create the file but not read, list or delete it). The 'T3 token mover' task (SYSTEM, fixed code) moves it into connector\\token with a t3bridge-only ACL set at creation. The daily issuer keeps the new and the previous connector session and revokes the rest; -RotateConnectorToken revokes every previous one first. tailor:connector reaches only the five contract RPCs and five dispatch commands (RpcAuthorization.tailorConnectorAllows). install-policy.ps1 -ConnectorTokenDays sets the lifetime.",
     "scopes": [
       "tailor:connector"
     ],
@@ -137,12 +137,12 @@
     ]
   },
   "bridge": {
-    "$comment": "The T3 bridge runs as t3bridge, opens no listener, and dials out only to loopback (T3) and the tailor.au API hosts given to install-policy.ps1 -TailorApiHosts (for example api.example.com). Its tailor.au key lives in %ProgramData%\\T3CodePolicy\\bridge, readable by t3bridge only."
+    "$comment": "The T3 bridge runs as t3bridge, opens no listener, reaches T3 only through the named pipe \\\\.\\pipe\\t3code-bridge (owner t3agent, t3bridge read/write; it checks the owner and session before sending anything) and dials out only to the tailor.au API hosts given to install-policy.ps1 -TailorApiHosts (for example api.example.com). Its tailor.au key lives in %ProgramData%\\T3CodePolicy\\bridge, readable by t3bridge only."
   },
   "workspaces": {
     "$comment": "Projects must be inside a workspace root while the policy is installed (workspacePolicy.ts). The installer creates %ProgramData%\\T3CodePolicy\\workspaces for Administrators, SYSTEM and t3agent only; -WorkspaceRoots adds more. See README.md, 'Getting code in and out'."
   },
   "gitHardening": {
-    "$comment": "Every git command T3 runs gets GIT_CONFIG_GLOBAL = an empty admin-owned file (%ProgramData%\\T3CodePolicy\\git-config\\gitconfig), GIT_CONFIG_NOSYSTEM=1, core.hooksPath = the empty admin-owned git-hooks folder, safe.bareRepository=explicit, core.fsmonitor=false, protocol.ext.allow=never, protocol.file.allow=user, credential.helper= (cleared), core.sshCommand=ssh, commit.gpgSign=false and tag.gpgSign=false; diff, log, show, blame, diff-tree and stash show get --no-ext-diff --no-textconv (gitHardening.ts)."
+    "$comment": "Every git command T3 runs is the policy's absolute gitExe and gets GIT_CONFIG_GLOBAL = an empty admin-owned file (%ProgramData%\\T3CodePolicy\\git-config\\gitconfig), GIT_CONFIG_NOSYSTEM=1, core.hooksPath = the empty admin-owned git-hooks folder, safe.bareRepository=explicit, core.fsmonitor=false, protocol.ext.allow=never, protocol.file.allow=user, credential.helper= (cleared), core.askPass= and core.gitProxy=none, core.sshCommand=ssh, commit.gpgSign=false and tag.gpgSign=false; diff, log, show, blame, diff-tree and stash show get --no-ext-diff --no-textconv (gitHardening.ts)."
   }
 }

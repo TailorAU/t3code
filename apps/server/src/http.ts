@@ -156,7 +156,11 @@ export function assetResponseHeaders(
     wouldServeInlineHtml(filePath, options?.mimeType) &&
     !isFramedRequest(options?.fetchDest)
   ) {
-    return assetResponseHeaders(filePath, { ...options, download: true });
+    return {
+      ...assetResponseHeaders(filePath, { ...options, download: true }),
+      "Cache-Control": "no-store",
+      Vary: "Sec-Fetch-Dest",
+    };
   }
   const lowerPath = filePath.toLowerCase();
   const inlineMimeType = options?.mimeType?.split(";", 1)[0]?.trim();
@@ -181,13 +185,20 @@ export function assetResponseHeaders(
                   ? "text/html; charset=utf-8"
                   : "application/pdf",
               ...(inlineMimeType.toLowerCase() === "text/html"
-                ? { "Content-Security-Policy": HTML_CONTENT_SECURITY_POLICY }
+                ? {
+                    "Content-Security-Policy": HTML_CONTENT_SECURITY_POLICY,
+                    // Tailor fork: framed and top-level answers differ; never cache either.
+                    "Cache-Control": "no-store",
+                    Vary: "Sec-Fetch-Dest",
+                  }
                 : {}),
             }
           : lowerPath.endsWith(".html") || lowerPath.endsWith(".htm")
             ? {
                 "Content-Type": "text/html; charset=utf-8",
                 "Content-Security-Policy": HTML_CONTENT_SECURITY_POLICY,
+                "Cache-Control": "no-store",
+                Vary: "Sec-Fetch-Dest",
               }
             : {}),
     ...(!options?.download && lowerPath.endsWith(".svg")

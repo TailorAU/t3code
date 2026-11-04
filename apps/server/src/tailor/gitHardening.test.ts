@@ -12,6 +12,8 @@ import {
   withTailorGitArgs,
   withTailorGitConfig,
 } from "./gitHardening.ts";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeOS from "node:os";
 import * as TailorGitSpawner from "./gitSpawner.ts";
 
 const configOf = (env: Record<string, string | undefined>) => {
@@ -32,6 +34,7 @@ describe("Tailor git hardening", () => {
         GIT_SSH_COMMAND: "evil",
         GIT_SSH: "evil",
         GIT_ASKPASS: "evil",
+        SSH_ASKPASS: "evil",
         GIT_CONFIG_GLOBAL: "/home/x/.gitconfig",
       },
       "/empty-hooks",
@@ -44,13 +47,15 @@ describe("Tailor git hardening", () => {
       "protocol.ext.allow": "never",
       "protocol.file.allow": "user",
       "credential.helper": "",
+      "core.askPass": "",
+      "core.gitProxy": "none",
       "core.sshCommand": "ssh",
       "commit.gpgSign": "false",
       "tag.gpgSign": "false",
     });
     assert.strictEqual(env.GIT_CONFIG_GLOBAL, "/empty-config");
     assert.strictEqual(env.GIT_CONFIG_NOSYSTEM, "1");
-    for (const name of ["GIT_EXTERNAL_DIFF", "GIT_SSH_COMMAND", "GIT_SSH", "GIT_ASKPASS"]) {
+    for (const name of ["GIT_EXTERNAL_DIFF", "GIT_SSH_COMMAND", "GIT_SSH", "GIT_ASKPASS", "SSH_ASKPASS"]) {
       assert.isUndefined(env[name], name);
     }
     assert.strictEqual(env.PATH, "/bin");
@@ -62,9 +67,9 @@ describe("Tailor git hardening", () => {
       "/h",
     );
     assert.strictEqual(first.GIT_CONFIG_KEY_0, "user.name");
-    assert.strictEqual(first.GIT_CONFIG_COUNT, "10");
+    assert.strictEqual(first.GIT_CONFIG_COUNT, "12");
     const second = withTailorGitConfig(first, "/h");
-    assert.strictEqual(second.GIT_CONFIG_COUNT, "10");
+    assert.strictEqual(second.GIT_CONFIG_COUNT, "12");
   });
 
   it("applies to the process environment so every child inherits it", () => {
@@ -147,8 +152,13 @@ describe("Tailor git hardening", () => {
         configOf(seen[0]!.env as Record<string, string>)["safe.bareRepository"],
         "explicit",
       );
-      assert.strictEqual(seen[1]!.command, "node");
-      assert.isUndefined(seen[1]!.env);
+      // A bare name is resolved from PATH's absolute entries (Windows) or left alone.
+      if (process.platform === "win32") {
+        assert.isTrue(NodePath.win32.isAbsolute(seen[1]!.command), seen[1]!.command);
+        assert.match(seen[1]!.command.toLowerCase(), /node\.exe$/);
+      } else {
+        assert.strictEqual(seen[1]!.command, "node");
+      }
     }),
   );
 
@@ -177,5 +187,82 @@ describe("Tailor git hardening", () => {
     };
     walk(root);
     assert.deepEqual(offenders, []);
+  });
+
+  it("never resolves a bare command in the working directory, and runs the policy's git", () => {
+    const fakeRepo = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-planted-git-"));
+    const files = new Set([NodePath.win32.join(fakeRepo, "git.exe"), "C:\\Tools\\git.exe"]);
+    const policy: TailorGitSpawner.SpawnPolicy = {
+      platform: "win32",
+      gitExe: undefined,
+      workspaceRoots: undefined,
+      isFile: (path) => files.has(path),
+      readText: () => undefined,
+      realPath: () => undefined,
+    };
+    // PATH with a relative entry and the repository itself as "." : both are skipped.
+    const env = { PATH: `.;bin;C:\\Tools`, PATHEXT: ".EXE" };
+    assert.strictEqual(TailorGitSpawner.resolveFromPath("git", env, policy), "C:\\Tools\\git.exe");
+    assert.isUndefined(TailorGitSpawner.resolveFromPath("git", { PATH: ".;bin", PATHEXT: ".EXE" }, policy));
+    const bare = ChildProcess.make("git", ["status"], { cwd: fakeRepo, env });
+    const resolved = TailorGitSpawner.tailorCommand(bare, policy);
+    assert.isTrue("command" in resolved);
+    if ("command" in resolved && resolved.command._tag === "StandardCommand") {
+      assert.strictEqual(resolved.command.command, "C:\\Tools\\git.exe");
+      assert.strictEqual(resolved.command.options.env?.NoDefaultCurrentDirectoryInExePath, "1");
+    }
+    // With the policy installed, git is always the policy's git.exe.
+    const withPolicy = TailorGitSpawner.tailorCommand(bare, { ...policy, gitExe: "D:\\Git\\cmd\\git.exe" });
+    assert.isTrue("command" in withPolicy && withPolicy.command._tag === "StandardCommand" && withPolicy.command.command === "D:\\Git\\cmd\\git.exe");
+    const noGit = TailorGitSpawner.tailorCommand(bare, { ...policy, gitExe: null });
+    assert.isTrue("refused" in noGit);
+    // A name found nowhere becomes a path that cannot exist, never a cwd lookup.
+    const unknown = TailorGitSpawner.tailorCommand(ChildProcess.make("whereami", [], { env }), policy);
+    assert.isTrue("command" in unknown && unknown.command._tag === "StandardCommand" && unknown.command.command === TailorGitSpawner.TAILOR_UNRESOLVED_COMMAND);
+  });
+
+  it.skipIf(process.platform !== "win32")("a planted git.exe at a repository root is not run (real spawn)", () => {
+    const fakeRepo = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-planted-git-real-"));
+    // whoami.exe renamed to git.exe: if it ran, the output would be a user name.
+    NodeFS.copyFileSync(NodePath.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "whoami.exe"), NodePath.join(fakeRepo, "git.exe"));
+    const resolved = TailorGitSpawner.tailorCommand(
+      ChildProcess.make("git", ["--version"], { cwd: fakeRepo }),
+      { ...TailorGitSpawner.currentSpawnPolicy(), gitExe: undefined, workspaceRoots: undefined },
+    );
+    assert.isTrue("command" in resolved);
+    if (!("command" in resolved) || resolved.command._tag !== "StandardCommand") return;
+    const executable = resolved.command.command;
+    assert.isFalse(executable.toLowerCase().startsWith(fakeRepo.toLowerCase()), executable);
+    const output = NodeChildProcess.execFileSync(executable, ["--version"], { cwd: fakeRepo, encoding: "utf8" });
+    assert.match(output, /^git version/);
+  });
+
+  it("refuses git in a tree whose .git file points outside .git/worktrees or .git/modules", () => {
+    const base = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-gitdir-"));
+    const repo = NodePath.join(base, "repo");
+    const linked = NodePath.join(repo, ".git", "worktrees", "wt");
+    NodeFS.mkdirSync(linked, { recursive: true });
+    const worktree = NodePath.join(base, "wt");
+    NodeFS.mkdirSync(worktree);
+    NodeFS.writeFileSync(NodePath.join(worktree, ".git"), `gitdir: ${linked}\n`);
+    const evil = NodePath.join(base, "evil-gitdir");
+    NodeFS.mkdirSync(evil);
+    const hijacked = NodePath.join(base, "hijacked");
+    NodeFS.mkdirSync(hijacked);
+    NodeFS.writeFileSync(NodePath.join(hijacked, ".git"), `gitdir: ${evil}\n`);
+    const policy = { ...TailorGitSpawner.currentSpawnPolicy(), gitExe: undefined, workspaceRoots: undefined };
+    assert.isUndefined(TailorGitSpawner.checkGitDirFile(worktree, policy));
+    assert.isUndefined(TailorGitSpawner.checkGitDirFile(NodePath.join(repo), policy));
+    assert.isDefined(TailorGitSpawner.checkGitDirFile(hijacked, policy));
+    const sub = NodePath.join(hijacked, "src");
+    NodeFS.mkdirSync(sub);
+    assert.isDefined(TailorGitSpawner.checkGitDirFile(sub, policy), "a subfolder of a hijacked tree");
+    // With the policy installed, the repository must be in a workspace root.
+    assert.isDefined(
+      TailorGitSpawner.checkGitDirFile(worktree, { ...policy, workspaceRoots: [NodePath.join(base, "elsewhere")] }),
+    );
+    assert.isUndefined(TailorGitSpawner.checkGitDirFile(worktree, { ...policy, workspaceRoots: [base] }));
+    const refused = TailorGitSpawner.tailorCommand(ChildProcess.make("git", ["status"], { cwd: hijacked }), policy);
+    assert.isTrue("refused" in refused);
   });
 });

@@ -242,11 +242,11 @@ it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
     const args = claudePrintToolArgs(true);
     expect(args).toEqual([
       "--tools",
-      "Read,Grep,Glob",
+      "Read",
       "--allowedTools",
-      "Read(./**),Grep,Glob",
+      "Read(./**)",
       "--disallowedTools",
-      "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch",
+      "Bash,Grep,Glob,Edit,Write,NotebookEdit,WebFetch,WebSearch",
     ]);
     expect(args.join(" ")).not.toMatch(/Bash\(/);
     expect(claudePrintToolArgs(false)).toEqual(["--tools", ""]);

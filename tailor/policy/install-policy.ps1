@@ -41,6 +41,13 @@
     9. Runs verify-install.ps1. Only on a full PASS does it write the verified marker and
        start the tasks; the launchers refuse to start without a current marker.
 
+  -EmergencyRevoke (same protected copy and hash rules; -ExpectedSha256 may be left out, then
+  the hashes recorded at install are used) stops and disables the tasks, kills the accounts'
+  processes, has t3agent rotate every T3 signing key with T3's own CLI (every token and session
+  becomes invalid), deletes the connector token and the drop folder's contents, removes the
+  verified marker and records the revoke in state\revoke-log.json. Re-running the install
+  mints a fresh token and verifies again.
+
   No administrator code runs inside the T3 home or the workspaces: the connector token is
   issued there by the t3agent task and moved into connector\ by the fixed SYSTEM task.
 
@@ -64,7 +71,9 @@
 param(
   [string] $T3Exe,
   [string] $ClaudeExe,
-  [Parameter(Mandatory = $true)][string] $ExpectedSha256,
+  # Required, except with -EmergencyRevoke, which checks the protected copy against the hashes
+  # recorded in the admin-only t3-policy.json at install time.
+  [string] $ExpectedSha256,
   # Folder name under %ProgramData%\T3CodePolicy for the Claude home.
   [ValidatePattern('^[A-Za-z0-9._-]+$')][string] $ClaudeHomeName = 'claude-home',
   [ValidatePattern('^[A-Za-z0-9_-]{1,20}$')][string] $AgentAccount = 't3agent',
@@ -91,7 +100,11 @@ param(
   # Claude Code's machine-wide admin tier. Affects EVERY Claude session on the PC.
   [string] $MachineManagedSettingsPath = 'C:\Program Files\ClaudeCode\managed-settings.json',
   [switch] $SkipMachineManagedSettings,
-  [switch] $Uninstall
+  [switch] $Uninstall,
+  # Emergency revoke: stop everything, rotate T3's signing keys (every token and session
+  # becomes invalid), delete the connector token, leave the tasks disabled and the verified
+  # marker removed. Nothing starts until the operator runs the install again.
+  [switch] $EmergencyRevoke
 )
 
 Set-StrictMode -Version 2.0
@@ -116,7 +129,9 @@ $InstalledPath = Join-Path $PolicyDir 't3-policy.json'
 $UndoPath = Join-Path $StateDir 'undo.json'
 $BaselinePath = Join-Path $StateDir 'managed-settings.baseline.json'
 $MarkerPath = Join-Path $ServiceDir 'verified.json'
-$Tasks = [ordered]@{ Server = 'T3 server'; Bridge = 'T3 bridge'; Issuer = 'T3 token issuer'; Mover = 'T3 token mover' }
+$Tasks = [ordered]@{ Server = 'T3 server'; Bridge = 'T3 bridge'; Issuer = 'T3 token issuer'; Mover = 'T3 token mover'; Rotate = 'T3 key rotation' }
+$RevokeLogPath = Join-Path $StateDir 'revoke-log.json'
+$RotateScript = Join-Path $ServiceDir 'rotate-keys.ps1'
 $InstallerFiles = [ordered]@{
   script = 'install-policy.ps1'; verify = 'verify-install.ps1'; template = 't3-policy.template.json'
   module = 'ManagedSettingsMerge.psm1'; accounts = 'ServiceAccounts.psm1'
@@ -231,7 +246,7 @@ public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(stri
 public static extern bool GetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle handle, out ByHandleInfo info);
 [DllImport("advapi32.dll", SetLastError = true)]
 public static extern bool SetKernelObjectSecurity(Microsoft.Win32.SafeHandles.SafeFileHandle handle, uint information, byte[] descriptor);
-[StructLayout(LayoutKind.Sequential)]
+[StructLayout(LayoutKind.Sequential, Pack = 4)]
 public struct ByHandleInfo { public uint Attributes; public long Created; public long Accessed; public long Written; public uint Volume; public uint SizeHigh; public uint SizeLow; public uint Links; public uint IndexHigh; public uint IndexLow; }
 public static void SetProtectedSecurity(string path, byte[] descriptor) {
   // READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES; BACKUP_SEMANTICS | OPEN_REPARSE_POINT.
@@ -469,6 +484,13 @@ foreach ($key in $InstallerFiles.Keys) {
 }
 $hashText = ($hashes.Keys | ForEach-Object { "$_=$($hashes[$_])" }) -join ','
 Write-Host "Installer SHA-256: $hashText"
+if (-not $ExpectedSha256) {
+  if (-not $EmergencyRevoke) { throw 'Pass -ExpectedSha256 from the reviewed commit (README.md, First step). Nothing was changed.' }
+  # Emergency revoke: the hashes recorded at install, from the admin-only policy file.
+  Assert-AdminControlled $InstalledPath -SkipParent
+  $ExpectedSha256 = [string](Get-Content -LiteralPath $InstalledPath -Raw | ConvertFrom-Json).installed.installerSha256
+  Write-Host 'Checking the protected copy against the hashes recorded at install.'
+}
 $expected = @{}
 foreach ($pair in $ExpectedSha256.Split(',')) { $kv = $pair.Split('=', 2); if ($kv.Length -eq 2) { $expected[$kv[0].Trim()] = $kv[1].Trim().ToLowerInvariant() } }
 foreach ($key in $hashes.Keys) {
@@ -549,9 +571,125 @@ function Undo-MachineManagedSettings($record) {
   }
 }
 
+# Starts a registered task and waits for it to finish. Returns its result code ($null if it
+# did not run or did not finish in time).
+function Invoke-TaskAndWait([string] $name, [int] $timeoutSeconds = 180) {
+  $task = Get-ScheduledTask -TaskName $name -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue
+  if ($null -eq $task) { return $null }
+  if ($task.State -eq 'Disabled') { Enable-ScheduledTask -TaskName $name -TaskPath '\T3CodePolicy\' | Out-Null }
+  $started = [DateTime]::Now.AddSeconds(-2)
+  Start-ScheduledTask -TaskName $name -TaskPath '\T3CodePolicy\'
+  $deadline = [DateTime]::Now.AddSeconds($timeoutSeconds)
+  do {
+    Start-Sleep -Seconds 2
+    $info = Get-ScheduledTaskInfo -TaskName $name -TaskPath '\T3CodePolicy\'
+    $state = (Get-ScheduledTask -TaskName $name -TaskPath '\T3CodePolicy\').State
+  } while (($state -eq 'Running' -or $info.LastRunTime -lt $started) -and [DateTime]::Now -lt $deadline)
+  if ($state -eq 'Running' -or $info.LastRunTime -lt $started) { return $null }
+  return [int64]$info.LastTaskResult
+}
+
+# Stops every process running as the account (by owner SID), without removing the account.
+function Stop-AccountProcesses([string] $name) {
+  $user = Get-LocalUser -Name $name -ErrorAction SilentlyContinue
+  if ($null -eq $user) { Write-Host "  no account $name"; return 0 }
+  $count = 0
+  foreach ($process in Get-CimInstance Win32_Process) {
+    $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+    if ($owner -and $owner.Sid -eq $user.SID.Value -and $PSCmdlet.ShouldProcess("$($process.Name) ($($process.ProcessId))", "Stop process running as $name")) {
+      Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+      $count++
+    }
+  }
+  return $count
+}
+
+# ---------- emergency revoke ----------
+if ($EmergencyRevoke) {
+  Write-Host 'EMERGENCY REVOKE'
+  $plan = Get-EmergencyRevokePlan -Tasks $Tasks -Accounts @($AgentAccount, $BridgeAccount) -MarkerPath $MarkerPath `
+    -TokenPath $TokenPath -DropDir $DropDir -RevokeLogPath $RevokeLogPath
+  $done = [System.Collections.Generic.List[string]]::new()
+  $failed = [System.Collections.Generic.List[string]]::new()
+  $rotated = $false
+  foreach ($step in $plan) {
+    $line = "$($step.Action) $($step.Target): $($step.Detail)"
+    if (-not $PSCmdlet.ShouldProcess($step.Target, "$($step.Action): $($step.Detail)")) { continue }
+    try {
+      switch ($step.Action) {
+        'RemoveMarker' { if (Test-Path -LiteralPath $step.Target) { [IO.File]::Delete($step.Target); $line += ' (removed)' } else { $line += ' (none)' } }
+        'DisableTask' {
+          if (Get-ScheduledTask -TaskName $step.Target -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue) {
+            Disable-ScheduledTask -TaskName $step.Target -TaskPath '\T3CodePolicy\' | Out-Null; $line += ' (disabled)'
+          } else { $line += ' (not registered)' }
+        }
+        'StopTask' { Stop-ScheduledTask -TaskName $step.Target -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue }
+        'KillProcesses' { $line += " ($(Stop-AccountProcesses $step.Target) stopped)" }
+        'RotateKeys' {
+          $result = Invoke-TaskAndWait $step.Target
+          Disable-ScheduledTask -TaskName $step.Target -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue | Out-Null
+          if ($result -ne 0) { throw "the key rotation task did not succeed (result: $(if ($null -eq $result) { 'did not run or finish' } else { $result }))" }
+          $rotated = $true
+          $line += ' (every signing key replaced, every session revoked)'
+        }
+        'DeleteFile' {
+          foreach ($file in @($step.Target, "$($step.Target).new")) {
+            if (Test-Path -LiteralPath $file) { [void](Assert-NotReparse (Split-Path -Parent $file)); [IO.File]::Delete($file); $line += " (deleted $(Split-Path -Leaf $file))" }
+          }
+        }
+        'EmptyFolder' {
+          if (Test-Path -LiteralPath $step.Target) {
+            [void](Assert-NotReparse $step.Target)
+            $children = @(Get-ChildItem -LiteralPath $step.Target -Force)
+            foreach ($child in $children) { Remove-TreeNoFollow $child.FullName }
+            $line += " ($($children.Count) removed)"
+          }
+        }
+        'AppendRevokeLog' {
+          $log = @()
+          if (Test-Path -LiteralPath $step.Target) { [void](Assert-NotReparse $step.Target); $log = @(Get-Content -LiteralPath $step.Target -Raw | ConvertFrom-Json) }
+          $log += [ordered]@{ at = [DateTime]::UtcNow.ToString('o'); keysRotated = $rotated; by = [Security.Principal.WindowsIdentity]::GetCurrent().Name }
+          Write-ProtectedFile $step.Target (Get-Utf8Bytes ((ConvertTo-Json -InputObject @($log) -Depth 4) + "`n"))
+        }
+      }
+      $done.Add($line)
+    } catch {
+      $failed.Add("$line -- FAILED: $($_.Exception.Message)")
+    }
+  }
+  Write-Host ''
+  Write-Host 'Done:'
+  $done | ForEach-Object { Write-Host "  $_" }
+  if ($failed.Count -gt 0) {
+    Write-Host 'FAILED:'
+    $failed | ForEach-Object { Write-Host "  $_" }
+  }
+  Write-Host ''
+  Write-Host 'Every task is disabled and the verified marker is gone: nothing starts until you run the install again'
+  Write-Host '(from the protected copy, with -ExpectedSha256), which mints a fresh connector token and re-verifies.'
+  if (-not $rotated) {
+    Write-Warning 'The signing keys were NOT rotated: tokens issued before may still be valid. Fix the failure and run -EmergencyRevoke again.'
+    exit 1
+  }
+  return
+}
+
 # ---------- uninstall ----------
 if ($Uninstall) {
   $undo = Read-UndoRecord
+  # First make every issued token and session invalid (t3agent rotates the keys), then the T3
+  # home, keys included, is deleted below.
+  foreach ($key in 'Server', 'Bridge', 'Issuer', 'Mover') {
+    if ((Get-ScheduledTask -TaskName $Tasks[$key] -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue) -and $PSCmdlet.ShouldProcess($Tasks[$key], 'Stop')) {
+      Stop-ScheduledTask -TaskName $Tasks[$key] -TaskPath '\T3CodePolicy\' -ErrorAction SilentlyContinue
+    }
+  }
+  if ($PSCmdlet.ShouldProcess($Tasks.Rotate, 'Rotate every T3 signing key before removing the T3 home')) {
+    [void](Stop-AccountProcesses $AgentAccount)
+    $rotation = Invoke-TaskAndWait $Tasks.Rotate
+    if ($rotation -eq 0) { Write-Host '  signing keys rotated; every issued token is invalid' }
+    else { Write-Warning 'Key rotation did not run; the keys are destroyed with the T3 home below.' }
+  }
   foreach ($task in $Tasks.Values) { Remove-ServiceTask -TaskName $task -WhatIf:$WhatIfPreference }
   $removedSids = @()
   foreach ($name in $AgentAccount, $BridgeAccount) {
@@ -774,6 +912,7 @@ Write-ProtectedFile $t3Launcher (Get-Utf8Bytes (Get-T3LauncherText -T3Exe $T3Exe
       -MarkerPath $MarkerPath -RequiredFiles @($T3Exe, $ClaudeExe, $InstalledPath, $t3Launcher, $seedPath) -SettingsSeedPath $seedPath)) $readAgent
 Write-ProtectedFile $issuer (Get-Utf8Bytes (Get-TokenIssuerText -T3Exe $T3Exe -T3Home $T3Home -DropPath $DropPath -Ttl "$($ConnectorTokenDays)d" `
       -MustBeUnset $mustBeUnset -MarkerPath $MarkerPath -RequiredFiles @($T3Exe, $InstalledPath, $issuer))) $readAgent
+Write-ProtectedFile $RotateScript (Get-Utf8Bytes (Get-KeyRotationText -T3Exe $T3Exe -T3Home $T3Home -PolicyPath $InstalledPath -MustBeUnset $mustBeUnset)) $readAgent
 Write-ProtectedFile $mover (Get-Utf8Bytes (Get-TokenMoverText -DropPath $DropPath -TokenPath $TokenPath -AgentSid $agentId -BridgeSid $bridgeId)) (New-FileEntry @{})
 if ($BridgeExe) {
   Write-ProtectedFile $bridgeLauncher (Get-Utf8Bytes (Get-BridgeLauncherText -BridgeExe $BridgeExe -TokenPath $TokenPath -KeyPath $BridgeKeyPath `
@@ -786,6 +925,8 @@ Register-ServiceTask -TaskName $Tasks.Server -Account $AgentAccount -Password $a
   -Xml (Get-ServiceTaskXml -Description 'Runs t3 serve (T3CodePolicy).' -Account $AgentAccount -PwshPath $PwshPath -LauncherPath $t3Launcher -Trigger Startup)
 Register-ServiceTask -TaskName $Tasks.Issuer -Account $AgentAccount -Password $agentPassword -WhatIf:$WhatIfPreference `
   -Xml (Get-ServiceTaskXml -Description 'Issues the connector token into the drop folder (T3CodePolicy).' -Account $AgentAccount -PwshPath $PwshPath -LauncherPath $issuer -Trigger Daily)
+Register-ServiceTask -TaskName $Tasks.Rotate -Account $AgentAccount -Password $agentPassword -WhatIf:$WhatIfPreference `
+  -Xml (Get-ServiceTaskXml -Description 'Rotates the T3 signing keys on demand (emergency revoke, uninstall) (T3CodePolicy).' -Account $AgentAccount -PwshPath $PwshPath -LauncherPath $RotateScript -Trigger OnDemand)
 Register-ServiceTask -TaskName $Tasks.Mover -System -WhatIf:$WhatIfPreference `
   -Xml (Get-ServiceTaskXml -Description 'Moves the connector token from the drop folder (T3CodePolicy).' -System -PwshPath $PwshPath -LauncherPath $mover -Trigger Every10Minutes)
 if ($BridgeExe) {
@@ -832,6 +973,7 @@ if (((-not (Test-Path -LiteralPath $TokenPath)) -or $RotateConnectorToken) -and 
 Write-Host ''
 Write-Host 'Done. Next steps (not done by this script):'
 Write-Host '  - Work through the manual checks verify-install.ps1 printed.'
+Write-Host "  - If anything looks wrong: & `"$InstallerDir\install-policy.ps1`" -EmergencyRevoke"
 Write-Host '  - Enter the model credential on the Claude provider instance as a sensitive value (provider-config.md).'
 Write-Host "  - As an administrator, put the bridge's tailor.au key in $BridgeKeyPath (the folder ACL keeps it $BridgeAccount-only)."
 Write-Host '  - Run the live egress capture (SECURITY-REVIEW.md, T3-01).'

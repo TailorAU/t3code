@@ -69,6 +69,7 @@ Severity: Critical, High, Medium, Low, Info. Status: Fixed (in this PR), Mitigat
 | T3-51 | Service accounts' groups not checked | Medium | Fixed (privileged groups refused; Users kept, documented) |
 | T3-52 | Uninstall leftovers, variable restore, undo ordering, password logging, probe hash | Low | Fixed (UNVERIFIED elevated) |
 | T3-53 | No self-check of an install | Medium | Fixed (`verify-install.ps1`; UNVERIFIED elevated) |
+| T3-54 | No way to invalidate every issued token at once | High | Fixed (`-EmergencyRevoke`; UNVERIFIED elevated) |
 
 ## Findings
 
@@ -734,20 +735,42 @@ refuses to start without a current one whose hashes match. Checks it cannot scri
 as a checklist. The reviewer's first-run checks 1 to 7 were not available to this worker; the
 seven printed checks are this worker's definition and should be compared with them.
 
+### T3-54 Emergency revoke (High, Fixed; UNVERIFIED elevated)
+
+Revoking a session row does not help if the signing key itself may be exposed, and there was
+no single action to stop everything. `install-policy.ps1 -EmergencyRevoke` (protected copy,
+same hash rules) removes the verified marker, disables and stops every task, stops the
+accounts' processes, and has `t3agent` run T3's own `t3 auth rotate-signing-keys` through an
+on-demand task (fork CLI command, `tailor/signingKeys.ts`): new random values for the four
+signing keys (session, MCP OAuth, guest share, asset access) and every session revoked. The
+token-signing HMAC check then fails for everything issued before. It deletes the connector
+token and the drop folder's contents, logs the time in `state\revoke-log.json`, and prints
+each step and its outcome. Nothing restarts until a full install and a passing self-check;
+the self-check fails unless the signing key's last-write time (read through no-follow handles;
+creation time is unreliable because of NTFS file-name tunnelling) is later than the last
+revoke. Uninstall rotates the keys before deleting the T3 home.
+
+Tests: `signingKeys.test.ts` (a token verified across a restart stops verifying after the
+rotation, with `InvalidSessionTokenSignatureError`; new tokens work), and the revoke plan,
+rotation script, on-demand task and freshness check in `ServiceAccounts.Tests.ps1`.
+
 ## What was verified
 
 - Locally on Windows (frozen lockfile), round 3: the contracts suite (161/161) and the gate's
-  server tests (535 passed, 1 upstream skip; 18 files, now including the git hardening,
-  workspace path, CSP and `http.test.ts` tests). Server `src` and contracts typecheck clean.
+  server tests (536 passed, 1 upstream skip; 19 files, now including the git hardening,
+  workspace path, CSP, signing-key rotation and `http.test.ts` tests). `t3 auth
+  rotate-signing-keys` ran from source against a throwaway base dir and replaced all four keys. Server `src` and contracts typecheck clean.
   The PowerShell tests pass: the managed-settings merge (including `parentSettingsBehavior`,
   re-run records and the verify comparison) and the service-account module (task XML, folder
   ACL plan and comparison, group refusal, launchers, issuer and mover parse and order, the
-  marker check, and the installer refusing to run outside the protected copy). Both scripts
+  marker check, the emergency revoke plan, rotation script and key freshness check, and the
+  installer refusing to run outside the protected copy). Both scripts
   parse; the modules and the self-check load from bytes; the self-check refuses to run
   unelevated.
 - Not verified (UNVERIFIED): anything that needs an elevated run on a real machine: the
   accounts and group checks, secedit, task registration through COM, folder creation and the
-  handle-based ACL reset, the token issuer and mover, the firewall rules, the self-check's
+  handle-based ACL reset, the token issuer and mover, the emergency revoke and key rotation
+  task, the firewall rules, the self-check's
   PASS path and the marker, uninstall, and the policy guard and binary hash on a real
   install. The `-WhatIf` preview could not be run here, because it now needs the protected
   copy in an admin-only folder. Also not verified: a full build, the full upstream suite

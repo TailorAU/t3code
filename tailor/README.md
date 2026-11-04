@@ -24,6 +24,7 @@ Patches to upstream code, each marked `Tailor fork` in a comment:
 - `apps/server/src/provider/builtInDrivers.ts`: Claude driver only.
 - `apps/server/src/provider/Drivers/ClaudeDriver.ts`, `apps/server/src/tailor/machinePolicy.ts`: the machine policy sets the Claude binary and home, launch arguments are ignored, instance variables are allowlisted, Windows refuses to run without the policy.
 - `packages/contracts/src/auth.ts`, `apps/server/src/auth/RpcAuthorization.ts`: the `tailor:connector` scope.
+- `apps/server/src/cli/auth.ts`: `t3 auth rotate-signing-keys` for the emergency revoke (`tailor/signingKeys.ts`).
 - `apps/server/src/cli/config.ts`: loopback bind by default.
 - `apps/server/src/server.ts`, `apps/server/src/bin.ts`: every git command hardened (`tailor/gitSpawner.ts`, `tailor/gitHardening.ts`).
 - `apps/server/src/ws.ts`: worktree and project paths checked (`tailor/workspacePolicy.ts`).

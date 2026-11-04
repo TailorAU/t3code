@@ -137,6 +137,47 @@ try {
   }
 } finally { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
 
+# Emergency revoke: the plan, in order, touching only the expected targets.
+$tasks = [ordered]@{ Server = 'T3 server'; Bridge = 'T3 bridge'; Issuer = 'T3 token issuer'; Mover = 'T3 token mover'; Rotate = 'T3 key rotation' }
+$revoke = Get-EmergencyRevokePlan -Tasks $tasks -Accounts @('t3agent', 't3bridge') -MarkerPath 'C:\P\service\verified.json' `
+  -TokenPath 'C:\P\connector\token' -DropDir 'C:\P\connector-drop' -RevokeLogPath 'C:\P\state\revoke-log.json'
+$actions = @($revoke | ForEach-Object Action)
+$indexOf = { param($action, $target) for ($n = 0; $n -lt $revoke.Count; $n++) { if ($revoke[$n].Action -eq $action -and ($null -eq $target -or $revoke[$n].Target -eq $target)) { return $n } }; return -1 }
+Assert-True ($actions[0] -eq 'RemoveMarker') 'the marker goes first, so nothing restarts during the revoke'
+foreach ($name in 'T3 server', 'T3 bridge', 'T3 token issuer', 'T3 token mover') {
+  Assert-True ((& $indexOf 'DisableTask' $name) -ge 0) "$name is disabled"
+  Assert-True ((& $indexOf 'DisableTask' $name) -lt (& $indexOf 'RotateKeys' $null)) "$name is disabled before the keys rotate"
+}
+Assert-True ((& $indexOf 'KillProcesses' 't3agent') -lt (& $indexOf 'RotateKeys' 'T3 key rotation')) 'processes are stopped before the rotation'
+Assert-True ((& $indexOf 'KillProcesses' 't3bridge') -ge 0) 'bridge processes are stopped'
+Assert-True ((& $indexOf 'DeleteFile' 'C:\P\connector\token') -gt (& $indexOf 'RotateKeys' $null)) 'the token is deleted'
+Assert-True ((& $indexOf 'EmptyFolder' 'C:\P\connector-drop') -ge 0) 'the drop folder is emptied'
+Assert-True ($actions[-1] -eq 'AppendRevokeLog') 'the revoke is logged last'
+Assert-True (@($revoke | Where-Object { $_.Action -eq 'EnableTask' -or $_.Action -eq 'StartTask' }).Count -eq 0) 'nothing is enabled or started'
+$text = ($revoke | ForEach-Object { "$($_.Action) $($_.Target) $($_.Detail)" }) -join "`n"
+Assert-True ($text -notmatch 'tailor_sk_|Bearer ') 'the plan names no secret'
+
+# Key rotation script: runs as t3agent, checks t3.exe's hash, uses T3's own CLI, prints no key.
+$rotate = Get-KeyRotationText -T3Exe 'C:\Program Files\T3Code\t3.exe' -T3Home 'C:\P\t3-home' -PolicyPath 'C:\P\t3-policy.json' -MustBeUnset @('NODE_OPTIONS')
+Assert-True (Test-Parses $rotate) 'the rotation script parses'
+Assert-True ($rotate.IndexOf('t3ExeSha256') -lt $rotate.IndexOf('rotate-signing-keys')) 'it checks the t3 hash before rotating'
+Assert-True ($rotate.Contains("auth rotate-signing-keys --base-dir")) 'it uses T3''s own rotation command'
+Assert-True ($rotate -notmatch 'Get-Content[^\n]*secrets') 'it never reads a key'
+$onDemand = [xml](Get-ServiceTaskXml -Description 'rotate' -Account 't3agent' -PwshPath 'p.exe' -LauncherPath 'r.ps1' -Trigger OnDemand)
+Assert-True ($onDemand.Task.Triggers.ChildNodes.Count -eq 0 -and $onDemand.Task.Principals.Principal.LogonType -eq 'Password') 'the rotation task has no trigger and runs as the account'
+
+# Signing key freshness against the revoke log.
+$t0 = [DateTime]::new(2026, 11, 5, 1, 0, 0, [DateTimeKind]::Utc)
+Assert-True (Test-SigningKeyFresh -KeyWrittenUtc $t0 -LastRevokeUtc $null).Ok 'no revoke recorded: pass'
+Assert-True (Test-SigningKeyFresh -KeyWrittenUtc $t0.AddSeconds(5) -LastRevokeUtc $t0).Ok 'a key written after the revoke passes'
+Assert-True (-not (Test-SigningKeyFresh -KeyWrittenUtc $t0.AddSeconds(-5) -LastRevokeUtc $t0).Ok) 'an older key fails'
+Assert-True (-not (Test-SigningKeyFresh -KeyWrittenUtc $null -LastRevokeUtc $t0).Ok) 'a missing key after a revoke fails'
+Assert-True ($null -eq (Get-LastRevokeTime -LogText $null)) 'no log: no revoke time'
+$logText = (@(@{ at = '2026-11-05T01:00:00.0000000Z' }, @{ at = '2026-11-05T03:00:00.0000000Z' }, @{ at = '2026-11-05T02:00:00.0000000Z' }) | ConvertTo-Json)
+Assert-True ((Get-LastRevokeTime -LogText $logText) -eq [DateTime]::new(2026, 11, 5, 3, 0, 0, [DateTimeKind]::Utc)) 'the latest revoke counts'
+$single = (ConvertTo-Json -InputObject @(@{ at = '2026-11-05T01:00:00.0000000Z' }))
+Assert-True ((Get-LastRevokeTime -LogText $single) -eq $t0) 'a one-entry log is read'
+
 # The installer refuses to run from anywhere but the protected copy (here: the repository).
 $installer = Join-Path $PSScriptRoot '..' 'install-policy.ps1'
 $output = & pwsh -NoProfile -NonInteractive -File $installer -ExpectedSha256 'script=0' -T3Exe 'C:\none\t3.exe' -ClaudeExe 'C:\none\claude.exe' -WhatIf 2>&1 | Out-String

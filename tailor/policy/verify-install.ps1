@@ -28,6 +28,8 @@
     hashes         t3, Claude, the bridge and every service file match what was installed
     git-hooks      the hooks folder is empty, and with T3's git settings a repository hook
                    does not run
+    signing-key    after an emergency revoke, T3's signing key was written later than the last
+                   revoke in state\revoke-log.json (read through no-follow handles)
   Then it prints the checks that need a person (first-run checklist).
 #>
 [CmdletBinding()]
@@ -48,8 +50,32 @@ $MarkerPath = Join-Path $ServiceDir 'verified.json'
 $InstalledPath = Join-Path $PolicyDir 't3-policy.json'
 $BaselinePath = Join-Path $PolicyDir 'state\managed-settings.baseline.json'
 $TokenPath = Join-Path $PolicyDir 'connector\token'
+$RevokeLogPath = Join-Path $PolicyDir 'state\revoke-log.json'
+$RevokeCommand = "& `"$InstallerDir\install-policy.ps1`" -EmergencyRevoke"
 $AdminSids = @('S-1-5-32-544', 'S-1-5-18', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
 $WriteMask = 0x2 -bor 0x4 -bor 0x10 -bor 0x40 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+
+# Reads a file's attributes and last-write time through a handle that does not follow links,
+# so nothing t3agent plants in the T3 home can point this check somewhere else.
+if (-not ('T3Policy.Probe' -as [type])) {
+  Add-Type -Namespace T3Policy -Name Probe -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+[DllImport("kernel32.dll", SetLastError = true)]
+static extern bool GetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle handle, out Info info);
+[StructLayout(LayoutKind.Sequential, Pack = 4)]
+public struct Info { public uint Attributes; public long Created; public long Accessed; public long Written; public uint Volume; public uint SizeHigh; public uint SizeLow; public uint Links; public uint IndexHigh; public uint IndexLow; }
+// FILE_READ_ATTRIBUTES; BACKUP_SEMANTICS | OPEN_REPARSE_POINT. Returns false if it does not exist.
+public static bool TryGet(string path, out Info info) {
+  info = new Info();
+  using (var handle = CreateFileW(path, 0x80, 7, IntPtr.Zero, 3, 0x02000000 | 0x00200000, IntPtr.Zero)) {
+    if (handle.IsInvalid) { int e = Marshal.GetLastWin32Error(); if (e == 2 || e == 3) return false; throw new System.ComponentModel.Win32Exception(e, path); }
+    if (!GetFileInformationByHandle(handle, out info)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), path);
+    return true;
+  }
+}
+'@
+}
 
 $results = [System.Collections.Generic.List[object]]::new()
 function Add-Check([string] $name, [bool] $ok, [string] $detail = '') {
@@ -192,6 +218,7 @@ $taskPlan = @(
   @{ Name = $installed.tasks.Server; User = $installed.agentAccount; Launcher = (Join-Path $service 'start-t3.ps1') }
   @{ Name = $installed.tasks.Issuer; User = $installed.agentAccount; Launcher = (Join-Path $service 'issue-token.ps1') }
   @{ Name = $installed.tasks.Mover; User = 'SYSTEM'; Launcher = (Join-Path $service 'move-token.ps1') }
+  @{ Name = $installed.tasks.Rotate; User = $installed.agentAccount; Launcher = (Join-Path $service 'rotate-keys.ps1') }
 )
 if ($installed.PSObject.Properties['bridgeExe']) { $taskPlan += @{ Name = $installed.tasks.Bridge; User = $installed.bridgeAccount; Launcher = (Join-Path $service 'start-bridge.ps1') } }
 foreach ($t in $taskPlan) {
@@ -238,7 +265,7 @@ Invoke-Check 'managed' {
 }
 
 # ---------- hashes ----------
-$serviceFiles = @('start-t3.ps1', 'issue-token.ps1', 'move-token.ps1', 't3-settings.seed.json') | ForEach-Object { Join-Path $service $_ }
+$serviceFiles = @('start-t3.ps1', 'issue-token.ps1', 'move-token.ps1', 'rotate-keys.ps1', 't3-settings.seed.json') | ForEach-Object { Join-Path $service $_ }
 if ($installed.PSObject.Properties['bridgeExe']) { $serviceFiles += Join-Path $service 'start-bridge.ps1' }
 Invoke-Check 'hashes' {
   $pairs = @(@($installed.t3Exe, $installed.t3ExeSha256), @($installed.claudeExe, $installed.claudeExeSha256))
@@ -278,6 +305,28 @@ Invoke-Check 'git-hooks' {
     Remove-Item -LiteralPath $repo -Recurse -Force -ErrorAction SilentlyContinue
   }
   'folder empty; a repository hook does not run with the T3 git settings'
+}
+
+# ---------- signing key after a revoke ----------
+Invoke-Check 'signing-key' {
+  $logText = $null
+  if (Test-Path -LiteralPath $RevokeLogPath) { Assert-AdminOnlyWrite $RevokeLogPath; $logText = [IO.File]::ReadAllText($RevokeLogPath) }
+  $lastRevoke = Get-LastRevokeTime -LogText $logText
+  $written = $null
+  $current = [string]$installed.t3Home
+  foreach ($part in 'userdata', 'secrets', 'server-signing-key.bin') {
+    $current = Join-Path $current $part
+    $info = [T3Policy.Probe+Info]::new()
+    if (-not [T3Policy.Probe]::TryGet($current, [ref]$info)) { $written = $null; break }
+    if (($info.Attributes -band 0x400) -ne 0) { throw "$current is a reparse point" }
+    if ($part -eq 'server-signing-key.bin') {
+      if (($info.Attributes -band 0x10) -ne 0 -or $info.Links -ne 1) { throw "$current is not a plain file" }
+      $written = [DateTime]::FromFileTimeUtc($info.Written)
+    }
+  }
+  $result = Test-SigningKeyFresh -KeyWrittenUtc $written -LastRevokeUtc $lastRevoke
+  if (-not $result.Ok) { throw $result.Reason }
+  $result.Reason
 }
 
 # ---------- report, marker ----------
@@ -328,5 +377,7 @@ Manual first-run checks (a person does these; they cannot be scripted from here)
      create a worktree or switch branch from T3: the file must not appear.
   6. Create a project outside $(@($installed.workspaceRoots) -join ' or '): T3 must refuse it.
   7. Run the live egress capture while one turn runs (SECURITY-REVIEW.md, T3-01).
+
+If anything looks wrong: run $RevokeCommand
 "@
 return $allPassed

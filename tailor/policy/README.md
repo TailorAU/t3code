@@ -124,7 +124,7 @@ handle, never by path. No folder grants anything to the interactive user, `Users
 
 | Parameter | Required | Default | Meaning |
 | --- | --- | --- | --- |
-| `-ExpectedSha256` | yes | none | `script=<hex>,verify=<hex>,template=<hex>,module=<hex>,accounts=<hex>` from the reviewed commit |
+| `-ExpectedSha256` | yes (optional with `-EmergencyRevoke`) | none | `script=<hex>,verify=<hex>,template=<hex>,module=<hex>,accounts=<hex>` from the reviewed commit |
 | `-T3Exe` | to install | | Full path of the `t3.exe` built from this fork (admin-only folder) |
 | `-ClaudeExe` | to install | | Full path of a Claude binary used only by T3's Claude instance, in an admin-only folder (the firewall rule applies to that path) |
 | `-ClaudeHomeName` | no | `claude-home` | Folder name of the Claude home under `%ProgramData%\T3CodePolicy` |
@@ -143,6 +143,7 @@ handle, never by path. No folder grants anything to the interactive user, `Users
 | `-SkipMachineManagedSettings` | no | | Do not touch the machine-wide file |
 | `-RuleGroup` | no | `T3 Code egress policy` | Firewall rule group the installer owns and replaces |
 | `-Uninstall` | no | | Remove what the installer created (below) |
+| `-EmergencyRevoke` | no | | Stop everything, invalidate every token and session, delete the connector token (below) |
 
 ## The connector token
 
@@ -161,6 +162,36 @@ step:
 
 A token lives `-ConnectorTokenDays` (default 7) and is replaced daily, so the bridge always
 holds one of the two valid tokens.
+
+## Emergency revoke
+
+If anything looks wrong (a token may have leaked, the self-check fails unexpectedly, the bridge
+behaves oddly), from an elevated PowerShell 7:
+
+```powershell
+& "$env:ProgramData\T3CodePolicy\installer\install-policy.ps1" -EmergencyRevoke
+```
+
+It runs from the protected copy under the same rules (it refuses a writable or changed copy;
+without `-ExpectedSha256` it checks the files against the hashes recorded at install) and:
+
+1. removes the verified marker, then disables and stops the T3 server, bridge, token issuer
+   and token mover tasks, and stops every process running as `t3agent` or `t3bridge`;
+2. runs the on-demand task `T3 key rotation` as `t3agent`: after checking `t3.exe` against
+   its installed hash, T3's own `t3 auth rotate-signing-keys` writes new random values for
+   every signing key (`server-signing-key`, `mcp-oauth-signing-key`, `guest-share-signing-key`,
+   `asset-access-signing-key`) and revokes every session. Every bearer token, browser session,
+   websocket ticket, MCP token and share link issued before fails its signature check. No
+   administrator code touches the T3 home;
+3. deletes `connector\token` and everything in `connector-drop\`;
+4. records the time in `state\revoke-log.json`, leaves every task disabled and the marker
+   gone, and prints each step it took and its outcome, never a secret. If the key rotation
+   failed it says so and exits non-zero: run it again.
+
+Nothing starts until you run the install again (from the protected copy, with
+`-ExpectedSha256`). That re-enables the tasks, verifies (the self-check fails unless T3's
+signing key was written after the last revoke), and only then starts T3 and issues a fresh
+connector token. Uninstall also rotates the keys first and then deletes the T3 home with them.
 
 ## Getting code in and out
 
@@ -248,7 +279,8 @@ under `T3CodePolicy` grants `Users` anything.
 
 ## Uninstall
 
-`-Uninstall` (from the protected copy) stops and removes the four tasks, stops every process
+`-Uninstall` (from the protected copy) first has `t3agent` rotate every signing key (so every
+issued token is invalid even before the files go), then stops and removes the five tasks, stops every process
 running as either account, removes the accounts, their rights and profiles, the firewall
 rules, and restores only the `T3CODE_*` machine variables it changed to their earlier values.
 It removes only what it added to the machine managed-settings file, then deletes `service\`,

@@ -8,6 +8,7 @@ import * as Schema from "effect/Schema";
 import { Argument, Command, Flag, GlobalFlag } from "effect/cli";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
+import * as TailorSigningKeys from "../tailor/signingKeys.ts";
 
 import {
   formatIssuedPairingCredential,
@@ -248,7 +249,43 @@ const sessionCommand = Command.make("session").pipe(
   Command.withSubcommands([sessionIssueCommand, sessionListCommand, sessionRevokeCommand]),
 );
 
+// Tailor fork: emergency revoke. Replaces every token-signing key, then marks every session
+// revoked. Prints counts only, never a key or token.
+const rotateSigningKeysCommand = Command.make("rotate-signing-keys", {
+  ...authLocationFlags,
+}).pipe(
+  Command.withDescription(
+    "Replace every token-signing key and revoke every session: all issued tokens stop working.",
+  ),
+  Command.withHandler((flags) =>
+    Effect.gen(function* () {
+      const logLevel = yield* GlobalFlag.LogLevel;
+      const config = yield* resolveCliAuthConfig(flags, logLevel, { quietLogs: true });
+      const result = yield* Effect.gen(function* () {
+        const environmentAuth = yield* EnvironmentAuth.EnvironmentAuth;
+        const rotated = yield* TailorSigningKeys.rotateSigningKeys;
+        const sessions = yield* environmentAuth.listSessions();
+        let revoked = 0;
+        for (const session of sessions) {
+          if (yield* environmentAuth.revokeSession(session.sessionId)) revoked++;
+        }
+        return { rotated, revoked };
+      }).pipe(
+        Effect.provide(
+          EnvironmentAuth.layerRuntime.pipe(
+            Layer.provide(ServerConfig.layer(config)),
+            Layer.provide(Layer.succeed(References.MinimumLogLevel, "Error")),
+          ),
+        ),
+      );
+      yield* Console.log(
+        `Rotated ${result.rotated.length} signing keys (${result.rotated.join(", ")}); revoked ${result.revoked} sessions.\n`,
+      );
+    }),
+  ),
+);
+
 export const authCommand = Command.make("auth").pipe(
   Command.withDescription("Manage the local auth control plane for headless deployments."),
-  Command.withSubcommands([pairingCommand, sessionCommand]),
+  Command.withSubcommands([pairingCommand, sessionCommand, rotateSigningKeysCommand]),
 );
